@@ -1,0 +1,23 @@
+# 忽略 Python 编译文件
+__pycache__/
+*.py[cod]
+
+# 忽略环境文件夹 (关键！)
+env/
+venv/
+.venv/
+
+# 忽略编辑器配置
+.vscode/
+.idea/
+
+# 忽略巨大的数据文件 (GitHub 传不上去)
+*.tif
+*.tiff
+*.mhd
+*.raw
+*.json
+*.yaml
+
+images/
+labels/
