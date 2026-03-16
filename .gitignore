@@ -16,7 +16,6 @@ venv/
 *.tiff
 *.mhd
 *.raw
-*.json
 *.yaml
 
 images/

@@ -1,0 +1,58 @@
+{
+    "model_path": "D:/Fengyi/ultralytics/MADM_Cell_CoExpression/train3_large/weights/best.pt",
+    "labels_to_names": {
+        "0": "red glia",
+        "1": "green glia",
+        "2": "yellow glia",
+        "3": "red neuron",
+        "4": "green neuron",
+        "5": "yellow neuron"
+    },
+    "colors_map": {
+        "0": "red", "1": "green", "2": "yellow",
+        "3": "red", "4": "green", "5": "yellow"
+    },
+    "type_map": {
+        "0": "glia", "1": "glia", "2": "glia",
+        "3": "neuron", "4": "neuron", "5": "neuron"
+    },
+    "bgr_colors": {
+        "red": [0, 0, 255],
+        "green": [0, 255, 0],
+        "yellow": [0, 255, 255]
+    },
+    "paths": { 
+        "channel1_dir": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\561nm",
+        "channel2_dir": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\numorph_align\\aligned\\GFP",
+        "pATHRESULT": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\detection2"
+    },
+    "detection_params": {
+        "cHANNELS": {
+                    "561nm": "RFP",
+                    "640nm": "GFP"
+        },
+        "dOWNSAMPLE_Z_2X":false,
+        "vISUALIZE_STITCH": false,
+        "vISUALIZE_TILE": true,
+        "tHRESHOLD": 0.5,
+        "mINIOU": 0.6,
+        "mERGEZ": true,
+        "xsize": 512,
+        "ysize": 512,
+        "step": 448,
+        "tILESIZE": 2048,
+        "sTARTID": null,
+        "eNDID": null,
+        "left2right" : true,
+        "top2bottom" : true,
+        "overlapThresh": 0.4, 
+        "z_distance_limit": 3
+    },
+
+    "vISUALIZATIONSAMPLESTEP": 100,
+    "vISUALIZATIONSAMPLECOUNT": 100,
+    "vISUALIZATIONSIZE": [512, 512],
+    "dOWNSAMPLE_PERCENTILE_LOW": 0.1,
+    "dOWNSAMPLE_PERCENTILE_HIGH": 99.9
+
+}
