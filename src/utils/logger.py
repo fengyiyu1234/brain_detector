@@ -1,8 +1,9 @@
 import sys
 sys.path.insert(0, '../')
 import logging
+import os
 
-def setup_logging(log_file=None):
+def setup_logging(log_path=None):
     """
     配置全局日志格式
     """
@@ -21,9 +22,20 @@ def setup_logging(log_file=None):
     console_handler.setFormatter(log_format)
     logger.addHandler(console_handler)
 
-    # (可选) 如果需要保存到文件
-    if log_file:
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    if log_path:
+        # === 🔴 核心修复部分 ===
+        # 判断传入的是否是文件夹（如果没有 .log 或 .txt 后缀，就默认它是文件夹）
+        if os.path.isdir(log_path) or not log_path.endswith(('.log', '.txt')):
+            os.makedirs(log_path, exist_ok=True)  # 确保文件夹存在
+            actual_log_file = os.path.join(log_path, 'inference.log') # 自动补上文件名
+        else:
+            # 如果传入的已经是具体的文件路径，确保其父文件夹存在
+            parent_dir = os.path.dirname(log_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            actual_log_file = log_path
+
+        file_handler = logging.FileHandler(actual_log_file, encoding='utf-8')
         file_handler.setFormatter(log_format)
         logger.addHandler(file_handler)
 
