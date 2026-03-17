@@ -1,3 +1,14 @@
+import sys
+import os
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+import cv2
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from src.utils.image import normalize_for_detection
+
 def plot_histogram_comparison(fullimg_raw, fulldraw, name_no_ext, save_path):
     """
     生成 Raw (16-bit) 和 Norm (8-bit) 的双通道直方图对比
@@ -29,7 +40,7 @@ def plot_histogram_comparison(fullimg_raw, fulldraw, name_no_ext, save_path):
     plt.savefig(save_path, dpi=100)
     plt.close(fig) # 关键：释放内存，防止在大规模处理时崩溃
 
-def save_visualization_samples(final_results, dir_dict, disp_mat_fin, Z, H, W, config):
+def save_visualization_samples(final_results, dir_dict, disp_mat_fin, Z, H, W, config, z_start):
     """
     针对双通道（C1=Red, C2=Green）独立归一化的全局大图拼接预览函数
     逻辑：每隔 vISUALIZATIONSAMPLESTEP 层，连续保存 vISUALIZATIONSAMPLECOUNT 张图

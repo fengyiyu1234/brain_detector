@@ -17,6 +17,6 @@ venv/
 *.mhd
 *.raw
 *.yaml
-
+*.json
 images/
 labels/
