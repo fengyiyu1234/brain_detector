@@ -12,6 +12,7 @@ from .stitcher import stitchDetection
 from src.utils.io import load_cached_detections,listFile
 from src.utils.image import normalize_for_detection
 from src.analysis.qc import calculate_comprehensive_qc, calculate_channel_logic_qc
+
 def process_single_tile(i, pATHTEST, config):
     current_logger = logging.getLogger(__name__)
     dir_name = os.path.basename(pATHTEST)
@@ -19,6 +20,7 @@ def process_single_tile(i, pATHTEST, config):
 
     # --- 1. 初始化变量 ---
     dp = config['detection_params']
+    run_qc_flag = dp.get('rUN_QC', True)
     derived = config['derived_paths']
     paths = config['paths']
     labels_to_names = config['labels_to_names']
@@ -237,50 +239,50 @@ def process_single_tile(i, pATHTEST, config):
             # =========================================================
             # 步骤 3: 双通道 QC 计算 (Dual Channel QC)
             # =========================================================
-
+            if run_qc_flag:
             # 3.1 C1 通道质量 (Red)
-            qc_c1, small_c1 = calculate_comprehensive_qc(
-                img_c1, final_layer_boxes, current_z_real, prev_img_small=last_small_img_c1
-            )
-            
-            # 3.2 C2 通道质量 (Green)
-            qc_c2, small_c2 = calculate_comprehensive_qc(
-                img_c2, final_layer_boxes, current_z_real, prev_img_small=last_small_img_c2
-            )
+                qc_c1, small_c1 = calculate_comprehensive_qc(
+                    img_c1, final_layer_boxes, current_z_real, prev_img_small=last_small_img_c1
+                )
+                
+                # 3.2 C2 通道质量 (Green)
+                qc_c2, small_c2 = calculate_comprehensive_qc(
+                    img_c2, final_layer_boxes, current_z_real, prev_img_small=last_small_img_c2
+                )
 
-            # 3.3 [新增] 生物学逻辑检查 (检测结果 vs 信号强度)
-            qc_logic = calculate_channel_logic_qc(
-                img_c1, img_c2, final_layer_boxes, current_z_real
-            )
-            
-            # --- 数据合并 ---
-            combined_qc = {"z": current_z_real, "detection_count": len(final_layer_boxes)}
-            
-            # 合并 C1 结果 (加前缀区分)
-            if qc_c1:
-                for k, v in qc_c1.items():
-                    if k not in ["z", "detection_count"]:
-                        combined_qc[f"c1_{k}"] = v
+                # 3.3 [新增] 生物学逻辑检查 (检测结果 vs 信号强度)
+                qc_logic = calculate_channel_logic_qc(
+                    img_c1, img_c2, final_layer_boxes, current_z_real
+                )
+                
+                # --- 数据合并 ---
+                combined_qc = {"z": current_z_real, "detection_count": len(final_layer_boxes)}
+                
+                # 合并 C1 结果 (加前缀区分)
+                if qc_c1:
+                    for k, v in qc_c1.items():
+                        if k not in ["z", "detection_count"]:
+                            combined_qc[f"c1_{k}"] = v
 
-            # 合并 C2 结果 (加前缀区分)
-            if qc_c2:
-                for k, v in qc_c2.items():
-                    if k not in ["z", "detection_count"]:
-                        combined_qc[f"c2_{k}"] = v
-            
-            # 合并 Logic 结果 (不需要前缀，因为字段名已经是独特的，如 logic_mismatch_rate)
-            if qc_logic:
-                combined_qc.update(qc_logic)
+                # 合并 C2 结果 (加前缀区分)
+                if qc_c2:
+                    for k, v in qc_c2.items():
+                        if k not in ["z", "detection_count"]:
+                            combined_qc[f"c2_{k}"] = v
+                
+                # 合并 Logic 结果 (不需要前缀，因为字段名已经是独特的，如 logic_mismatch_rate)
+                if qc_logic:
+                    combined_qc.update(qc_logic)
 
-            qc_data_list.append(combined_qc)
-            
-            last_small_img_c1 = small_c1
-            last_small_img_c2 = small_c2
+                qc_data_list.append(combined_qc)
+                
+                last_small_img_c1 = small_c1
+                last_small_img_c2 = small_c2
 
-            pbar.update(1)
+                pbar.update(1)
     
     # --- 4. 保存 QC ---
-    if qc_data_list:
+    if run_qc_flag and qc_data_list:
         try:
             # 收集所有可能的 key 以确保表头完整
             all_keys = set().union(*(d.keys() for d in qc_data_list))

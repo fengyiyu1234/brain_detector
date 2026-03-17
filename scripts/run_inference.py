@@ -92,13 +92,16 @@ if __name__ == '__main__':
     tile_size = dp.get('tILESIZE', 2048)
     dir_dict, H, W, Z, z_start, disp_mat_fin = loadTeraxml(pATHxml,tile_size)
     
-    # 判断是否所有 Tile 都完成了 QC
-    missing_qc_tiles = []
-    for i, path in enumerate(pATHTILE):
-        tile_name = os.path.split(path)[-1]
-        qc_path = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_qc_metrics.csv")
-        if not os.path.exists(qc_path):
-            missing_qc_tiles.append((i, path, config))
+    run_qc_flag = dp.get('rUN_QC', True) #check if QC is needed
+
+    missing_qc_tiles = [] #check if all tiles have QC results
+
+    if run_qc_flag:
+        for i, path in enumerate(pATHTILE):
+            tile_name = os.path.split(path)[-1]
+            qc_path = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_qc_metrics.csv")
+            if not os.path.exists(qc_path):
+                missing_qc_tiles.append((i, path, config))
 
     qc_needs_run = len(missing_qc_tiles) > 0
 
@@ -128,10 +131,15 @@ if __name__ == '__main__':
                 tile_name = os.path.split(path)[-1]
                 csv_tile = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_result.csv")
                 qc_tile = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_qc_metrics.csv")
+
+                is_done = False
+                if run_qc_flag:
+                    is_done = os.path.exists(csv_tile) and os.path.exists(qc_tile)
+                else:
+                    is_done = os.path.exists(csv_tile) # 关闭 QC 时，只要有检测结果就行
                 
-                if os.path.exists(csv_tile) and os.path.exists(qc_tile):
-                    # 🔴 统一改用 logging.info
-                    logging.info(f"Checkpoint: Tile {i} ({tile_name}) 检测+QC均完成，跳过。")
+                if is_done:
+                    logging.info(f"Checkpoint: Tile {i} ({tile_name}) 已完成，跳过。")
                 else:
                     tasks_to_run.append((i, path, cfg))
     
@@ -276,12 +284,13 @@ if __name__ == '__main__':
     # ==========================================
     if dp.get('vISUALIZE', True) and 'final_results' in locals():
         save_visualization_samples(
-            final_results, dir_dict, disp_mat_fin, Z, H, W, config
+            final_results, dir_dict, disp_mat_fin, Z, H, W, config, z_start
         )
     
-    try:
-        generate_global_summary(derived['pATH_DET_RES'])
-    except Exception as e:
-        logging.error(f"生成全局 QC 报告失败: {e}")
+    if run_qc_flag:
+        try:
+            generate_global_summary(derived['pATH_DET_RES'])
+        except Exception as e:
+            logging.error(f"生成全局 QC 报告失败: {e}")
 
     logging.info(f"所有任务已完成！总耗时: {(time.time() - start_time)/60:.2f} 分钟。")

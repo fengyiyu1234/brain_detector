@@ -22,9 +22,9 @@
         "yellow": [0, 255, 255]
     },
     "paths": { 
-        "channel1_dir": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\561nm",
-        "channel2_dir": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\numorph_align\\aligned\\GFP",
-        "pATHRESULT": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\detection2"
+        "channel1_dir": "z:\\Ryan\\Light_Sheet_Imaged_Brains\\04-08-2025_FW_2\\561nm",
+        "channel2_dir": "z:\\Ryan\\Light_Sheet_Imaged_Brains\\04-08-2025_FW_2\\numorph_align\\aligned\\GFP",
+        "pATHRESULT": "z:\\Fengyi\\brain_analysis_6sample\\detection_results2"
     },
     "detection_params": {
         "cHANNELS": {
@@ -46,11 +46,12 @@
         "left2right" : true,
         "top2bottom" : true,
         "overlapThresh": 0.4, 
-        "z_distance_limit": 3
+        "z_distance_limit": 3,
+        "rUN_QC": false
     },
 
     "vISUALIZATIONSAMPLESTEP": 100,
-    "vISUALIZATIONSAMPLECOUNT": 100,
+    "vISUALIZATIONSAMPLECOUNT": 20,
     "vISUALIZATIONSIZE": [512, 512],
     "dOWNSAMPLE_PERCENTILE_LOW": 0.1,
     "dOWNSAMPLE_PERCENTILE_HIGH": 99.9
