@@ -1,5 +1,5 @@
 {
-    "model_path": "D:/Fengyi/ultralytics/MADM_Cell_CoExpression/train3_large/weights/best.pt",
+    "model_path": "d:/Fengyi/ultralytics/MADM_2channel_model/train21/weights/best.pt",
     "labels_to_names": {
         "0": "red glia",
         "1": "green glia",
@@ -23,23 +23,18 @@
     },
     "paths": { 
         "channel1_dir": "z:\\Ryan\\Light_Sheet_Imaged_Brains\\04-08-2025_FW_2\\561nm",
-        "channel2_dir": "z:\\Ryan\\Light_Sheet_Imaged_Brains\\04-08-2025_FW_2\\numorph_align\\aligned\\GFP",
-        "pATHRESULT": "z:\\Fengyi\\brain_analysis_6sample\\detection_results2"
+        "channel2_dir": "z:\\Ryan\\Light_Sheet_Imaged_Brains\\04-08-2025_FW_2\\numorph_align\\aligned\\GFP", 
+        "pATHRESULT": "z:\\Fengyi\\brain_analysis_6sample\\detection_results2\\fw2_4"
     },
     "detection_params": {
-        "cHANNELS": {
-                    "561nm": "RFP",
-                    "640nm": "GFP"
-        },
         "dOWNSAMPLE_Z_2X":false,
-        "vISUALIZE_STITCH": false,
         "vISUALIZE_TILE": true,
-        "tHRESHOLD": 0.5,
-        "mINIOU": 0.6,
+        "conf_thresh": 0.25,
+        "nms_iou": 0.45,
         "mERGEZ": true,
         "xsize": 512,
         "ysize": 512,
-        "step": 448,
+        "step": 384,
         "tILESIZE": 2048,
         "sTARTID": null,
         "eNDID": null,

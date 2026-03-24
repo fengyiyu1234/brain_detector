@@ -13,6 +13,33 @@ from src.utils.io import load_cached_detections,listFile
 from src.utils.image import normalize_for_detection
 from src.analysis.qc import calculate_comprehensive_qc, calculate_channel_logic_qc
 
+def draw_dashed_rectangle(img, pt1, pt2, color, thickness=2, dash_length=8):
+    """
+    在 OpenCV 图像上绘制虚线矩形框的辅助函数
+    """
+    x1, y1 = pt1
+    x2, y2 = pt2
+    
+    # 定义四条边：(起点, 终点)
+    lines = [
+        ((x1, y1), (x2, y1)), # 顶边
+        ((x2, y1), (x2, y2)), # 右边
+        ((x2, y2), (x1, y2)), # 底边
+        ((x1, y2), (x1, y1))  # 左边
+    ]
+    
+    for (start_x, start_y), (end_x, end_y) in lines:
+        length = np.hypot(end_x - start_x, end_y - start_y)
+        dashes = max(1, int(length / dash_length))
+        
+        for i in range(dashes):
+            if i % 2 == 0: # 只在偶数段画线，奇数段留空
+                p1 = (int(start_x + (end_x - start_x) * i / dashes), 
+                      int(start_y + (end_y - start_y) * i / dashes))
+                p2 = (int(start_x + (end_x - start_x) * (i + 1) / dashes), 
+                      int(start_y + (end_y - start_y) * (i + 1) / dashes))
+                cv2.line(img, p1, p2, color, thickness)
+
 def process_single_tile(i, pATHTEST, config):
     current_logger = logging.getLogger(__name__)
     dir_name = os.path.basename(pATHTEST)
@@ -104,8 +131,6 @@ def process_single_tile(i, pATHTEST, config):
     with ctx as csvfile:
         filewriter = csv.writer(csvfile) if should_run_yolo else None
 
-
-
         for z_idx, testpath in enumerate(testpaths):
             current_z_real = z_idx + 1 # 1-based index
 
@@ -174,7 +199,9 @@ def process_single_tile(i, pATHTEST, config):
                 xsize, ysize, step_win = dp['xsize'], dp['ysize'], dp['step']
                 H_pad = H0 if (H0-ysize)%step_win == 0 else H0-H0%step_win+ysize
                 W_pad = W0 if (W0-xsize)%step_win == 0 else W0-W0%step_win+xsize
-                
+                conf_thresh = dp.get('conf_thresh', dp.get('tHRESHOLD', 0.25))
+                nms_iou = dp.get('nms_iou', dp.get('mINIOU', 0.45))
+
                 fullimg_pad = np.zeros((H_pad, W_pad, 3), dtype=np.uint8)
                 fullimg_pad[0:H0, 0:W0] = fulldraw
                 
@@ -184,16 +211,14 @@ def process_single_tile(i, pATHTEST, config):
                         patch = fullimg_pad[y:y+ysize, x:x+xsize]
                         if patch.max() < 10: continue # 过滤全黑块
                         
-                        results = model.predict(patch, device=device, verbose=False, iou = dp.get('mINIOU',0.5) )
+                        results = model.predict(patch, device=device, verbose=False,conf=conf_thresh, iou=nms_iou )
                         res = results[0]
                         if len(res.boxes) > 0:
                             boxes = res.boxes.xyxy.cpu().numpy() + np.array([x, y, x, y])
                             scores = res.boxes.conf.cpu().numpy()
                             labels = res.boxes.cls.cpu().numpy()
-                            idx = np.where(scores >= dp['tHRESHOLD'])[0]
-                            if len(idx) > 0:
-                                patch_res = np.hstack((boxes[idx], scores[idx, np.newaxis], labels[idx, np.newaxis]))
-                                raw_detections = np.append(raw_detections, patch_res, axis=0)
+                            patch_res = np.hstack((boxes, scores[:, np.newaxis], labels[:, np.newaxis]))
+                            raw_detections = np.append(raw_detections, patch_res, axis=0)
 
                 # 3.6 XY 平面去重与保存
                 for label_idx in range(num_class):
@@ -215,10 +240,18 @@ def process_single_tile(i, pATHTEST, config):
                             all_tile_detections.append([x1, y1, x2, y2, score, mean_val, int(label_idx), z_idx+1])
 
                             if is_sampled_frame and fulldraw_vis is not None:
-                                c_name = config['colors_map'].get(str(int(label_idx)), "white")
+                                # 1. 获取颜色映射
+                                c_name = config['colors_map'].get(int(label_idx), "white")
                                 bgr_c = config['bgr_colors'].get(c_name, (255, 255, 255))
-                                cv2.rectangle(fulldraw_vis, (ix1, iy1), (ix2, iy2), bgr_c, 2)
-
+                                
+                                # 2. 获取类别名称 (例如 "red glia", "red neuron")
+                                class_name_str = labels_to_names.get(int(label_idx), "").lower()
+                                
+                                # 3. 判断细胞类型：如果是 neuron 就画虚线，否则画实线
+                                if "neuron" in class_name_str:
+                                    draw_dashed_rectangle(fulldraw_vis, (ix1, iy1), (ix2, iy2), bgr_c, thickness=1, dash_length=3)
+                                else:
+                                    cv2.rectangle(fulldraw_vis, (ix1, iy1), (ix2, iy2), bgr_c, thickness=1)
                 # 3.7 保存可视化图
                 if is_sampled_frame and fulldraw_vis is not None:
                     os.makedirs(pATH_VIS_TILE_CURRENT, exist_ok=True)
