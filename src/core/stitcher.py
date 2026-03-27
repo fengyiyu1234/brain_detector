@@ -39,7 +39,7 @@ def non_max_suppression_merge(boxes, overlapThresh=0.5, sort=4):
         idxs = np.delete(idxs, np.concatenate(([last], np.where(overlap > overlapThresh)[0])))
     return boxes[pick]
 
-def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, disp_mat, size, tILESIZE = 2048, file_z0 = None):
+def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, disp_mat, size, metadata_registry, tile_name, tILESIZE = 2048, file_z0 = None):
     row, col = pos
     ABS_X, ABS_Y, ABS_Z = disp_mat[pos]
     H, W = size
@@ -56,7 +56,7 @@ def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, d
     z1 = z0 + Z
     
     for row in csv_reader:
-        _, x1, y1, x2, y2, class_name, score, mean, z = row[:9]
+        slice_name, x1, y1, x2, y2, class_name, score, mean, z = row[:9]
         z = int(float(z))
         x1 = float(x1); x2 = float(x2); y1 = float(y1); y2 = float(y2)
         score = float(score); mean = float(mean)
@@ -66,4 +66,7 @@ def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, d
                 cell_type_index = 0 if classes.index(class_name) < 3 else 1
                 all_predictions[z-1][cell_type_index] = np.concatenate((all_predictions[z-1][cell_type_index],
                                                                          [[x1,y1,x2,y2,score,mean,classes.index(class_name),z]]))
+                # 将该细胞的全局质心与名字注册到内存中
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                metadata_registry.append([cx, cy, z, tile_name, slice_name])
     return all_predictions

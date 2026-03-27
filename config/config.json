@@ -24,12 +24,12 @@
     "paths": { 
         "channel1_dir": "z:\\Ryan\\Light_Sheet_Imaged_Brains\\04-08-2025_FW_2\\561nm",
         "channel2_dir": "z:\\Ryan\\Light_Sheet_Imaged_Brains\\04-08-2025_FW_2\\numorph_align\\aligned\\GFP", 
-        "pATHRESULT": "z:\\Fengyi\\brain_analysis_6sample\\detection_results2\\fw2_4"
+        "pATHRESULT": "z:\\Fengyi\\brain_analysis_6sample\\detection_results2\\fw2_8"
     },
     "detection_params": {
         "dOWNSAMPLE_Z_2X":false,
         "vISUALIZE_TILE": true,
-        "conf_thresh": 0.25,
+        "conf_thresh": 0.4,
         "nms_iou": 0.45,
         "mERGEZ": true,
         "xsize": 512,

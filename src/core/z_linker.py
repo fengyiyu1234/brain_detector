@@ -1,15 +1,15 @@
 import numpy as np
 
-def run_z_linker(full_stack_matrix, iou_thresh=0.3, max_gap=1):
+def run_z_linker(full_stack_matrix, iou_thresh=0.25, max_gap=1, min_z_layers=2):
     """
     针对全量矩阵进行 Z 轴串联
     输入格式: [x1, y1, x2, y2, score, mean, class, z] (8列)
+    新增 min_z_layers: 真实细胞至少需要连续跨越的 Z 层数 (用于强力过滤 2D 噪点)
     """
     if full_stack_matrix.size == 0:
         return full_stack_matrix
 
     # 1. 按 Z 轴排序并分组
-    # 注意：你的 Z 在最后一列 (index 7)
     z_min, z_max = int(np.min(full_stack_matrix[:, 7])), int(np.max(full_stack_matrix[:, 7]))
     z_groups = {z: [] for z in range(z_min, z_max + 1)}
     for det in full_stack_matrix:
@@ -29,15 +29,14 @@ def run_z_linker(full_stack_matrix, iou_thresh=0.3, max_gap=1):
                 track['active'] = False
                 continue
             
-            best_iou = iou_thresh
+            best_overlap = iou_thresh
             best_match_idx = -1
             
-            # 在当前层寻找同类别且 IoU 最大的框
+            # 在当前层寻找同类别且重叠度最大的框
             for idx, det in enumerate(curr_detections):
                 if idx in matched_indices: continue
-                if det[6] != track['class_idx']: continue # 类别校验 (index 6)
+                if det[6] != track['class_idx']: continue # 类别校验
                 
-                # 计算 2D IoU
                 boxA = track['last_box']
                 boxB = det[:4]
                 
@@ -45,13 +44,24 @@ def run_z_linker(full_stack_matrix, iou_thresh=0.3, max_gap=1):
                 yA = max(boxA[1], boxB[1])
                 xB = min(boxA[2], boxB[2])
                 yB = min(boxA[3], boxB[3])
+                
                 interArea = max(0, xB - xA) * max(0, yB - yA)
-                boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-                boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-                iou = interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+                boxAArea = max(0, boxA[2] - boxA[0]) * max(0, boxA[3] - boxA[1])
+                boxBArea = max(0, boxB[2] - boxB[0]) * max(0, boxB[3] - boxB[1])
+                
+                if interArea > 0:
+                    # 核心优化：计算 IoU 以及双向 IoA
+                    iou = interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+                    ioa_A = interArea / float(boxAArea + 1e-6) # 涵盖前一层小框的情况
+                    ioa_B = interArea / float(boxBArea + 1e-6) # 涵盖当前层小框的情况
+                    
+                    # 只要交并比、或者任意一方被绝大部分包围(IoA)，就认为是高度重合
+                    max_overlap_score = max(iou, ioa_A, ioa_B)
+                else:
+                    max_overlap_score = 0
 
-                if iou > best_iou:
-                    best_iou = iou
+                if max_overlap_score > best_overlap:
+                    best_overlap = max_overlap_score
                     best_match_idx = idx
             
             if best_match_idx != -1:
@@ -78,12 +88,11 @@ def run_z_linker(full_stack_matrix, iou_thresh=0.3, max_gap=1):
     finished_tracks.extend(active_tracks)
 
     # 3. 结果聚合：从每个 Track 中选出 Score 最高的代表
-    # 你也可以选择计算中值层，这里采用 Score 最高原则
     final_rows = []
     for track in finished_tracks:
-        # 可选：过滤掉只出现过 1 层的噪声（如果是生物样本通常跨层）
-        if len(track['all_boxes']) >= 1: 
-            best_det = max(track['all_boxes'], key=lambda x: x[4]) # index 4 是 score
+        # 核心优化：利用 3D 信息强力降噪。至少出现在 min_z_layers 层中的才算真细胞
+        if len(track['all_boxes']) >= min_z_layers: 
+            best_det = max(track['all_boxes'], key=lambda x: x[4]) # 选出置信度最高的一层作为代表
             final_rows.append(best_det)
             
     return np.array(final_rows) if len(final_rows) > 0 else np.empty((0, 8))

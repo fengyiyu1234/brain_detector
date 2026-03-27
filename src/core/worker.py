@@ -220,42 +220,111 @@ def process_single_tile(i, pATHTEST, config):
                             patch_res = np.hstack((boxes, scores[:, np.newaxis], labels[:, np.newaxis]))
                             raw_detections = np.append(raw_detections, patch_res, axis=0)
 
-                # 3.6 XY 平面去重与保存
+                # 3.6 XY 平面去重与跨类别优先级过滤（解决大框套小框、同细胞双类别）
+                temp_all_boxes = []
+                
+                # 第一步：收集所有类别的检测框（先执行类内拼接合并碎片）
                 for label_idx in range(num_class):
                     layer_label_data = raw_detections[raw_detections[:, -1] == label_idx, :-1]
                     if layer_label_data.size > 0:
                         cleaned_layer_boxes = stitchDetection(layer_label_data, H0, W0, xsize, ysize, step_win)
-                        class_name = labels_to_names.get(int(label_idx), f"C{label_idx}")
-                        
                         for box in cleaned_layer_boxes:
                             x1, y1, x2, y2, score = box
-                            final_layer_boxes.append([x1, y1, x2, y2, score, label_idx])
-                            ix1, iy1, ix2, iy2 = map(int, [x1, y1, x2, y2])
-                            
-                            # 在原始 16-bit 融合数据上计算均值（包含红绿分量）
-                            cell_crop = fullimg_raw_16bit[max(0,iy1):min(H0,iy2), max(0,ix1):min(W0,ix2)]
-                            mean_val = cell_crop.mean() if cell_crop.size > 0 else 0
-                            
-                            filewriter.writerow([testnames[z_idx], x1, y1, x2, y2, class_name, score, mean_val, z_idx+1])
-                            all_tile_detections.append([x1, y1, x2, y2, score, mean_val, int(label_idx), z_idx+1])
+                            temp_all_boxes.append([x1, y1, x2, y2, score, int(label_idx)])
 
-                            if is_sampled_frame and fulldraw_vis is not None:
-                                # 1. 获取颜色映射
-                                c_name = config['colors_map'].get(int(label_idx), "white")
-                                bgr_c = config['bgr_colors'].get(c_name, (255, 255, 255))
+                filtered_boxes = []
+                if len(temp_all_boxes) > 0:
+                    boxes_np = np.array(temp_all_boxes)
+                    
+                    # 定义你的生物学优先级字典
+                    priority_map = {
+                        2: 3,  # yellow glia (Level 3 - 最高)
+                        0: 2,  # red glia    (Level 2)
+                        1: 2,  # green glia  (Level 2)
+                        5: 1,  # yellow neuron (Level 1)
+                        3: 0,  # red neuron    (Level 0 - 最低)
+                        4: 0   # green neuron  (Level 0 - 最低)
+                    }
+                    
+                    # 获取每个框的优先级和置信度
+                    priorities = np.array([priority_map[int(cls)] for cls in boxes_np[:, 5]])
+                    scores = boxes_np[:, 4]
+                    
+                    sort_idx = np.lexsort((-scores, -priorities))
+                    
+                    kept_boxes = []
+                    for idx in sort_idx:
+                        box_curr = boxes_np[idx]
+                        cx1, cy1, cx2, cy2 = box_curr[:4]
+                        area_c = (cx2 - cx1) * (cy2 - cy1)
+                        
+                        is_suppressed = False
+                        
+                        # 与已经保留的高优框进行比对
+                        for box_kept in kept_boxes:
+                            kx1, ky1, kx2, ky2 = box_kept[:4]
+                            area_k = (kx2 - kx1) * (ky2 - ky1)
+                            
+                            # 计算交集
+                            ixmin, iymin = max(cx1, kx1), max(cy1, ky1)
+                            ixmax, iymax = min(cx2, kx2), min(cy2, ky2)
+                            iw, ih = max(0, ixmax - ixmin), max(0, iymax - iymin)
+                            
+                            if iw > 0 and ih > 0:
+                                inter_area = iw * ih
+                                union_area = area_c + area_k - inter_area
                                 
-                                # 2. 获取类别名称 (例如 "red glia", "red neuron")
-                                class_name_str = labels_to_names.get(int(label_idx), "").lower()
+                                # 计算三种重叠度指标
+                                iou = inter_area / union_area if union_area > 0 else 0
+                                ioa_curr = inter_area / area_c if area_c > 0 else 0 # 交集占当前评估框的比例
+                                ioa_kept = inter_area / area_k if area_k > 0 else 0 # 交集占已保留框的比例
                                 
-                                # 3. 判断细胞类型：如果是 neuron 就画虚线，否则画实线
-                                if "neuron" in class_name_str:
-                                    draw_dashed_rectangle(fulldraw_vis, (ix1, iy1), (ix2, iy2), bgr_c, thickness=1, dash_length=3)
-                                else:
-                                    cv2.rectangle(fulldraw_vis, (ix1, iy1), (ix2, iy2), bgr_c, thickness=1)
+                                # 核心排斥逻辑：
+                                # 1. IoU > 0.35：两个大小相近的框发生明显重叠
+                                # 2. ioa_curr > 0.70：当前框被已保留的大框“套住”了 70% 以上
+                                # 3. ioa_kept > 0.70：已保留的框被当前的大框“套住”了 70% 以上
+                                if iou > 0.35 or ioa_curr > 0.70 or ioa_kept > 0.70:
+                                    is_suppressed = True
+                                    break
+                                    
+                        # 如果没有被高优/高分框排斥，则保留
+                        if not is_suppressed:
+                            kept_boxes.append(box_curr)
+                            
+                    filtered_boxes = kept_boxes
+
+                # 第三步：将过滤后干净的框执行后续的计算均值、保存和可视化
+                for item in filtered_boxes:
+                    x1, y1, x2, y2, score, label_idx = item
+                    final_layer_boxes.append([x1, y1, x2, y2, score, int(label_idx)])
+                    ix1, iy1, ix2, iy2 = map(int, [x1, y1, x2, y2])
+                    
+                    # 在原始 16-bit 融合数据上计算均值（包含红绿分量）
+                    cell_crop = fullimg_raw_16bit[max(0,iy1):min(H0,iy2), max(0,ix1):min(W0,ix2)]
+                    mean_val = cell_crop.mean() if cell_crop.size > 0 else 0
+                    
+                    class_name = labels_to_names.get(int(label_idx), f"C{int(label_idx)}")
+                    filewriter.writerow([name_no_ext, x1, y1, x2, y2, class_name, score, mean_val, z_idx+1])
+                    all_tile_detections.append([x1, y1, x2, y2, score, mean_val, int(label_idx), z_idx+1])
+
+                    if is_sampled_frame and fulldraw_vis is not None:
+                        label_key = int(label_idx)
+                        c_name = config['colors_map'].get(label_key, "white")
+                        bgr_c = config['bgr_colors'].get(c_name, (255, 255, 255))
+                        cell_type_str = config.get('type_map', {}).get(label_key, "").lower()
+
+                        if "glia" in cell_type_str:
+                            # Glia 细胞: 画虚线
+                            draw_dashed_rectangle(fulldraw_vis, (ix1, iy1), (ix2, iy2), bgr_c, thickness=2, dash_length=8)
+                        else:
+                            # Neuron 细胞: 画实线
+                            cv2.rectangle(fulldraw_vis, (ix1, iy1), (ix2, iy2), bgr_c, 2, cv2.LINE_8)
+                        
                 # 3.7 保存可视化图
                 if is_sampled_frame and fulldraw_vis is not None:
                     os.makedirs(pATH_VIS_TILE_CURRENT, exist_ok=True)
                     cv2.imwrite(os.path.join(pATH_VIS_TILE_CURRENT, f"{name_no_ext}_Z{z_idx+1:03d}.jpg"), fulldraw_vis)                  
+            
             else:
                 # --- B. QC Only Mode (读取缓存) ---
                 cached_list = cached_detections_map.get(current_z_real, [])

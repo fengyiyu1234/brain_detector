@@ -15,7 +15,8 @@ import multiprocessing as mp
 import numpy as np
 import torch
 from tqdm import tqdm
-
+import pandas as pd
+from scipy.spatial import cKDTree
 from src.config.loader import load_config
 from src.utils.logger import setup_logging
 from src.utils.io import listTile, loadTeraxml, save_run_metadata
@@ -127,7 +128,6 @@ if __name__ == '__main__':
     else:
         logging.info("✔️ Checkpoint 1 达成: 所有单个 Tile 的检测与 QC 均已完成，跳过 YOLO 推理。")
 
-
     # ==========================================
     # 🔴 阶段 3: 线性 Checkpoint - 全局拼接与 Z-Linker
     # ==========================================
@@ -136,13 +136,15 @@ if __name__ == '__main__':
 
     if os.path.exists(bbox_path):
         logging.info(f"✔️ Checkpoint 2 达成: 发现已有的 {bbox_path}，直接加载全局检测结果。")
-        final_results = np.loadtxt(bbox_path, delimiter=",", skiprows=1)
-        # 防御性编程：如果 CSV 里只有一行数据，loadtxt 会返回 1D 数组，需要转回 2D
+        # 改用 Pandas 读取，因为现在 CSV 里最后两列是字符串，np.loadtxt 会报错
+        df_boxes = pd.read_csv(bbox_path)
+        final_results = df_boxes[["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]].values
         if final_results.ndim == 1:
             final_results = final_results.reshape(1, -1)
     else:
         logging.info("阶段 3: 未找到全局结果，开始合并 Tile 并运行 Z-Linker...")
         all_raw_detections = []
+        metadata_registry = [] # 用于追踪数据的来源
         num_tiles = len(pATHTILE_all)
         
         if num_tiles > 1:
@@ -155,7 +157,7 @@ if __name__ == '__main__':
                         csv_reader = csv.reader(tile_file, delimiter=',', quotechar='|')
                         stitched_predictions = combine_predictions(
                             stitched_predictions, csv_reader, classes, z_start, Z, 
-                            dir_dict[dir_name], disp_mat_fin, (H, W), tILESIZE=2048
+                            dir_dict[dir_name], disp_mat_fin, (H, W), metadata_registry, tile_name, tILESIZE=2048
                         )
             for layer in stitched_predictions:
                 for group in layer:
@@ -164,9 +166,17 @@ if __name__ == '__main__':
             # 单 Tile 模式
             csv_list = [f for f in os.listdir(derived['pATH_DET_RES']) if f.endswith('_result.csv')]
             if csv_list:
+                tile_name = csv_list[0].replace('_result.csv', '')
                 with open(os.path.join(derived['pATH_DET_RES'], csv_list[0]), 'r') as f:
                     reader = csv.reader(f, delimiter=',', quotechar='|')
-                    temp_list = [[float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[6]), float(r[7]), classes.index(r[5]), int(float(r[8]))] for r in reader if len(r)>5]
+                    temp_list = []
+                    for r in reader:
+                        if len(r) > 8:
+                            slice_name = r[0]
+                            x1, y1, x2, y2, score, mean, c, z = float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[6]), float(r[7]), classes.index(r[5]), int(float(r[8]))
+                            temp_list.append([x1, y1, x2, y2, score, mean, c, z])
+                            cx, cy = (x1+x2)/2, (y1+y2)/2
+                            metadata_registry.append([cx, cy, z, tile_name, slice_name])
                     if temp_list: all_raw_detections.append(np.array(temp_list))
         
         if len(all_raw_detections) > 0:
@@ -177,12 +187,33 @@ if __name__ == '__main__':
             else:
                 final_results = full_stack_matrix
             
-            # 保存到本地，达成 Checkpoint
-            np.savetxt(bbox_path, final_results, delimiter=",", header="x1,y1,x2,y2,score,mean,class,z", comments='')
-            logging.info(f"阶段 3 完成: 生成了 {len(final_results)} 个最终细胞坐标。")
+            # --- 逆向溯源匹配，并用 Pandas 保存包含文本的 CSV ---
+            df = pd.DataFrame(final_results, columns=["x1", "y1", "x2", "y2", "score", "mean", "class", "z"])
+            
+            if len(metadata_registry) > 0 and len(final_results) > 0:
+                meta_np = np.array(metadata_registry, dtype=object)
+                meta_coords = meta_np[:, :3].astype(float)
+                meta_coords[:, 2] *= 10.0 # 增强 Z 轴距离权重，防止不同层间错误匹配
+                tree = cKDTree(meta_coords)
+                
+                final_coords = np.column_stack((
+                    (final_results[:, 0] + final_results[:, 2]) / 2,
+                    (final_results[:, 1] + final_results[:, 3]) / 2,
+                    final_results[:, 7] * 10.0
+                ))
+                
+                # 为最终保留下来的每一个框寻找它的来源标签
+                _, indices = tree.query(final_coords)
+                df['tile_name'] = meta_np[indices, 3]
+                df['slice_name'] = meta_np[indices, 4]
+            else:
+                df['tile_name'] = 'Unknown'
+                df['slice_name'] = 'Unknown'
+            
+            df.to_csv(bbox_path, index=False)
+            logging.info(f"阶段 3 完成: 生成了 {len(final_results)} 个细胞坐标。")
         else:
             logging.warning("警告：在所有 Tile 中均未检测到任何目标。")
-
 
     # ==========================================
     # 🔴 阶段 4: 线性 Checkpoint - 生成统计和质心
@@ -214,11 +245,26 @@ if __name__ == '__main__':
             if label in t_map: stats_type[t_map[label]] += 1
             class_specific_data[label].append([x_cent[i], y_cent[i], int(z_vals[i])])
 
-        for label, data in class_specific_data.items():
-            if data:
-                data_np = np.array(data)
-                data_np = data_np[data_np[:, 2].argsort()]
-                np.savetxt(os.path.join(derived['pATH_CENTROIDS'], f"ob_{label}.csv"), data_np, delimiter=",", comments='')
+        # 直接读取Stage 3 生成的包含详尽信息的全局坐标文件
+        if os.path.exists(bbox_path):
+            import pandas as pd
+            df_final = pd.read_csv(bbox_path)
+
+            df_final['cx'] = (df_final['x1'] + df_final['x2']) / 2
+            df_final['cy'] = (df_final['y1'] + df_final['y2']) / 2
+            
+            df_final['z'] = df_final['z'].astype(int)
+            
+            for label, group in df_final.groupby('class'):
+                group_sorted = group.sort_values('z')
+                out_df = group_sorted[['cx', 'cy', 'z', 'score', 'slice_name', 'tile_name']]
+                
+                save_path = os.path.join(derived['pATH_CENTROIDS'], f"ob_{int(label)}.csv")
+                out_df.to_csv(save_path, index=False)
+                
+                logging.info(f"已保存带有溯源信息的质心文件: {save_path}")
+        else:
+            logging.error(f"未找到 {bbox_path}，无法生成质心文件。")
 
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write("Group,Category,Count,Percentage(%)\n")
@@ -230,7 +276,6 @@ if __name__ == '__main__':
                 f.write(f"Type,{t},{count},{count / total_cells * 100:.2f}\n")
 
         logging.info("阶段 4 完成: 统计报告生成完毕。")
-
     
     # ==========================================
     # 阶段 5:  QC 报告
