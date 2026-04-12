@@ -1,17 +1,185 @@
 import sys
 sys.path.insert(0, '../')
 import cv2
-import csv
 import os
+cv2.setNumThreads(0)
+os.environ["OMP_NUM_THREADS"] = "1"
+import csv
 import numpy as np
 from ultralytics import YOLO
 import logging
 from tqdm import tqdm
-from contextlib import nullcontext
 from .stitcher import stitchDetection
-from src.utils.io import load_cached_detections,listFile
 from src.utils.image import normalize_for_detection
-from src.analysis.qc import calculate_comprehensive_qc, calculate_channel_logic_qc
+import warnings
+warnings.filterwarnings("ignore", message=".*channels deprecated.*")
+
+try:
+    from cellpose import models as cp_models
+except ImportError:
+    cp_models = None
+
+import tempfile
+import shutil
+
+def fast_cloud_read(cloud_path):
+    """
+    极速云端图片读取器 (F 盘 SSD 增强版)：
+    将缓存路径指向空间更大的 F 盘 SSD，确保 C 盘系统盘安全。
+    """
+    # 1. 自定义 F 盘的缓存目录
+    temp_dir = r"F:\temp_cache" 
+    
+    # 确保文件夹存在，如果不存在则自动创建
+    if not os.path.exists(temp_dir):
+        try:
+            os.makedirs(temp_dir, exist_ok=True)
+        except Exception as e:
+            # 如果 F 盘没有权限或不存在，退回到 C 盘系统临时目录
+            temp_dir = tempfile.gettempdir()
+    
+    # 2. 构造防冲突的本地临时文件名 (加入当前进程的 PID)
+    file_name = os.path.basename(cloud_path)
+    pid = os.getpid()
+    local_temp_path = os.path.join(temp_dir, f"gpu_worker_{pid}_{file_name}")
+    
+    try:
+        # 3. 操作系统底层级大文件流式拉取
+        shutil.copy2(cloud_path, local_temp_path)
+        
+        # 4. 从 F 盘 SSD 极速读取 (使用 IMREAD_ANYDEPTH 保证 0 损耗)
+        img = cv2.imread(local_temp_path, cv2.IMREAD_ANYDEPTH) 
+        
+        return img
+    
+    except Exception as e:
+        logging.getLogger(__name__).error(f"❌ F 盘读取失败 {cloud_path}: {e}")
+        return None
+        
+    finally:
+        # 5. 阅后即焚：读取完成后立即释放空间
+        if os.path.exists(local_temp_path):
+            try:
+                os.remove(local_temp_path)
+            except:
+                pass
+
+def calculate_iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    if interArea == 0: return 0.0
+    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    return interArea / float(boxAArea + boxBArea - interArea)
+
+def calculate_ioa(box_nuc, box_soma):
+    """计算细胞核在胞体内的占比 (Intersection over Area of Nucleus)"""
+    xA = max(box_nuc[0], box_soma[0])
+    yA = max(box_nuc[1], box_soma[1])
+    xB = min(box_nuc[2], box_soma[2])
+    yB = min(box_nuc[3], box_soma[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    if interArea == 0: return 0.0
+    nucArea = (box_nuc[2] - box_nuc[0]) * (box_nuc[3] - box_nuc[1])
+    return interArea / float(nucArea)
+
+def extract_boxes_from_masks(masks):
+    """将 Cellpose 得到的 2D 实例 mask 转换为 Bounding Box"""
+    boxes = []
+    # 0 是背景，细胞从 1 开始
+    for val in np.unique(masks):
+        if val == 0: continue
+        y_idx, x_idx = np.where(masks == val)
+        if len(y_idx) == 0: continue
+        x1, x2 = np.min(x_idx), np.max(x_idx)
+        y1, y2 = np.min(y_idx), np.max(y_idx)
+        # 固定赋予 nucleus 类别和 1.0 的分数
+        boxes.append([x1, y1, x2, y2, 1.0, "nucleus"])
+    return boxes
+
+def colocalization(layer_channel_boxes, iou_thresh=0.5, ioa_thresh=0.6):
+    target_cells = []
+    
+    rfp_boxes = layer_channel_boxes.get("RFP", [])
+    gfp_boxes = layer_channel_boxes.get("GFP", [])
+    tf_boxes = layer_channel_boxes.get("Sox9", []) # 取决于 config 里的 id
+    
+    matched_gfp_indices = set()
+    
+    # 1. 胞体融合 (RFP 与 GFP)
+    for r_box in rfp_boxes:
+        best_iou = 0
+        best_g_idx = -1
+        
+        for g_idx, g_box in enumerate(gfp_boxes):
+            if g_idx in matched_gfp_indices: continue
+            iou = calculate_iou(r_box[:4], g_box[:4])
+            if iou > best_iou:
+                best_iou = iou
+                best_g_idx = g_idx
+                
+        r_type = r_box[5] # 假设 YOLO 传入的已经是字符串 'neuron' 或 'glia'
+        
+        cell_info = {
+            "box": r_box[:4], 
+            "cell_type": r_type,
+            "markers": ["RFP"],
+            "score": r_box[4]
+        }
+        
+        if best_iou >= iou_thresh:
+            cell_info["markers"].append("GFP")
+            # 坐标取包络框 (包含两者的最大范围)
+            g_box = gfp_boxes[best_g_idx]
+            cell_info["box"] = [
+                min(r_box[0], g_box[0]), min(r_box[1], g_box[1]),
+                max(r_box[2], g_box[2]), max(r_box[3], g_box[3])
+            ]
+            matched_gfp_indices.add(best_g_idx)
+            
+            # --- 冲突解决：Glia 优先级最高 ---
+            g_type = g_box[5]
+            if r_type != g_type:
+                if r_type == 'glia' or g_type == 'glia':
+                    cell_info["cell_type"] = 'glia'
+                else:
+                    # 如果都不是 glia（理论上不可能，除非类别增多），听高置信度的
+                    cell_info["cell_type"] = g_type if g_box[4] > r_box[4] else r_type
+
+        target_cells.append(cell_info)
+        
+    # 将剩下的独立 GFP 放入池中
+    for g_idx, g_box in enumerate(gfp_boxes):
+        if g_idx not in matched_gfp_indices:
+            target_cells.append({
+                "box": g_box[:4],
+                "cell_type": g_box[5],
+                "markers": ["GFP"],
+                "score": g_box[4]
+            })
+
+    # 2. 将 TF (Sox9) 核填入胞体池
+    for tf_box in tf_boxes:
+        for cell in target_cells:
+            # 计算核在胞体内的面积占比
+            ioa = calculate_ioa(tf_box[:4], cell["box"]) 
+            if ioa >= ioa_thresh:
+                cell["markers"].append("Sox9") # 具体标记名视需要可参数化
+                break
+                
+    # 3. 输出格式化
+    final_merged_boxes = []
+    for cell in target_cells:
+        marker_str = "_".join(sorted(cell["markers"]))
+        final_class_name = f"{cell['cell_type']}_{marker_str}"
+        x1, y1, x2, y2 = cell["box"]
+        # 输出 [x1, y1, x2, y2, score, class_name] 以供 stitchDetection 使用
+        final_merged_boxes.append([x1, y1, x2, y2, cell["score"], final_class_name])
+        
+    return final_merged_boxes
 
 def draw_dashed_rectangle(img, pt1, pt2, color, thickness=2, dash_length=8):
     """
@@ -43,363 +211,343 @@ def draw_dashed_rectangle(img, pt1, pt2, color, thickness=2, dash_length=8):
 def process_single_tile(i, pATHTEST, config):
     current_logger = logging.getLogger(__name__)
     dir_name = os.path.basename(pATHTEST)
-    #current_logger.info(f"开始处理 Tile: {dir_name}")
 
-    # --- 1. 初始化变量 ---
     dp = config['detection_params']
-    run_qc_flag = dp.get('rUN_QC', True)
     derived = config['derived_paths']
     paths = config['paths']
-    labels_to_names = config['labels_to_names']
-    num_class = len(labels_to_names)
     device = config['device']
-    names_to_labels = {v: int(k) for k, v in labels_to_names.items()}
-
-    sample_step = config.get('vISUALIZATIONSAMPLESTEP', 100)
-    sample_count = config.get('vISUALIZATIONSAMPLECOUNT', 5)
-    visualize_tile = dp.get('vISUALIZE_TILE', False)
 
     CSV_PATH = os.path.join(derived['pATH_DET_RES'], dir_name + '_result.csv')
-    pATH_VIS_TILE_CURRENT = os.path.join(derived['pATH_VIS_TILE'], dir_name)
-    QC_CSV_PATH = os.path.join(derived['pATH_DET_RES'], dir_name + '_qc_metrics.csv')
-
-    # === Checkpoint 1: 完美完成 ===
-    # 如果 QC 文件存在，说明跑完了，直接跳过
-    if os.path.exists(QC_CSV_PATH):
-        print(f"[{dir_name}] QC Report exists. Skipping entire tile.")
-        # 这里需要返回一些东西以保持主程序兼容，通常返回空列表或读取现有结果
-        return [], dir_name
-
-    # === Checkpoint 2: 检测已完成，补跑 QC (QC Mode) ===
-    should_run_yolo = True
-    cached_detections_map = {}
     
+    # --- 1.Checkpoint ---
     if os.path.exists(CSV_PATH):
-        # 尝试读取现有的 CSV 结果
-        cached_detections_map = load_cached_detections(CSV_PATH)
-        # 如果读取到了数据，说明检测已完成，进入 QC Only 模式
-        if len(cached_detections_map) > 0:
-            print(f"[{dir_name}] Found result.csv. Running QC ONLY mode...")
-            should_run_yolo = False
+        # 结果已存在，直接跳过整个 Tile
+        print(f"[{dir_name}] Result CSV already exists. Skipping tile.")
+        return [], dir_name
+    
+    # --- 2. 解析路由与打印确认 ---
+    routing_config = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
 
-    if os.path.isfile(CSV_PATH):
+    print(f"\n[{dir_name}] === 确认通道推理路由 ===")
+    if not routing_config:
+        current_logger.error("配置文件中没有激活的 channels_routing！")
         return [], dir_name
 
+    required_models = set()
+    for ch in routing_config:
+        ch_dir = paths.get(ch['dir_key'], 'Unknown')
+        print(f" -> 通道: {ch['id']} ({ch.get('type', 'N/A')}) | 模型: {ch['model'].upper()} | 路径: {ch_dir}")
+        required_models.add(ch['model'].lower())
+    print("================================\n")
 
-    # 准备循环
-    # --- 2. 环境准备 ---
-    all_tile_detections = [] 
-
-    if should_run_yolo:
+    # --- 3. 动态加载所需模型 ---
+    models_dict = {}
+    if 'yolo' in required_models:
         try:
-            model = YOLO(config['model_path']) # 确保 config 里有这个 key
+            models_dict['yolo'] = YOLO(config['models']['yolo_path'])
+            # 注意获取新的模型类别映射
+            yolo_classes = config.get('model_classes', {}).get('yolo', {"0":"neuron", "1":"glia"})
+            print(f"[{dir_name}] ✔️ YOLO 模型加载成功")
         except Exception as e:
-            current_logger.error(f"模型加载失败: {e}")
+            current_logger.error(f"YOLO 加载失败: {e}")
             return [], dir_name
-    testnames, testpaths = listFile(pATHTEST, '.tiff')
-
-    if config['detection_params'].get('dOWNSAMPLE_Z_2X', False):
-        current_logger.info(f"Downsampling enabled: reducing Z-stack by 2x for {dir_name}")
-        testnames = testnames[::2]  # 从索引0开始，每隔2个取一个
-        testpaths = testpaths[::2]
-
-    if not testpaths: return [], dir_name
-
-    # 建立 Channel 2 索引
-    c1_root = os.path.abspath(paths['channel1_dir'])
-    c2_root = os.path.abspath(paths['channel2_dir'])
-    rel_tile_path = os.path.relpath(pATHTEST, c1_root)
-    pATHTEST_C2 = os.path.join(c2_root, rel_tile_path)
-
-    c2_files_index = {}
-    if os.path.exists(pATHTEST_C2):
-        c2_files_index = {os.path.splitext(f)[0]: os.path.join(pATHTEST_C2, f) 
-                          for f in os.listdir(pATHTEST_C2) 
-                          if f.lower().endswith(('.tif', '.tiff')) and not f.startswith('.')}
-
-    mode_str = "Full" if should_run_yolo else "QC-Only"
-    pbar = tqdm(total=len(testpaths), desc=f"[{mode_str}] {dir_name[:10]}", position=i+1, leave=False)
-
-    #for qc
-    qc_data_list = []
-    last_small_img_c1 = None
-    last_small_img_c2 = None    
-
-    # --- 3. 核心循环 (Z-axis) ---
-    ctx = open(CSV_PATH, 'w', newline='') if should_run_yolo else nullcontext()
     
-    with ctx as csvfile:
-        filewriter = csv.writer(csvfile) if should_run_yolo else None
+    if 'cellpose' in required_models:
+        try:
+            from cellpose import models as cp_models
+            models_dict['cellpose'] = cp_models.CellposeModel(
+                pretrained_model=config['models']['cellpose_path'], 
+                gpu=(device == 'cuda')
+            )
+            print(f"[{dir_name}] ✔️ Cellpose 模型加载成功")
+        except Exception as e:
+            current_logger.error(f"Cellpose 加载失败: {e}")
+            return [], dir_name
 
-        for z_idx, testpath in enumerate(testpaths):
+    # --- 4. 建立多通道文件索引 (完美镜像结构版) ---
+    anchor_ch = routing_config[0]
+    anchor_root = os.path.abspath(paths[anchor_ch['dir_key']])
+    
+    print(f"\n[{dir_name}] ====== 文件检索 Checkpoint ======")
+    
+    # 1. 获取锚点通道的所有图片 (完美兼容 .tif 和 .tiff 混用)
+    testnames = []
+    if os.path.exists(pATHTEST):
+        for f in os.listdir(pATHTEST):
+            if f.lower().endswith(('.tif', '.tiff')) and not f.startswith('.'):
+                testnames.append(f)
+        testnames.sort()
+        
+    print(f" -> 锚点通道 [{anchor_ch['id']}] (路径: {pATHTEST})")
+    print(f"    共找到切片: {len(testnames)} 张")
+
+    if not testnames:
+        current_logger.error(f"❌ 严重错误: 目录中没找到任何 tif/tiff，跳过此 Tile！")
+        return [], dir_name
+
+    # 提取无后缀名作为 Key (e.g., '452800_377900_001')
+    testnames_no_ext = [os.path.splitext(f)[0] for f in testnames]
+
+    if dp.get('dOWNSAMPLE_Z_2X', False):
+        testnames = testnames[::2]
+        testnames_no_ext = testnames_no_ext[::2]
+
+    # 获取相对的二级结构路径 (例如: 452800\452800_377900)
+    rel_tile_path = os.path.relpath(pATHTEST, anchor_root)
+    channel_files_indices = {}
+
+    # 2. 精准映射镜像通道
+    for ch in routing_config:
+        ch_id = ch['id']
+        ch_root = os.path.abspath(paths[ch['dir_key']])
+        
+        # 因为结构一模一样，直接将根目录和二级相对路径拼起来
+        target_dir = os.path.join(ch_root, rel_tile_path)
+        
+        if os.path.exists(target_dir):
+            files_dict = {
+                os.path.splitext(f)[0]: os.path.join(target_dir, f) 
+                for f in os.listdir(target_dir) 
+                if f.lower().endswith(('.tif', '.tiff')) and not f.startswith('.')
+            }
+            channel_files_indices[ch_id] = files_dict
+            print(f" -> 关联通道 [{ch_id}] 找到切片: {len(files_dict)} 张")
+        else:
+            channel_files_indices[ch_id] = {}
+            current_logger.warning(f"⚠️ 警告: 找不到对应的镜像文件夹: {target_dir}")
+            
+    print("======================================\n")
+
+    # --- 5. 核心循环准备 ---
+    all_tile_detections = []
+    pbar = tqdm(total=len(testnames_no_ext), desc=f"[{dir_name[:10]}] 准备启动...", position=i+1, leave=False)
+
+    file_handles = {}
+    csv_writers = {}
+
+    # 1. 打开综合结果的主 CSV
+    f_combined = open(CSV_PATH, 'w', newline='', encoding='utf-8')
+    writer_combined = csv.writer(f_combined)
+
+    # 2. 为每个激活的通道打开专属的 CSV
+    for ch in routing_config:
+        ch_id = ch['id']
+        ch_csv_path = os.path.join(derived['pATH_DET_RES'], f"{dir_name}_{ch_id}_result.csv")
+        f_ch = open(ch_csv_path, 'w', newline='', encoding='utf-8')
+        file_handles[ch_id] = f_ch
+        csv_writers[ch_id] = csv.writer(f_ch)
+        
+    try:
+        for z_idx, name_no_ext in enumerate(testnames_no_ext):
             current_z_real = z_idx + 1 # 1-based index
-
-            # 3.1 鲁棒性读取 Channel 1 (Red)
-            # 无论什么模式，QC 必须读图
-            img_c1 = cv2.imread(testpath, cv2.IMREAD_ANYDEPTH)
-            if img_c1 is None:
-                pbar.update(1)
-                continue
-            if len(img_c1.shape) == 3: img_c1 = img_c1[:, :, 0]
-            H0, W0 = img_c1.shape[:2]
-
-            # 3.2 鲁棒性读取 Channel 2 (Green)
-            name_no_ext = os.path.splitext(testnames[z_idx])[0]
-            c2_full_path = c2_files_index.get(name_no_ext)
-            img_c2 = None
-            if c2_full_path and os.path.exists(c2_full_path):
-                img_c2 = cv2.imread(c2_full_path, cv2.IMREAD_ANYDEPTH)
-                if img_c2 is not None and len(img_c2.shape) == 3:
-                    img_c2 = img_c2[:, :, 0]
-
-            # C2 缺失保护
-            if img_c2 is None: 
-                img_c2 = np.zeros((H0, W0), dtype=np.uint16)
-            # 尺寸对齐保护
-            elif img_c2.shape[:2] != (H0, W0):
-                img_c2_resized = np.zeros((H0, W0), dtype=img_c2.dtype)
-                h_l, w_l = min(H0, img_c2.shape[0]), min(W0, img_c2.shape[1])
-                img_c2_resized[:h_l, :w_l] = img_c2[:h_l, :w_l]
-                img_c2 = img_c2_resized
+            # 格式: { "RFP": [[x1, y1, x2, y2, score, "neuron"], ...], "Sox9": [...] }
+            layer_channel_boxes = {ch['id']: [] for ch in routing_config}
+        
+            H0, W0 = 0, 0 
 
             # =========================================================
-            # 步骤 2: 获取检测结果 (Run YOLO or Read Cache)
+            # 步骤 2.1: 遍历路由表，进行独立的单通道检测
             # =========================================================
-            final_layer_boxes = []
-            if should_run_yolo:
-
-                # 3.3 分通道归一化 (核心修改)
-                p_low, p_high = config['dOWNSAMPLE_PERCENTILE_LOW'], config['dOWNSAMPLE_PERCENTILE_HIGH']
-                red_8bit = normalize_for_detection(img_c1, p_low, p_high)
+            for ch in routing_config:
+                ch_id = ch['id']
+                pbar.set_description(f"Tile:[{dir_name[:10]}] | Z层:[{current_z_real}/{len(testnames_no_ext)}] | 检测通道:[{ch_id}]")
+                ch_model = ch['model']
+                img_path = channel_files_indices[ch_id].get(name_no_ext)
                 
-                # 对 C2 进行尺寸对齐（防止红绿通道图尺寸微差）
-                if img_c2.shape[:2] != (H0, W0):
-                    img_c2_resized = np.zeros((H0, W0), dtype=np.uint16)
-                    h_l, w_l = min(H0, img_c2.shape[0]), min(W0, img_c2.shape[1])
-                    img_c2_resized[:h_l, :w_l] = img_c2[:h_l, :w_l]
-                    img_c2 = img_c2_resized
+                # 如果当前 Z 层该通道缺图，直接跳过
+                if not img_path or not os.path.exists(img_path):
+                    continue
                     
-                green_8bit = normalize_for_detection(img_c2, p_low, p_high)
-
-                # 合成 8-bit BGR (B:0, G:green, R:red)
-                fulldraw = np.zeros((H0, W0, 3), dtype=np.uint8)
-                fulldraw[:, :, 1] = green_8bit
-                fulldraw[:, :, 2] = red_8bit
-
-                # 用于计算均值的原始 16-bit 堆叠图 (用于后续 mean_val 计算)
-                fullimg_raw_16bit = np.zeros((H0, W0, 3), dtype=np.uint16)
-                fullimg_raw_16bit[:, :, 1] = img_c2
-                fullimg_raw_16bit[:, :, 2] = img_c1
-
-                # 3.4 采样可视化判定
-                is_sampled_frame = visualize_tile and (z_idx % sample_step < sample_count)
-                fulldraw_vis = fulldraw.copy() if is_sampled_frame else None
-
-                # 3.5 滑动窗口检测 (使用 8-bit RG 融合图)
-                xsize, ysize, step_win = dp['xsize'], dp['ysize'], dp['step']
-                H_pad = H0 if (H0-ysize)%step_win == 0 else H0-H0%step_win+ysize
-                W_pad = W0 if (W0-xsize)%step_win == 0 else W0-W0%step_win+xsize
-                conf_thresh = dp.get('conf_thresh', dp.get('tHRESHOLD', 0.25))
-                nms_iou = dp.get('nms_iou', dp.get('mINIOU', 0.45))
-
-                fullimg_pad = np.zeros((H_pad, W_pad, 3), dtype=np.uint8)
-                fullimg_pad[0:H0, 0:W0] = fulldraw
+                img_raw = cv2.imread(img_path, cv2.IMREAD_ANYDEPTH)
+                if img_raw is None: continue
+                if len(img_raw.shape) == 3: img_raw = img_raw[:, :, 0]
                 
-                raw_detections = np.empty((0, 6))
-                for x in range(0, W_pad, step_win):
-                    for y in range(0, H_pad, step_win):
-                        patch = fullimg_pad[y:y+ysize, x:x+xsize]
-                        if patch.max() < 10: continue # 过滤全黑块
-                        
-                        results = model.predict(patch, device=device, verbose=False,conf=conf_thresh, iou=nms_iou )
-                        res = results[0]
-                        if len(res.boxes) > 0:
-                            boxes = res.boxes.xyxy.cpu().numpy() + np.array([x, y, x, y])
-                            scores = res.boxes.conf.cpu().numpy()
-                            labels = res.boxes.cls.cpu().numpy()
-                            patch_res = np.hstack((boxes, scores[:, np.newaxis], labels[:, np.newaxis]))
-                            raw_detections = np.append(raw_detections, patch_res, axis=0)
+                if H0 == 0: H0, W0 = img_raw.shape[:2] # 记录当前层的实际尺寸
 
-                # 3.6 XY 平面去重与跨类别优先级过滤（解决大框套小框、同细胞双类别）
-                temp_all_boxes = []
-                
-                # 第一步：收集所有类别的检测框（先执行类内拼接合并碎片）
-                for label_idx in range(num_class):
-                    layer_label_data = raw_detections[raw_detections[:, -1] == label_idx, :-1]
-                    if layer_label_data.size > 0:
-                        cleaned_layer_boxes = stitchDetection(layer_label_data, H0, W0, xsize, ysize, step_win)
-                        for box in cleaned_layer_boxes:
-                            x1, y1, x2, y2, score = box
-                            temp_all_boxes.append([x1, y1, x2, y2, score, int(label_idx)])
+                # 单通道图像归一化 (拉伸到 0-255)
+                norm_img = normalize_for_detection(img_raw, dp['dOWNSAMPLE_PERCENTILE_LOW'], dp['dOWNSAMPLE_PERCENTILE_HIGH'])
 
-                filtered_boxes = []
-                if len(temp_all_boxes) > 0:
-                    boxes_np = np.array(temp_all_boxes)
+                # --------- YOLO 单通道滑动窗口检测 ---------
+                if ch_model == 'yolo':
+                    img_infer = cv2.cvtColor(norm_img, cv2.COLOR_GRAY2BGR) # YOLO 仍需要 3 通道输入
                     
-                    # 定义你的生物学优先级字典
-                    priority_map = {
-                        2: 3,  # yellow glia (Level 3 - 最高)
-                        0: 2,  # red glia    (Level 2)
-                        1: 2,  # green glia  (Level 2)
-                        5: 1,  # yellow neuron (Level 1)
-                        3: 0,  # red neuron    (Level 0 - 最低)
-                        4: 0   # green neuron  (Level 0 - 最低)
-                    }
+                    xsize, ysize, step_win = dp['xsize'], dp['ysize'], dp['step']
+                    H_pad = H0 if (H0-ysize)%step_win == 0 else H0-H0%step_win+ysize
+                    W_pad = W0 if (W0-xsize)%step_win == 0 else W0-W0%step_win+xsize
                     
-                    # 获取每个框的优先级和置信度
-                    priorities = np.array([priority_map[int(cls)] for cls in boxes_np[:, 5]])
-                    scores = boxes_np[:, 4]
+                    fullimg_pad = np.zeros((H_pad, W_pad, 3), dtype=np.uint8)
+                    fullimg_pad[0:H0, 0:W0] = img_infer
                     
-                    sort_idx = np.lexsort((-scores, -priorities))
+                    conf_thresh = dp.get('conf_thresh', dp.get('tHRESHOLD', 0.25))
+                    nms_iou = dp.get('nms_iou', dp.get('mINIOU', 0.45))
                     
-                    kept_boxes = []
-                    for idx in sort_idx:
-                        box_curr = boxes_np[idx]
+                    raw_detections = np.empty((0, 6))
+                    for x in range(0, W_pad, step_win):
+                        for y in range(0, H_pad, step_win):
+                            patch = fullimg_pad[y:y+ysize, x:x+xsize]
+                            if patch.max() < 10: continue # 过滤纯黑无信号背景
+                            
+                            results = models_dict['yolo'].predict(patch, device=device, verbose=False, conf=conf_thresh, iou=nms_iou)
+                            res = results[0]
+                            if len(res.boxes) > 0:
+                                boxes = res.boxes.xyxy.cpu().numpy() + np.array([x, y, x, y])
+                                scores = res.boxes.conf.cpu().numpy()
+                                labels = res.boxes.cls.cpu().numpy()
+                                patch_res = np.hstack((boxes, scores[:, np.newaxis], labels[:, np.newaxis]))
+                                raw_detections = np.append(raw_detections, patch_res, axis=0)
+
+                    # 针对单通道内进行拼接和去重 (stitchDetection)
+                    unique_labels = np.unique(raw_detections[:, 5]) if raw_detections.size > 0 else []
+                    temp_yolo_boxes = []
+                    
+                    for lbl in unique_labels:
+                        # 提取该类别坐标 [x1, y1, x2, y2, score] 进行局部拼接 NMS
+                        layer_label_data = raw_detections[raw_detections[:, 5] == lbl, :-1]
+                        if layer_label_data.size > 0:
+                            cleaned_boxes = stitchDetection(layer_label_data, H0, W0, xsize, ysize, step_win)
+                            class_str = yolo_classes.get(str(int(lbl)), "unknown")
+                            for box in cleaned_boxes:
+                                temp_yolo_boxes.append([box[0], box[1], box[2], box[3], box[4], class_str])
+                                
+                    # --- 单通道内部的冲突解决 (如模型在同个位置既框了 Neuron 又框了 Glia) ---
+                    kept_yolo_boxes = []
+                    temp_yolo_boxes.sort(key=lambda x: (1 if x[5]=='glia' else 0, x[4]), reverse=True) # Glia优先，得分高的优先
+                    for box_curr in temp_yolo_boxes:
+                        is_suppressed = False
                         cx1, cy1, cx2, cy2 = box_curr[:4]
                         area_c = (cx2 - cx1) * (cy2 - cy1)
-                        
-                        is_suppressed = False
-                        
-                        # 与已经保留的高优框进行比对
-                        for box_kept in kept_boxes:
+                        for box_kept in kept_yolo_boxes:
                             kx1, ky1, kx2, ky2 = box_kept[:4]
                             area_k = (kx2 - kx1) * (ky2 - ky1)
-                            
-                            # 计算交集
-                            ixmin, iymin = max(cx1, kx1), max(cy1, ky1)
-                            ixmax, iymax = min(cx2, kx2), min(cy2, ky2)
-                            iw, ih = max(0, ixmax - ixmin), max(0, iymax - iymin)
-                            
+                            iw = max(0, min(cx2, kx2) - max(cx1, kx1))
+                            ih = max(0, min(cy2, ky2) - max(cy1, ky1))
                             if iw > 0 and ih > 0:
                                 inter_area = iw * ih
-                                union_area = area_c + area_k - inter_area
-                                
-                                # 计算三种重叠度指标
-                                iou = inter_area / union_area if union_area > 0 else 0
-                                ioa_curr = inter_area / area_c if area_c > 0 else 0 # 交集占当前评估框的比例
-                                ioa_kept = inter_area / area_k if area_k > 0 else 0 # 交集占已保留框的比例
-                                
-                                # 核心排斥逻辑：
-                                # 1. IoU > 0.35：两个大小相近的框发生明显重叠
-                                # 2. ioa_curr > 0.70：当前框被已保留的大框“套住”了 70% 以上
-                                # 3. ioa_kept > 0.70：已保留的框被当前的大框“套住”了 70% 以上
-                                if iou > 0.35 or ioa_curr > 0.70 or ioa_kept > 0.70:
+                                ioa_curr = inter_area / area_c if area_c > 0 else 0
+                                if ioa_curr > 0.70 or (inter_area / (area_c + area_k - inter_area) > 0.35):
                                     is_suppressed = True
                                     break
-                                    
-                        # 如果没有被高优/高分框排斥，则保留
                         if not is_suppressed:
-                            kept_boxes.append(box_curr)
+                            kept_yolo_boxes.append(box_curr)
                             
-                    filtered_boxes = kept_boxes
+                            # ✨ 写入纯 YOLO 单通道的独立结果
+                            # 格式: [slice_name, x1, y1, x2, y2, class, score, mean, z_val]
+                            row = [name_no_ext, box_curr[0], box_curr[1], box_curr[2], box_curr[3], box_curr[5], box_curr[4], 0.0, current_z_real]
+                            csv_writers[ch_id].writerow(row)
+                            
+                    layer_channel_boxes[ch_id].extend(kept_yolo_boxes)
 
-                # 第三步：将过滤后干净的框执行后续的计算均值、保存和可视化
-                for item in filtered_boxes:
-                    x1, y1, x2, y2, score, label_idx = item
-                    final_layer_boxes.append([x1, y1, x2, y2, score, int(label_idx)])
-                    ix1, iy1, ix2, iy2 = map(int, [x1, y1, x2, y2])
+                # --------- Cellpose 单通道密集细胞核检测 ---------
+                elif ch_model == 'cellpose':
+                    # eval 直接接受 2D 矩阵
+                    masks, flows, styles = models_dict['cellpose'].eval(norm_img, diameter=None, channels=[0,0])
+                    cp_boxes = extract_boxes_from_masks(masks) # 调用前面定义的辅助函数
                     
-                    # 在原始 16-bit 融合数据上计算均值（包含红绿分量）
-                    cell_crop = fullimg_raw_16bit[max(0,iy1):min(H0,iy2), max(0,ix1):min(W0,ix2)]
-                    mean_val = cell_crop.mean() if cell_crop.size > 0 else 0
-                    
-                    class_name = labels_to_names.get(int(label_idx), f"C{int(label_idx)}")
-                    filewriter.writerow([name_no_ext, x1, y1, x2, y2, class_name, score, mean_val, z_idx+1])
-                    all_tile_detections.append([x1, y1, x2, y2, score, mean_val, int(label_idx), z_idx+1])
-
-                    if is_sampled_frame and fulldraw_vis is not None:
-                        label_key = int(label_idx)
-                        c_name = config['colors_map'].get(label_key, "white")
-                        bgr_c = config['bgr_colors'].get(c_name, (255, 255, 255))
-                        cell_type_str = config.get('type_map', {}).get(label_key, "").lower()
-
-                        if "glia" in cell_type_str:
-                            # Glia 细胞: 画虚线
-                            draw_dashed_rectangle(fulldraw_vis, (ix1, iy1), (ix2, iy2), bgr_c, thickness=2, dash_length=8)
-                        else:
-                            # Neuron 细胞: 画实线
-                            cv2.rectangle(fulldraw_vis, (ix1, iy1), (ix2, iy2), bgr_c, 2, cv2.LINE_8)
+                    for box in cp_boxes:
+                        # ✨ 写入纯 Cellpose 单通道的独立结果
+                        row = [name_no_ext, box[0], box[1], box[2], box[3], box[5], box[4], 0.0, current_z_real]
+                        csv_writers[ch_id].writerow(row)
                         
-                # 3.7 保存可视化图
-                if is_sampled_frame and fulldraw_vis is not None:
-                    os.makedirs(pATH_VIS_TILE_CURRENT, exist_ok=True)
-                    cv2.imwrite(os.path.join(pATH_VIS_TILE_CURRENT, f"{name_no_ext}_Z{z_idx+1:03d}.jpg"), fulldraw_vis)                  
-            
-            else:
-                # --- B. QC Only Mode (读取缓存) ---
-                cached_list = cached_detections_map.get(current_z_real, [])
-                # 缓存格式: [x1, y1, x2, y2, score, class_name]
-                # 需要转换 class_name -> cls_id (为了 calculate_channel_logic_qc)
-                for item in cached_list:
-                    c_name = item[5]
-                    c_id = names_to_labels.get(c_name, -1) # 如果找不到 ID，给 -1
-                    if c_id != -1:
-                        # 替换最后一项为 ID
-                        new_item = item[:5] + [c_id]
-                        final_layer_boxes.append(new_item)
-            
+                    layer_channel_boxes[ch_id].extend(cp_boxes)
+
             # =========================================================
-            # 步骤 3: 双通道 QC 计算 (Dual Channel QC)
+            # 步骤 2.2: 跨通道空间重叠合并 (Colocalization)
             # =========================================================
-            if run_qc_flag:
-            # 3.1 C1 通道质量 (Red)
-                qc_c1, small_c1 = calculate_comprehensive_qc(
-                    img_c1, final_layer_boxes, current_z_real, prev_img_small=last_small_img_c1
-                )
-                
-                # 3.2 C2 通道质量 (Green)
-                qc_c2, small_c2 = calculate_comprehensive_qc(
-                    img_c2, final_layer_boxes, current_z_real, prev_img_small=last_small_img_c2
-                )
+            # 将各个通道提取好的 Box 融合，填入 Sox9 核，并且合并 RFP/GFP
+            final_merged_boxes = colocalization(layer_channel_boxes, iou_thresh=0.5, ioa_thresh=0.6)
 
-                # 3.3 [新增] 生物学逻辑检查 (检测结果 vs 信号强度)
-                qc_logic = calculate_channel_logic_qc(
-                    img_c1, img_c2, final_layer_boxes, current_z_real
-                )
+            # =========================================================
+            # 步骤 2.3: 写入综合结果并处理可视化
+            # =========================================================
+            for item in final_merged_boxes:
+                # final_merged_boxes 的格式是 [x1, y1, x2, y2, score, final_class_name]
+                x1, y1, x2, y2, score, class_name = item
+                mean_val = 0.0 # 因为解耦了通道，伪彩平均强度失去意义，置为 0，不影响空间坐标拼接
                 
-                # --- 数据合并 ---
-                combined_qc = {"z": current_z_real, "detection_count": len(final_layer_boxes)}
+                # ✨ 保存至融合主 CSV
+                writer_combined.writerow([name_no_ext, x1, y1, x2, y2, class_name, score, mean_val, current_z_real])
                 
-                # 合并 C1 结果 (加前缀区分)
-                if qc_c1:
-                    for k, v in qc_c1.items():
-                        if k not in ["z", "detection_count"]:
-                            combined_qc[f"c1_{k}"] = v
+                # 追加至全局列表供 Z-linker 3D 追踪使用
+                all_tile_detections.append([x1, y1, x2, y2, score, mean_val, class_name, current_z_real])
 
-                # 合并 C2 结果 (加前缀区分)
-                if qc_c2:
-                    for k, v in qc_c2.items():
-                        if k not in ["z", "detection_count"]:
-                            combined_qc[f"c2_{k}"] = v
+            # 如果开启了可视化 (按需采样，将综合结果画在某一层上做记录)
+            visualize_tile = dp.get('vISUALIZE_TILE', False)
+            sample_step = config.get('vISUALIZATIONSAMPLESTEP', 100)
+            sample_count = config.get('vISUALIZATIONSAMPLECOUNT', 5)
+            
+            if visualize_tile and (z_idx % sample_step < sample_count) and H0 > 0:
+                pATH_VIS_TILE_CURRENT = os.path.join(derived['pATH_VIS_TILE'], dir_name)
+                os.makedirs(pATH_VIS_TILE_CURRENT, exist_ok=True)
                 
-                # 合并 Logic 结果 (不需要前缀，因为字段名已经是独特的，如 logic_mismatch_rate)
-                if qc_logic:
-                    combined_qc.update(qc_logic)
+                # 创建一个全黑底板用于绘制综合结果
+                vis_img = np.zeros((H0, W0, 3), dtype=np.uint8)
+                for box in final_merged_boxes:
+                    ix1, iy1, ix2, iy2 = map(int, box[:4])
+                    c_name = box[5] # e.g. "glia_GFP_Sox9"
+                    
+                    # 简单按字符串包含上色
+                    color = (255, 255, 255) # Default white
+                    if "RFP" in c_name and "GFP" in c_name: color = (0, 255, 255) # Yellow for dual
+                    elif "RFP" in c_name: color = (0, 0, 255)
+                    elif "GFP" in c_name: color = (0, 255, 0)
+                    
+                    if "glia" in c_name.lower():
+                        draw_dashed_rectangle(vis_img, (ix1, iy1), (ix2, iy2), color, thickness=2)
+                    else:
+                        cv2.rectangle(vis_img, (ix1, iy1), (ix2, iy2), color, 2, cv2.LINE_8)
+                        
+                cv2.imwrite(os.path.join(pATH_VIS_TILE_CURRENT, f"{name_no_ext}_Z{current_z_real:03d}.jpg"), vis_img)
 
-                qc_data_list.append(combined_qc)
-                
-                last_small_img_c1 = small_c1
-                last_small_img_c2 = small_c2
+            # ✅ 所有的通道、融合、可视化都搞定了，这一层结束，进度条前进一格
+            pbar.update(1)
 
-                pbar.update(1)
+    finally:
+        f_combined.close()
+        for f in file_handles.values():
+            f.close()
+        pbar.close()
     
-    # --- 4. 保存 QC ---
-    if run_qc_flag and qc_data_list:
-        try:
-            # 收集所有可能的 key 以确保表头完整
-            all_keys = set().union(*(d.keys() for d in qc_data_list))
-            # 排序：z, detection_count 在前，其他字母序
-            sorted_keys = ['z', 'detection_count'] + sorted([k for k in all_keys if k not in ['z', 'detection_count']])
-            
-            with open(QC_CSV_PATH, 'w', newline='') as output_file:
-                dict_writer = csv.DictWriter(output_file, fieldnames=sorted_keys)
-                dict_writer.writeheader()
-                dict_writer.writerows(qc_data_list)
-        except Exception as e:
-            current_logger.error(f"QC Save Failed: {e}")
+    # =========================================================
+    # 步骤 6: 生成 Summary 统计文件
+    # =========================================================
+    from collections import Counter
+    
+    # 1. 提取所有检测到的类别标签
+    # all_tile_detections 的每个 item 格式: [x1, y1, x2, y2, score, mean, class_name, z]
+    all_labels = [item[6] for item in all_tile_detections]
+    
+    # 2. 使用 Counter 进行细分统计 (各种 marker 组合)
+    detail_counts = Counter(all_labels)
+    
+    # 3. 计算大类总数 (Neuron / Glia)
+    total_cells = len(all_labels)
+    total_neurons = sum(count for label, count in detail_counts.items() if label.startswith('neuron'))
+    total_glia = sum(count for label, count in detail_counts.items() if label.startswith('glia'))
+    
+    # 4. 写入 Summary CSV 文件
+    SUMMARY_PATH = os.path.join(derived['pATH_DET_RES'], f"{dir_name}_summary.csv")
+    with open(SUMMARY_PATH, 'w', newline='', encoding='utf-8') as f_sum:
+        sum_writer = csv.writer(f_sum)
+        
+        # 写入标题行和核心指标
+        sum_writer.writerow(["Metric", "Count"])
+        sum_writer.writerow(["Total_Detected_Cells", total_cells])
+        sum_writer.writerow(["Total_Neurons", total_neurons])
+        sum_writer.writerow(["Total_Glia", total_glia])
+        sum_writer.writerow([]) # 空行隔开
+        
+        # 写入每个细分类别的详细统计
+        sum_writer.writerow(["Detailed_Class_Name", "Cell_Count"])
+        # 按类别名称排序，让结果整齐一点
+        for label in sorted(detail_counts.keys()):
+            sum_writer.writerow([label, detail_counts[label]])
 
-    pbar.close()
-    if model: del model
+    print(f"✅ Tile {dir_name} 统计完成: 共发现 {total_cells} 个细胞 (Neuron: {total_neurons}, Glia: {total_glia})")
+
+    # 释放显存
+    for mod_name in list(models_dict.keys()):
+        del models_dict[mod_name]
+        
     return all_tile_detections, dir_name
 
 def process_single_tile_wrapper(args):

@@ -39,6 +39,7 @@ def non_max_suppression_merge(boxes, overlapThresh=0.5, sort=4):
         idxs = np.delete(idxs, np.concatenate(([last], np.where(overlap > overlapThresh)[0])))
     return boxes[pick]
 
+# 将 classes 参数设置了默认值 None，防止你主程序传参时报错
 def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, disp_mat, size, metadata_registry, tile_name, tILESIZE = 2048, file_z0 = None):
     row, col = pos
     ABS_X, ABS_Y, ABS_Z = disp_mat[pos]
@@ -55,18 +56,26 @@ def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, d
     z0 = z_start - ABS_Z
     z1 = z0 + Z
     
-    for row in csv_reader:
-        slice_name, x1, y1, x2, y2, class_name, score, mean, z = row[:9]
+    for row_data in csv_reader:
+        slice_name, x1, y1, x2, y2, class_name, score, mean, z = row_data[:9]
         z = int(float(z))
         x1 = float(x1); x2 = float(x2); y1 = float(y1); y2 = float(y2)
         score = float(score); mean = float(mean)
         if z-1 in range(z0,z1):
             x1 += ABS_X; x2 += ABS_X; y1 += ABS_Y; y2 += ABS_Y; z = z - z0
             if not mask[int((y1+y2)//2),int((x1+x2)//2)] > 0:
-                cell_type_index = 0 if classes.index(class_name) < 3 else 1
-                all_predictions[z-1][cell_type_index] = np.concatenate((all_predictions[z-1][cell_type_index],
-                                                                         [[x1,y1,x2,y2,score,mean,classes.index(class_name),z]]))
+                # [核心修改 1] 用字符串包含判定基础类型，取代 classes.index()
+                cell_type_index = 0 if 'glia' in class_name.lower() else 1
+                
+                # [核心修改 2] 保持 class_name 为字符串塞进数组，必须指定 dtype=object
+                new_box = np.array([[x1, y1, x2, y2, score, mean, class_name, z]], dtype=object)
+                
+                all_predictions[z-1][cell_type_index] = np.concatenate(
+                    (all_predictions[z-1][cell_type_index], new_box)
+                )
+                
                 # 将该细胞的全局质心与名字注册到内存中
                 cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
                 metadata_registry.append([cx, cy, z, tile_name, slice_name])
+                
     return all_predictions

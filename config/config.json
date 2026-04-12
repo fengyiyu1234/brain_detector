@@ -1,31 +1,30 @@
 {
-    "model_path": "d:/Fengyi/ultralytics/MADM_2channel_model/train21/weights/best.pt",
-    "labels_to_names": {
-        "0": "red glia",
-        "1": "green glia",
-        "2": "yellow glia",
-        "3": "red neuron",
-        "4": "green neuron",
-        "5": "yellow neuron"
+    "models": {
+        "yolo_path": "d:/Fengyi/model_weight/MADM_single_channel/cellType_train14/weights/best.pt",
+        "cellpose_path": "d:/Fengyi/model_weight/MADM_single_channel/custom_nuclei_model"
     },
-    "colors_map": {
-        "0": "red", "1": "green", "2": "yellow",
-        "3": "red", "4": "green", "5": "yellow"
+
+    "model_classes": {
+        "yolo": {"0": "neuron", "1": "glia"},
+        "cellpose": {"0": "nucleus"}
     },
-    "type_map": {
-        "0": "glia", "1": "glia", "2": "glia",
-        "3": "neuron", "4": "neuron", "5": "neuron"
-    },
-    "bgr_colors": {
-        "red": [0, 0, 255],
-        "green": [0, 255, 0],
-        "yellow": [0, 255, 255]
-    },
+    
+    "channels_routing": [
+        {"id": "RFP", "type": "soma", "model": "yolo", "dir_key": "rfp_dir", "active": true},
+        {"id": "GFP", "type": "soma", "model": "yolo", "dir_key": "gfp_dir", "active": true},
+        {"id": "Sox9", "type": "tf", "model": "cellpose", "dir_key": "sox9_dir", "active": true},
+        {"id": "Olig2", "type": "tf", "model": "cellpose", "dir_key": "olig2_dir", "active": false}
+    ],
+
     "paths": { 
-        "channel1_dir": "z:\\Ryan\\Light_Sheet_Imaged_Brains\\04-08-2025_FW_2\\561nm",
-        "channel2_dir": "z:\\Ryan\\Light_Sheet_Imaged_Brains\\04-08-2025_FW_2\\numorph_align\\aligned\\GFP", 
-        "pATHRESULT": "z:\\Fengyi\\brain_analysis_6sample\\detection_results2\\fw2_8"
+        "rfp_dir": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\561nm",
+        "gfp_dir": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\numorph_align\\aligned\\GFP",
+        "sox9_dir": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\numorph_align\\aligned\\Sox9", 
+        "pATHRESULT": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\detection_3Channel"
     },
+
+    "device": "cuda",
+
     "detection_params": {
         "dOWNSAMPLE_Z_2X":false,
         "vISUALIZE_TILE": true,
@@ -36,19 +35,13 @@
         "ysize": 512,
         "step": 384,
         "tILESIZE": 2048,
-        "sTARTID": null,
-        "eNDID": null,
-        "left2right" : true,
-        "top2bottom" : true,
-        "overlapThresh": 0.4, 
+        "sTARTID": 10,
+        "eNDID": 15, 
         "z_distance_limit": 3,
-        "rUN_QC": false
+        "dOWNSAMPLE_PERCENTILE_LOW": 0.1,
+        "dOWNSAMPLE_PERCENTILE_HIGH": 99.9
     },
 
-    "vISUALIZATIONSAMPLESTEP": 100,
-    "vISUALIZATIONSAMPLECOUNT": 20,
-    "vISUALIZATIONSIZE": [512, 512],
-    "dOWNSAMPLE_PERCENTILE_LOW": 0.1,
-    "dOWNSAMPLE_PERCENTILE_HIGH": 99.9
-
+    "vISUALIZATIONSAMPLESTEP": 150,
+    "vISUALIZATIONSAMPLECOUNT": 20
 }

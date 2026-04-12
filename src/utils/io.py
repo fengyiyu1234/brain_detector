@@ -52,46 +52,22 @@ def listTile(path):
             dirname_list.append(os.path.basename(r))
     return sorted(dirname_list), sorted(dir_list)
 
-def get_c2_file_map(tile_path_c2):
-    """
-    在处理 Tile 前，先建立一个 {文件名: 完整路径} 的字典
-    """
-    c2_map = {}
-    if not os.path.exists(tile_path_c2):
-        return c2_map
-        
-    for f in os.listdir(tile_path_c2):
-        if f.startswith('.'): continue # 跳过隐藏文件
-        name_no_ext = os.path.splitext(f)[0]
-        c2_map[name_no_ext] = os.path.join(tile_path_c2, f)
-    return c2_map
-
 def load_cached_detections(csv_path):
-    """
-    读取无 Header 的 CSV 检测结果。
-    假设写入格式: [filename, x1, y1, x2, y2, class_name, score, mean_val, z_real]
-    索引对应: row[8] -> z_real (key)
-    返回: { z_real_int: np.array([[x1, y1, x2, y2, score, class_id_placeholder], ...]) }
-    """
     detection_map = {}
-    if not os.path.exists(csv_path):
-        return detection_map
-
+    if not os.path.exists(csv_path): return detection_map
     try:
-        with open(csv_path, 'r', newline='') as f:
+        with open(csv_path, 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
+            header = next(reader, None)
             for row in reader:
                 if not row or len(row) < 9: continue
                 try:
-                    # 解析行数据
-                    z_val = int(float(row[8])) # 第9列是 Z
+                    z_val = int(float(row[8]))
                     x1, y1, x2, y2 = float(row[1]), float(row[2]), float(row[3]), float(row[4])
+                    class_name = row[5] # 保持读取为字符串
                     score = float(row[6])
-                    # 注意：缓存里只有 class_name，没有 class_id。为了 QC 兼容，我们这里把 class 设为 -1 或 0
-                    # 如果 QC 不需要具体 class，这没问题。如果需要，得反查 labels_to_names
-                    cls_placeholder = 0.0 
                     
-                    bbox = [x1, y1, x2, y2, score, cls_placeholder]
+                    bbox = [x1, y1, x2, y2, score, class_name]
                     
                     if z_val not in detection_map:
                         detection_map[z_val] = []
@@ -106,10 +82,17 @@ def load_cached_detections(csv_path):
 def save_run_metadata(cfg, start_time_stamp):
     save_path = os.path.join(cfg['paths']['pATHRESULT'], 'runtime_config.json')
     metadata = cfg.copy()
+    
+    # 动态记录所有使用的模型名称（适配新 config.json）
+    models_info = {}
+    if 'models' in cfg:
+        for model_name, model_path in cfg['models'].items():
+            models_info[model_name] = os.path.basename(model_path)
+            
     metadata['run_info'] = {
         "start_time": datetime.datetime.fromtimestamp(start_time_stamp).strftime('%Y-%m-%d %H:%M:%S'),
         "platform": platform.platform(),
-        "model": os.path.basename(cfg['model_path'])
+        "models_used": models_info # 替换原有的单一 model 字段
     }
     with open(save_path, 'w', encoding='utf-8') as f:
         json.dump(metadata, f, indent=4, ensure_ascii=False)
