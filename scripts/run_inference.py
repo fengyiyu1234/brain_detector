@@ -20,6 +20,7 @@ from src.core.worker import process_single_tile_wrapper
 from src.core.stitcher import combine_predictions
 from src.core.z_linker import run_z_linker
 
+
 if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)
     start_time = time.time()
@@ -85,11 +86,6 @@ if __name__ == '__main__':
 
     tile_size = dp.get('tILESIZE', 2048)
     dir_dict, H, W, Z, z_start, disp_mat_fin = loadTeraxml(pATHxml, tile_size)
-
-    if dp.get('dOWNSAMPLE_Z_2X', False):
-        logging.info(f"Global Flag Detected: Downsampling Z-axis (Old Z={Z})")
-        Z = (Z + 1) // 2 
-        logging.info(f"New Z-axis depth: {Z}")
 
     # ==========================================
     # 阶段 2: 线性 Checkpoint - Tile 级别检测 (无 QC)
@@ -172,10 +168,12 @@ if __name__ == '__main__':
         
         if len(all_raw_detections) > 0:
             full_stack_matrix = np.concatenate(all_raw_detections, axis=0)
-            if dp['mERGEZ']:
+            # 增加对 ENABLE_Z_LINKER 的判断
+            if config.get('ENABLE_Z_LINKER', True) and dp.get('mERGEZ', True):
                 logging.info(f"正在运行动态 Z-Linker (输入: {len(full_stack_matrix)} 个 2D 切片框)...")
                 final_results = run_z_linker(full_stack_matrix, iou_thresh=0.35, max_gap=1, min_z_layers=2, max_cell_z_span=dp.get('z_distance_limit', 5))
             else:
+                logging.info("⚠️ Z-Linker 已跳过（未开启 ENABLE_Z_LINKER 或采样步长过大）。")
                 final_results = full_stack_matrix
             
             # Pandas 导出字符串表格

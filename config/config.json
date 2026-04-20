@@ -17,16 +17,17 @@
     ],
 
     "paths": { 
-        "rfp_dir": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\561nm",
-        "gfp_dir": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\numorph_align\\aligned\\GFP",
-        "sox9_dir": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\numorph_align\\aligned\\Sox9", 
-        "pATHRESULT": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\detection_3Channel"
+        "rfp_dir": "f:\\fengyi\\sample1_inference\\561nm",
+        "gfp_dir": "f:\\fengyi\\sample1_inference\\GFP",
+        "sox9_dir": "f:\\fengyi\\sample1_inference\\Sox9", 
+        "pATHRESULT": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\detection_3Channel2"
     },
 
     "device": "cuda",
 
+    "ENABLE_Z_LINKER": false,
+
     "detection_params": {
-        "dOWNSAMPLE_Z_2X":false,
         "vISUALIZE_TILE": true,
         "conf_thresh": 0.4,
         "nms_iou": 0.45,
@@ -35,13 +36,15 @@
         "ysize": 512,
         "step": 384,
         "tILESIZE": 2048,
-        "sTARTID": 10,
-        "eNDID": 15, 
+        "sTARTID": null,
+        "eNDID": null, 
         "z_distance_limit": 3,
         "dOWNSAMPLE_PERCENTILE_LOW": 0.1,
-        "dOWNSAMPLE_PERCENTILE_HIGH": 99.9
+        "dOWNSAMPLE_PERCENTILE_HIGH": 99.9,
+        "DOWNSAMPLE": true,
+        "DOWNSAMPLE_Z_STEP": 11
     },
 
     "vISUALIZATIONSAMPLESTEP": 150,
-    "vISUALIZATIONSAMPLECOUNT": 20
+    "vISUALIZATIONSAMPLECOUNT": 10
 }

@@ -11,58 +11,37 @@ import logging
 from tqdm import tqdm
 from .stitcher import stitchDetection
 from src.utils.image import normalize_for_detection
-import warnings
-warnings.filterwarnings("ignore", message=".*channels deprecated.*")
+from cellpose import models as cp_models
+from concurrent.futures import ThreadPoolExecutor
+import time
+import logging
+from src.utils.logger import setup_logging  
 
-try:
-    from cellpose import models as cp_models
-except ImportError:
-    cp_models = None
+logger = logging.getLogger(__name__)
 
-import tempfile
-import shutil
-
-def fast_cloud_read(cloud_path):
+def save_raw_qc_visualization(norm_img, boxes, save_path, color=(0, 255, 0)):
     """
-    极速云端图片读取器 (F 盘 SSD 增强版)：
-    将缓存路径指向空间更大的 F 盘 SSD，确保 C 盘系统盘安全。
+    保存单通道原始质控图：将原始预测框直接画在归一化后的 8-bit 底图上
     """
-    # 1. 自定义 F 盘的缓存目录
-    temp_dir = r"F:\temp_cache" 
-    
-    # 确保文件夹存在，如果不存在则自动创建
-    if not os.path.exists(temp_dir):
-        try:
-            os.makedirs(temp_dir, exist_ok=True)
-        except Exception as e:
-            # 如果 F 盘没有权限或不存在，退回到 C 盘系统临时目录
-            temp_dir = tempfile.gettempdir()
-    
-    # 2. 构造防冲突的本地临时文件名 (加入当前进程的 PID)
-    file_name = os.path.basename(cloud_path)
-    pid = os.getpid()
-    local_temp_path = os.path.join(temp_dir, f"gpu_worker_{pid}_{file_name}")
-    
-    try:
-        # 3. 操作系统底层级大文件流式拉取
-        shutil.copy2(cloud_path, local_temp_path)
-        
-        # 4. 从 F 盘 SSD 极速读取 (使用 IMREAD_ANYDEPTH 保证 0 损耗)
-        img = cv2.imread(local_temp_path, cv2.IMREAD_ANYDEPTH) 
-        
-        return img
-    
-    except Exception as e:
-        logging.getLogger(__name__).error(f"❌ F 盘读取失败 {cloud_path}: {e}")
-        return None
-        
-    finally:
-        # 5. 阅后即焚：读取完成后立即释放空间
-        if os.path.exists(local_temp_path):
-            try:
-                os.remove(local_temp_path)
-            except:
-                pass
+    # 确保图片是 3 通道 BGR，这样才能画出彩色的框
+    if len(norm_img.shape) == 2:
+        vis_img = cv2.cvtColor(norm_img, cv2.COLOR_GRAY2BGR)
+    else:
+        vis_img = norm_img.copy()
+
+    # 将模型输出的框原封不动地画上去
+    for box in boxes:
+        x1, y1, x2, y2 = map(int, box[:4])
+        cv2.rectangle(vis_img, (x1, y1), (x2, y2), color, thickness=2)
+
+    # 确保输出目录存在并保存
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    cv2.imwrite(save_path, vis_img)
+
+# 确保你外部定义的这个函数现在长这样就行了：
+def fast_cloud_read(local_path):
+    # 没有任何乱七八糟的拷贝，纯粹的极速直读
+    return cv2.imread(local_path, cv2.IMREAD_ANYDEPTH)
 
 def calculate_iou(boxA, boxB):
     xA = max(boxA[0], boxB[0])
@@ -163,12 +142,21 @@ def colocalization(layer_channel_boxes, iou_thresh=0.5, ioa_thresh=0.6):
 
     # 2. 将 TF (Sox9) 核填入胞体池
     for tf_box in tf_boxes:
+        matched = False
         for cell in target_cells:
-            # 计算核在胞体内的面积占比
             ioa = calculate_ioa(tf_box[:4], cell["box"]) 
             if ioa >= ioa_thresh:
-                cell["markers"].append("Sox9") # 具体标记名视需要可参数化
+                cell["markers"].append("Sox9") 
+                matched = True
                 break
+
+        if not matched:
+            target_cells.append({
+                "box": tf_box[:4],
+                "cell_type": "nucleus", # 或者 "unknown_cell"
+                "markers": ["Sox9"],
+                "score": tf_box[4]
+            })
                 
     # 3. 输出格式化
     final_merged_boxes = []
@@ -216,6 +204,13 @@ def process_single_tile(i, pATHTEST, config):
     derived = config['derived_paths']
     paths = config['paths']
     device = config['device']
+
+    output_dir = derived.get('pATH_DET_RES')
+    if output_dir:
+        setup_logging(log_path=output_dir)
+        
+    current_logger = logging.getLogger(__name__)
+    current_logger.info(f"🚀 Worker (PID:{os.getpid()}) 开始接管 Tile: {dir_name}，日志已绑定至输出目录！")
 
     CSV_PATH = os.path.join(derived['pATH_DET_RES'], dir_name + '_result.csv')
     
@@ -288,9 +283,19 @@ def process_single_tile(i, pATHTEST, config):
     # 提取无后缀名作为 Key (e.g., '452800_377900_001')
     testnames_no_ext = [os.path.splitext(f)[0] for f in testnames]
 
-    if dp.get('dOWNSAMPLE_Z_2X', False):
-        testnames = testnames[::2]
-        testnames_no_ext = testnames_no_ext[::2]
+    is_downsample = dp.get('DOWNSAMPLE', False)
+    
+    if is_downsample:
+        z_step = dp.get('DOWNSAMPLE_Z_STEP', 2) # 默认设个底线为2
+        if z_step <= 1:
+            current_logger.warning("⚠️ 开启了 DOWNSAMPLE 但 DOWNSAMPLE_Z_STEP <= 1，已自动修正为步长 2")
+            z_step = 2
+            
+        current_logger.info(f"🚀 跳层检测开启：每隔 {z_step-1} 张处理一张 (抽样步长={z_step})")
+        testnames = testnames[::z_step]
+        testnames_no_ext = testnames_no_ext[::z_step]
+    else:
+        z_step = 1 # 未开启抽样，步长强制为 1
 
     # 获取相对的二级结构路径 (例如: 452800\452800_377900)
     rel_tile_path = os.path.relpath(pATHTEST, anchor_root)
@@ -338,168 +343,230 @@ def process_single_tile(i, pATHTEST, config):
         csv_writers[ch_id] = csv.writer(f_ch)
         
     try:
-        for z_idx, name_no_ext in enumerate(testnames_no_ext):
-            current_z_real = z_idx + 1 # 1-based index
-            # 格式: { "RFP": [[x1, y1, x2, y2, score, "neuron"], ...], "Sox9": [...] }
-            layer_channel_boxes = {ch['id']: [] for ch in routing_config}
-        
-            H0, W0 = 0, 0 
+        PREFETCH_DEPTH = 10 # 预取深度：永远保持未来 10 层的数据在后台下载
+        prefetch_futures = {} # 存放后台下载任务的字典: {(z_idx, ch_id): future}
+       
+        with ThreadPoolExecutor(max_workers=4) as downloader_pool:
+            
+            pbar.set_description(f"[{dir_name[:10]}] 正在填装初始流水线...")
 
-            # =========================================================
-            # 步骤 2.1: 遍历路由表，进行独立的单通道检测
-            # =========================================================
-            for ch in routing_config:
-                ch_id = ch['id']
-                pbar.set_description(f"Tile:[{dir_name[:10]}] | Z层:[{current_z_real}/{len(testnames_no_ext)}] | 检测通道:[{ch_id}]")
-                ch_model = ch['model']
-                img_path = channel_files_indices[ch_id].get(name_no_ext)
+            # --- 1. 填装初始弹药：提前把前 PREFETCH_DEPTH 层抛给后台 ---
+            for pre_z in range(min(PREFETCH_DEPTH, len(testnames_no_ext))):
+                pre_name = testnames_no_ext[pre_z]
+                for ch in routing_config:
+                    ch_id = ch['id']
+                    img_path = channel_files_indices[ch_id].get(pre_name)
+                    
+                    if img_path and os.path.exists(img_path):
+                        # submit 不会阻塞，它只是把任务扔给后台线程，然后立刻返回一个 Future 对象
+                        prefetch_futures[(pre_z, ch_id)] = downloader_pool.submit(fast_cloud_read, img_path)
+                    else:
+                        prefetch_futures[(pre_z, ch_id)] = None
+
+            # --- 2. 正式启动 GPU 核心消费者循环 ---
+            for z_idx, name_no_ext in enumerate(testnames_no_ext):
+                # 如果开启了 Z 轴降采样，那么真实的物理层数应该是 1, 3, 5, 7...
+                current_z_real = z_idx * z_step + 1
+                    
+                layer_channel_boxes = {ch['id']: [] for ch in routing_config}
+            
+                H0, W0 = 0, 0 
                 
-                # 如果当前 Z 层该通道缺图，直接跳过
-                if not img_path or not os.path.exists(img_path):
-                    continue
-                    
-                img_raw = cv2.imread(img_path, cv2.IMREAD_ANYDEPTH)
-                if img_raw is None: continue
-                if len(img_raw.shape) == 3: img_raw = img_raw[:, :, 0]
-                
-                if H0 == 0: H0, W0 = img_raw.shape[:2] # 记录当前层的实际尺寸
+                visualize_tile = dp.get('vISUALIZE_TILE', False)
+                sample_step = config.get('vISUALIZATIONSAMPLESTEP', 100)
+                sample_count = config.get('vISUALIZATIONSAMPLECOUNT', 5)
+                need_vis = visualize_tile and (z_idx % sample_step < sample_count)
 
-                # 单通道图像归一化 (拉伸到 0-255)
-                norm_img = normalize_for_detection(img_raw, dp['dOWNSAMPLE_PERCENTILE_LOW'], dp['dOWNSAMPLE_PERCENTILE_HIGH'])
+                for ch in routing_config:
+                    ch_id = ch['id']
+                    pbar.set_description(f"Tile:[{dir_name[:10]}] | Z层:[{current_z_real}/{len(testnames_no_ext)}] | 检测通道:[{ch_id}]")
+                    ch_model = ch['model']
+                    img_path = channel_files_indices[ch_id].get(name_no_ext)
+                    
+                    future = prefetch_futures.get((z_idx, ch_id))
+                    
+                    # 1. 检查物理文件本来就不存在的情况
+                    if future is None:
+                        error_msg = f"‼️ [数据缺失] Tile: {dir_name} | Z层: {current_z_real} | 通道: {ch_id} | 路径: {img_path}"
+                        logger.error(error_msg) 
+                        continue
 
-                # --------- YOLO 单通道滑动窗口检测 ---------
-                if ch_model == 'yolo':
-                    img_infer = cv2.cvtColor(norm_img, cv2.COLOR_GRAY2BGR) # YOLO 仍需要 3 通道输入
+                    # 2. .result() 会索要结果。
+                    img_raw = future.result()
                     
-                    xsize, ysize, step_win = dp['xsize'], dp['ysize'], dp['step']
-                    H_pad = H0 if (H0-ysize)%step_win == 0 else H0-H0%step_win+ysize
-                    W_pad = W0 if (W0-xsize)%step_win == 0 else W0-W0%step_win+xsize
+                    # 3. 拿到货后，立刻释放字典中的任务，防止撑爆内存
+                    del prefetch_futures[(z_idx, ch_id)]
                     
-                    fullimg_pad = np.zeros((H_pad, W_pad, 3), dtype=np.uint8)
-                    fullimg_pad[0:H0, 0:W0] = img_infer
-                    
-                    conf_thresh = dp.get('conf_thresh', dp.get('tHRESHOLD', 0.25))
-                    nms_iou = dp.get('nms_iou', dp.get('mINIOU', 0.45))
-                    
-                    raw_detections = np.empty((0, 6))
-                    for x in range(0, W_pad, step_win):
-                        for y in range(0, H_pad, step_win):
-                            patch = fullimg_pad[y:y+ysize, x:x+xsize]
-                            if patch.max() < 10: continue # 过滤纯黑无信号背景
-                            
-                            results = models_dict['yolo'].predict(patch, device=device, verbose=False, conf=conf_thresh, iou=nms_iou)
-                            res = results[0]
-                            if len(res.boxes) > 0:
-                                boxes = res.boxes.xyxy.cpu().numpy() + np.array([x, y, x, y])
-                                scores = res.boxes.conf.cpu().numpy()
-                                labels = res.boxes.cls.cpu().numpy()
-                                patch_res = np.hstack((boxes, scores[:, np.newaxis], labels[:, np.newaxis]))
-                                raw_detections = np.append(raw_detections, patch_res, axis=0)
+                    # 4. 检查读取内容是否合法
+                    if img_raw is None:
+                        error_msg = f"❌ [读取失败] Tile: {dir_name} | Z层: {current_z_real} | 通道: {ch_id} | 文件可能损坏: {img_path}"
+                        logger.error(error_msg)
+                        continue
 
-                    # 针对单通道内进行拼接和去重 (stitchDetection)
-                    unique_labels = np.unique(raw_detections[:, 5]) if raw_detections.size > 0 else []
-                    temp_yolo_boxes = []
+                    # ---------------------------------------------------------
+                    # 📤 维持流水线运转 (补充未来的预取任务)
+                    # ---------------------------------------------------------
+                    # 我消费了当前这层，立刻通知后台去下载未来 (z_idx + PREFETCH_DEPTH) 的那层
+                    future_z_idx = z_idx + PREFETCH_DEPTH
+                    if future_z_idx < len(testnames_no_ext):
+                        future_name = testnames_no_ext[future_z_idx]
+                        future_img_path = channel_files_indices[ch_id].get(future_name)
+                        
+                        if future_img_path and os.path.exists(future_img_path):
+                            prefetch_futures[(future_z_idx, ch_id)] = downloader_pool.submit(fast_cloud_read, future_img_path)
+                        else:
+                            prefetch_futures[(future_z_idx, ch_id)] = None
+
+                    # ---------------------------------------------------------
+                    # 🧠 开始 GPU 推理逻辑 (以下代码和原来完全一样)
+                    # ---------------------------------------------------------
+                    if len(img_raw.shape) == 3: img_raw = img_raw[:, :, 0]
                     
-                    for lbl in unique_labels:
-                        # 提取该类别坐标 [x1, y1, x2, y2, score] 进行局部拼接 NMS
-                        layer_label_data = raw_detections[raw_detections[:, 5] == lbl, :-1]
-                        if layer_label_data.size > 0:
-                            cleaned_boxes = stitchDetection(layer_label_data, H0, W0, xsize, ysize, step_win)
-                            class_str = yolo_classes.get(str(int(lbl)), "unknown")
-                            for box in cleaned_boxes:
-                                temp_yolo_boxes.append([box[0], box[1], box[2], box[3], box[4], class_str])
+                    if H0 == 0: H0, W0 = img_raw.shape[:2] # 记录当前层的实际尺寸
+
+                    norm_img = normalize_for_detection(img_raw, dp['dOWNSAMPLE_PERCENTILE_LOW'], dp['dOWNSAMPLE_PERCENTILE_HIGH'])
+
+                    # --------- YOLO 单通道滑动窗口检测 ---------
+                    if ch_model == 'yolo':
+                        img_infer = cv2.cvtColor(norm_img, cv2.COLOR_GRAY2BGR) # YOLO 仍需要 3 通道输入
+                        
+                        xsize, ysize, step_win = dp['xsize'], dp['ysize'], dp['step']
+                        H_pad = H0 if (H0-ysize)%step_win == 0 else H0-H0%step_win+ysize
+                        W_pad = W0 if (W0-xsize)%step_win == 0 else W0-W0%step_win+xsize
+                        
+                        fullimg_pad = np.zeros((H_pad, W_pad, 3), dtype=np.uint8)
+                        fullimg_pad[0:H0, 0:W0] = img_infer
+                        
+                        conf_thresh = dp.get('conf_thresh', dp.get('tHRESHOLD', 0.25))
+                        nms_iou = dp.get('nms_iou', dp.get('mINIOU', 0.45))
+                        
+                        raw_detections = np.empty((0, 6))
+                        
+                        # batch processing
+                        batch_patches = []
+                        batch_coords = []
+                        BATCH_SIZE = 8  # 你可以根据 P5000 的显存调节，比如 16 或 32
+                        
+                        for x in range(0, W_pad, step_win):
+                            for y in range(0, H_pad, step_win):
+                                patch = fullimg_pad[y:y+ysize, x:x+xsize]
+                                if patch.max() < 10: continue # 过滤纯黑背景
                                 
-                    # --- 单通道内部的冲突解决 (如模型在同个位置既框了 Neuron 又框了 Glia) ---
-                    kept_yolo_boxes = []
-                    temp_yolo_boxes.sort(key=lambda x: (1 if x[5]=='glia' else 0, x[4]), reverse=True) # Glia优先，得分高的优先
-                    for box_curr in temp_yolo_boxes:
-                        is_suppressed = False
-                        cx1, cy1, cx2, cy2 = box_curr[:4]
-                        area_c = (cx2 - cx1) * (cy2 - cy1)
-                        for box_kept in kept_yolo_boxes:
-                            kx1, ky1, kx2, ky2 = box_kept[:4]
-                            area_k = (kx2 - kx1) * (ky2 - ky1)
-                            iw = max(0, min(cx2, kx2) - max(cx1, kx1))
-                            ih = max(0, min(cy2, ky2) - max(cy1, ky1))
-                            if iw > 0 and ih > 0:
-                                inter_area = iw * ih
-                                ioa_curr = inter_area / area_c if area_c > 0 else 0
-                                if ioa_curr > 0.70 or (inter_area / (area_c + area_k - inter_area) > 0.35):
-                                    is_suppressed = True
-                                    break
-                        if not is_suppressed:
-                            kept_yolo_boxes.append(box_curr)
-                            
-                            # ✨ 写入纯 YOLO 单通道的独立结果
-                            # 格式: [slice_name, x1, y1, x2, y2, class, score, mean, z_val]
-                            row = [name_no_ext, box_curr[0], box_curr[1], box_curr[2], box_curr[3], box_curr[5], box_curr[4], 0.0, current_z_real]
+                                batch_patches.append(patch)
+                                batch_coords.append((x, y))
+                                
+                                if len(batch_patches) == BATCH_SIZE:
+                                    results = models_dict['yolo'].predict(batch_patches, device=device, verbose=False, conf=conf_thresh, iou=nms_iou)
+                                    
+                                    # 批量解析结果
+                                    for i, res in enumerate(results):
+                                        if len(res.boxes) > 0:
+                                            bx, by = batch_coords[i]
+                                            boxes = res.boxes.xyxy.cpu().numpy() + np.array([bx, by, bx, by])
+                                            scores = res.boxes.conf.cpu().numpy()
+                                            labels = res.boxes.cls.cpu().numpy()
+                                            patch_res = np.hstack((boxes, scores[:, np.newaxis], labels[:, np.newaxis]))
+                                            raw_detections = np.append(raw_detections, patch_res, axis=0)
+                                    
+                                    # 清空队列，准备装载下一批
+                                    batch_patches = []
+                                    batch_coords = []
+
+                        if len(batch_patches) > 0:
+                            results = models_dict['yolo'].predict(batch_patches, device=device, verbose=False, conf=conf_thresh, iou=nms_iou)
+                            for i, res in enumerate(results):
+                                if len(res.boxes) > 0:
+                                    bx, by = batch_coords[i]
+                                    boxes = res.boxes.xyxy.cpu().numpy() + np.array([bx, by, bx, by])
+                                    scores = res.boxes.conf.cpu().numpy()
+                                    labels = res.boxes.cls.cpu().numpy()
+                                    patch_res = np.hstack((boxes, scores[:, np.newaxis], labels[:, np.newaxis]))
+                                    raw_detections = np.append(raw_detections, patch_res, axis=0)
+
+                        # 针对单通道内进行拼接和去重 (stitchDetection)
+                        unique_labels = np.unique(raw_detections[:, 5]) if raw_detections.size > 0 else []
+                        temp_yolo_boxes = []
+                        
+                        for lbl in unique_labels:
+                            # 提取该类别坐标 [x1, y1, x2, y2, score] 进行局部拼接 NMS
+                            layer_label_data = raw_detections[raw_detections[:, 5] == lbl, :-1]
+                            if layer_label_data.size > 0:
+                                cleaned_boxes = stitchDetection(layer_label_data, H0, W0, xsize, ysize, step_win)
+                                class_str = yolo_classes.get(str(int(lbl)), "unknown")
+                                for box in cleaned_boxes:
+                                    temp_yolo_boxes.append([box[0], box[1], box[2], box[3], box[4], class_str])
+                                    
+                        # --- 单通道内部的冲突解决 (如模型在同个位置既框了 Neuron 又框了 Glia) ---
+                        kept_yolo_boxes = []
+                        temp_yolo_boxes.sort(key=lambda x: (1 if x[5]=='glia' else 0, x[4]), reverse=True) # Glia优先，得分高的优先
+                        for box_curr in temp_yolo_boxes:
+                            is_suppressed = False
+                            cx1, cy1, cx2, cy2 = box_curr[:4]
+                            area_c = (cx2 - cx1) * (cy2 - cy1)
+                            for box_kept in kept_yolo_boxes:
+                                kx1, ky1, kx2, ky2 = box_kept[:4]
+                                area_k = (kx2 - kx1) * (ky2 - ky1)
+                                iw = max(0, min(cx2, kx2) - max(cx1, kx1))
+                                ih = max(0, min(cy2, ky2) - max(cy1, ky1))
+                                if iw > 0 and ih > 0:
+                                    inter_area = iw * ih
+                                    ioa_curr = inter_area / area_c if area_c > 0 else 0
+                                    if ioa_curr > 0.70 or (inter_area / (area_c + area_k - inter_area) > 0.35):
+                                        is_suppressed = True
+                                        break
+                            if not is_suppressed:
+                                kept_yolo_boxes.append(box_curr)
+                                
+                                # ✨ 写入纯 YOLO 单通道的独立结果
+                                # 格式: [slice_name, x1, y1, x2, y2, class, score, mean, z_val]
+                                row = [name_no_ext, box_curr[0], box_curr[1], box_curr[2], box_curr[3], box_curr[5], box_curr[4], 0.0, current_z_real]
+                                csv_writers[ch_id].writerow(row)
+                                
+                        layer_channel_boxes[ch_id].extend(kept_yolo_boxes)
+
+                        if need_vis and H0 > 0:
+                            # 动态颜色：根据通道名分配，GFP标绿，RFP标红，其他标黄
+                            color = (0, 255, 0) if "gfp" in ch_id.lower() else (0, 0, 255) if "rfp" in ch_id.lower() else (0, 255, 255)
+                            qc_path = os.path.join(derived['pATH_VIS_TILE'], dir_name, f"{name_no_ext}_Z{current_z_real:03d}_{ch_id}_RAW.jpg")
+                            save_raw_qc_visualization(norm_img, kept_yolo_boxes, qc_path, color=color)
+
+                    # --------- Cellpose 单通道密集细胞核检测 ---------
+                    elif ch_model == 'cellpose':
+                        # eval 直接接受 2D 矩阵
+                        masks, flows, styles = models_dict['cellpose'].eval(norm_img, diameter=None, channels=[0,0])
+                        cp_boxes = extract_boxes_from_masks(masks) # 调用前面定义的辅助函数
+                        
+                        for box in cp_boxes:
+                            # ✨ 写入纯 Cellpose 单通道的独立结果
+                            row = [name_no_ext, box[0], box[1], box[2], box[3], box[5], box[4], 0.0, current_z_real]
                             csv_writers[ch_id].writerow(row)
                             
-                    layer_channel_boxes[ch_id].extend(kept_yolo_boxes)
+                        layer_channel_boxes[ch_id].extend(cp_boxes)
 
-                # --------- Cellpose 单通道密集细胞核检测 ---------
-                elif ch_model == 'cellpose':
-                    # eval 直接接受 2D 矩阵
-                    masks, flows, styles = models_dict['cellpose'].eval(norm_img, diameter=None, channels=[0,0])
-                    cp_boxes = extract_boxes_from_masks(masks) # 调用前面定义的辅助函数
+                        if need_vis and H0 > 0:
+                            # 细胞核(Sox9)默认用白色框
+                            qc_path = os.path.join(derived['pATH_VIS_TILE'], dir_name, f"{name_no_ext}_Z{current_z_real:03d}_{ch_id}_RAW.jpg")
+                            save_raw_qc_visualization(norm_img, cp_boxes, qc_path, color=(255, 255, 255))
                     
-                    for box in cp_boxes:
-                        # ✨ 写入纯 Cellpose 单通道的独立结果
-                        row = [name_no_ext, box[0], box[1], box[2], box[3], box[5], box[4], 0.0, current_z_real]
-                        csv_writers[ch_id].writerow(row)
-                        
-                    layer_channel_boxes[ch_id].extend(cp_boxes)
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
-            # =========================================================
-            # 步骤 2.2: 跨通道空间重叠合并 (Colocalization)
-            # =========================================================
-            # 将各个通道提取好的 Box 融合，填入 Sox9 核，并且合并 RFP/GFP
-            final_merged_boxes = colocalization(layer_channel_boxes, iou_thresh=0.5, ioa_thresh=0.6)
+                # 跨通道空间重叠合并 (Colocalization)
+                # 将各个通道提取好的 Box 融合，填入 Sox9 核，并且合并 RFP/GFP
+                final_merged_boxes = colocalization(layer_channel_boxes, iou_thresh=0.5, ioa_thresh=0.6)
 
-            # =========================================================
-            # 步骤 2.3: 写入综合结果并处理可视化
-            # =========================================================
-            for item in final_merged_boxes:
-                # final_merged_boxes 的格式是 [x1, y1, x2, y2, score, final_class_name]
-                x1, y1, x2, y2, score, class_name = item
-                mean_val = 0.0 # 因为解耦了通道，伪彩平均强度失去意义，置为 0，不影响空间坐标拼接
-                
-                # ✨ 保存至融合主 CSV
-                writer_combined.writerow([name_no_ext, x1, y1, x2, y2, class_name, score, mean_val, current_z_real])
-                
-                # 追加至全局列表供 Z-linker 3D 追踪使用
-                all_tile_detections.append([x1, y1, x2, y2, score, mean_val, class_name, current_z_real])
-
-            # 如果开启了可视化 (按需采样，将综合结果画在某一层上做记录)
-            visualize_tile = dp.get('vISUALIZE_TILE', False)
-            sample_step = config.get('vISUALIZATIONSAMPLESTEP', 100)
-            sample_count = config.get('vISUALIZATIONSAMPLECOUNT', 5)
-            
-            if visualize_tile and (z_idx % sample_step < sample_count) and H0 > 0:
-                pATH_VIS_TILE_CURRENT = os.path.join(derived['pATH_VIS_TILE'], dir_name)
-                os.makedirs(pATH_VIS_TILE_CURRENT, exist_ok=True)
-                
-                # 创建一个全黑底板用于绘制综合结果
-                vis_img = np.zeros((H0, W0, 3), dtype=np.uint8)
-                for box in final_merged_boxes:
-                    ix1, iy1, ix2, iy2 = map(int, box[:4])
-                    c_name = box[5] # e.g. "glia_GFP_Sox9"
+                for item in final_merged_boxes:
+                    # final_merged_boxes 的格式是 [x1, y1, x2, y2, score, final_class_name]
+                    x1, y1, x2, y2, score, class_name = item
+                    mean_val = 0.0
                     
-                    # 简单按字符串包含上色
-                    color = (255, 255, 255) # Default white
-                    if "RFP" in c_name and "GFP" in c_name: color = (0, 255, 255) # Yellow for dual
-                    elif "RFP" in c_name: color = (0, 0, 255)
-                    elif "GFP" in c_name: color = (0, 255, 0)
+                    writer_combined.writerow([name_no_ext, x1, y1, x2, y2, class_name, score, mean_val, current_z_real])
                     
-                    if "glia" in c_name.lower():
-                        draw_dashed_rectangle(vis_img, (ix1, iy1), (ix2, iy2), color, thickness=2)
-                    else:
-                        cv2.rectangle(vis_img, (ix1, iy1), (ix2, iy2), color, 2, cv2.LINE_8)
-                        
-                cv2.imwrite(os.path.join(pATH_VIS_TILE_CURRENT, f"{name_no_ext}_Z{current_z_real:03d}.jpg"), vis_img)
+                    # 追加至全局列表供 Z-linker 3D 追踪使用
+                    all_tile_detections.append([x1, y1, x2, y2, score, mean_val, class_name, current_z_real])
 
-            # ✅ 所有的通道、融合、可视化都搞定了，这一层结束，进度条前进一格
-            pbar.update(1)
+                pbar.update(1)
 
     finally:
         f_combined.close()
@@ -547,7 +614,10 @@ def process_single_tile(i, pATHTEST, config):
     # 释放显存
     for mod_name in list(models_dict.keys()):
         del models_dict[mod_name]
-        
+    
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return all_tile_detections, dir_name
 
 def process_single_tile_wrapper(args):
