@@ -1,7 +1,7 @@
 {
     "models": {
-        "yolo_path": "d:/Fengyi/model_weight/MADM_single_channel/cellType_train14/weights/best.pt",
-        "cellpose_path": "d:/Fengyi/model_weight/MADM_single_channel/custom_nuclei_model"
+        "yolo_path": "d:/Fengyi/model_weight/MADM_single_channel/train18/weights/best.pt",
+        "cellpose_path": "d:/Fengyi/model_weight/MADM_single_channel/models/nuclei_model_0515"
     },
 
     "model_classes": {
@@ -17,32 +17,44 @@
     ],
 
     "paths": { 
-        "rfp_dir": "f:\\fengyi\\sample1_inference\\561nm",
-        "gfp_dir": "f:\\fengyi\\sample1_inference\\GFP",
-        "sox9_dir": "f:\\fengyi\\sample1_inference\\Sox9", 
-        "pATHRESULT": "y:\\Fengyi\\brain\\batch2\\sample1_120325\\detection_3Channel2"
+        "rfp_dir": "y:/Fengyi/detection_infer_test/sample8/561",
+        "gfp_dir": "y:/Fengyi/detection_infer_test/sample8/640",
+        "sox9_dir": "y:/Fengyi/detection_infer_test/sample8/730", 
+        "pATHRESULT": "y:/Fengyi/detection_infer_test/sample8/detection_results"
     },
 
     "device": "cuda",
 
-    "ENABLE_Z_LINKER": false,
+    "ENABLE_Z_LINKER": true,
 
     "detection_params": {
+        "xy_resolution_um":0.65,
+        "z_resolution_um":8,
+        "z_distance_limit": 5,
+        "max_gap":0,
+        "coloc_distance_um": 15,
+
         "vISUALIZE_TILE": true,
-        "conf_thresh": 0.4,
-        "nms_iou": 0.45,
-        "mERGEZ": true,
+
+        "conf_thresh": 0.3,
+        "nms_iou": 0.3,
+
         "xsize": 512,
         "ysize": 512,
         "step": 384,
         "tILESIZE": 2048,
+
         "sTARTID": null,
         "eNDID": null, 
-        "z_distance_limit": 3,
-        "dOWNSAMPLE_PERCENTILE_LOW": 0.1,
-        "dOWNSAMPLE_PERCENTILE_HIGH": 99.9,
-        "DOWNSAMPLE": true,
-        "DOWNSAMPLE_Z_STEP": 11
+
+        "normalize_PERCENTILE_LOW": 0.1,
+        "normalize_PERCENTILE_HIGH": 99.9,
+
+        "DOWNSAMPLE": false,
+        "DOWNSAMPLE_Z_STEP": 11,
+
+        "n_permutations": 100,
+        "max_soma_sample": 50000
     },
 
     "vISUALIZATIONSAMPLESTEP": 150,

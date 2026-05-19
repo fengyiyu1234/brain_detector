@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 def calculate_iou(boxA, boxB):
     """计算两个 2D 框的交并比 (IoU)"""
@@ -54,40 +55,36 @@ def run_z_linker(full_stack_matrix, iou_thresh=0.45, max_gap=1, min_z_layers=2, 
             if z - track['first_z'] >= max_cell_z_span:
                 track['active'] = False
 
-        matched_indices = set()
-        matched_tracks = set()
+        matched_det_indices = set()
 
-        if curr_detections:
+        # 仅对仍活跃的 track 建立候选列表
+        active_t_indices = [ti for ti, t in enumerate(active_tracks) if t['active']]
+
+        if curr_detections and active_t_indices:
+            n_d, n_t = len(curr_detections), len(active_t_indices)
+            # 代价矩阵：代价 = 1 - IoU；跨类型或无重叠保持 1e6（不可行）
+            cost_mat = np.full((n_d, n_t), 1e6)
             for d_idx, det in enumerate(curr_detections):
-                curr_base_type, curr_markers = parse_class_string(det[6])
-                
-                best_iou = 0
-                best_t_idx = -1
-                
-                for t_idx, track in enumerate(active_tracks):
-                    if not track['active'] or t_idx in matched_tracks:
+                det_base, _ = parse_class_string(det[6])
+                for t_pos, ti in enumerate(active_t_indices):
+                    track = active_tracks[ti]
+                    if det_base != track['base_type']:
                         continue
-                    
-                    # === 核心修改 1: 仅校验基础类型是否一致 ===
-                    if curr_base_type != track['base_type']: 
-                        continue
-                        
-                    iou = calculate_iou(det[:4], track['last_box'])
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_t_idx = t_idx
-                
-                if best_iou >= iou_thresh:
-                    # 匹配成功，更新 track 状态
-                    track = active_tracks[best_t_idx]
-                    track['all_boxes'].append(det)
-                    track['last_box'] = det[:4]
-                    track['last_z'] = z
-                    # === 核心修改 2: 累加当前层发现的 Marker 特征 ===
-                    track['all_markers'].update(curr_markers)
-                    
-                    matched_indices.add(d_idx)
-                    matched_tracks.add(best_t_idx)
+                    cost_mat[d_idx, t_pos] = 1.0 - calculate_iou(det[:4], track['last_box'])
+
+            row_ind, col_ind = linear_sum_assignment(cost_mat)
+            for d_idx, t_pos in zip(row_ind, col_ind):
+                if cost_mat[d_idx, t_pos] > 1.0 - iou_thresh:
+                    continue  # 不可行或 IoU 不足阈值
+                ti = active_t_indices[t_pos]
+                track = active_tracks[ti]
+                det = curr_detections[d_idx]
+                _, det_markers = parse_class_string(det[6])
+                track['all_boxes'].append(det)
+                track['last_box'] = det[:4]
+                track['last_z'] = z
+                track['all_markers'].update(det_markers)
+                matched_det_indices.add(d_idx)
 
         # ==========================================
         # 归档已失活的 track
@@ -99,7 +96,7 @@ def run_z_linker(full_stack_matrix, iou_thresh=0.45, max_gap=1, min_z_layers=2, 
         # 当前层未匹配的框，作为新的 track 起点
         # ==========================================
         for idx, det in enumerate(curr_detections):
-            if idx not in matched_indices:
+            if idx not in matched_det_indices:
                 curr_base_type, curr_markers = parse_class_string(det[6])
                 active_tracks.append({
                     'all_boxes': [det],
