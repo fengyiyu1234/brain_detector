@@ -15,6 +15,7 @@ from cellpose import models as cp_models
 from concurrent.futures import ThreadPoolExecutor
 import time
 import logging
+import torch
 from src.utils.logger import setup_logging  
 
 logger = logging.getLogger(__name__)
@@ -200,11 +201,15 @@ def process_single_tile(i, pATHTEST, config):
         csv_writers[ch_id].writerow(['slice_name', 'x1', 'y1', 'x2', 'y2', 'class', 'score', 'mean', 'z'])
         
     try:
-        PREFETCH_DEPTH = 10 # 预取深度：永远保持未来 10 层的数据在后台下载
-        prefetch_futures = {} # 存放后台下载任务的字典: {(z_idx, ch_id): future}
-       
-        with ThreadPoolExecutor(max_workers=4) as downloader_pool:
-            
+        PREFETCH_DEPTH = 24  # 预取深度：网络盘 latency 高，多预取更多层掩盖延迟
+        prefetch_futures = {}
+
+        # Cellpose 批量推断缓冲区: ch_id -> [(name_no_ext, z_real, norm_img), ...]
+        cellpose_channels = [ch for ch in routing_config if ch['model'] == 'cellpose']
+        cellpose_buffer = {ch['id']: [] for ch in cellpose_channels}
+
+        with ThreadPoolExecutor(max_workers=16) as downloader_pool:
+
             pbar.set_description(f"[{dir_name[:10]}] 正在填装初始流水线...")
 
             # --- 1. 填装初始弹药：提前把前 PREFETCH_DEPTH 层抛给后台 ---
@@ -213,9 +218,8 @@ def process_single_tile(i, pATHTEST, config):
                 for ch in routing_config:
                     ch_id = ch['id']
                     img_path = channel_files_indices[ch_id].get(pre_name)
-                    
+
                     if img_path and os.path.exists(img_path):
-                        # submit 不会阻塞，它只是把任务扔给后台线程，然后立刻返回一个 Future 对象
                         prefetch_futures[(pre_z, ch_id)] = downloader_pool.submit(fast_cloud_read, img_path)
                     else:
                         prefetch_futures[(pre_z, ch_id)] = None
@@ -223,15 +227,15 @@ def process_single_tile(i, pATHTEST, config):
             # --- 2. 正式启动 GPU 核心消费者循环 ---
             for z_idx, name_no_ext in enumerate(testnames_no_ext):
                 current_z_real = z_idx * z_step + 1
-                
-                H0, W0 = 0, 0 
+
+                H0, W0 = 0, 0
 
                 for ch in routing_config:
                     ch_id = ch['id']
                     pbar.set_description(f"Tile:[{dir_name[:10]}] | Z层:[{current_z_real}/{len(testnames_no_ext)}] | 检测通道:[{ch_id}]")
                     ch_model = ch['model']
-                    
-                    # --- 1. 获取预取数据并维持流水线运转 ---
+
+                    # --- 获取预取数据并维持流水线运转 ---
                     future = prefetch_futures.get((z_idx, ch_id))
                     if future is None: continue
                     img_raw = future.result()
@@ -247,7 +251,7 @@ def process_single_tile(i, pATHTEST, config):
                         else:
                             prefetch_futures[(future_z_idx, ch_id)] = None
 
-                    # --- 2. GPU 推理图像预处理 ---
+                    # --- GPU 推理图像预处理 ---
                     if len(img_raw.shape) == 3: img_raw = img_raw[:, :, 0]
                     if H0 == 0: H0, W0 = img_raw.shape[:2]
 
@@ -255,85 +259,88 @@ def process_single_tile(i, pATHTEST, config):
 
                     # --------- YOLO 单通道滑动窗口检测 ---------
                     if ch_model == 'yolo':
-                        img_infer = cv2.cvtColor(norm_img, cv2.COLOR_GRAY2BGR) 
-                        
+                        img_infer = cv2.cvtColor(norm_img, cv2.COLOR_GRAY2BGR)
+
                         xsize, ysize, step_win = dp['xsize'], dp['ysize'], dp['step']
                         H_pad = H0 if (H0-ysize)%step_win == 0 else H0-H0%step_win+ysize
                         W_pad = W0 if (W0-xsize)%step_win == 0 else W0-W0%step_win+xsize
-                        
+
                         fullimg_pad = np.zeros((H_pad, W_pad, 3), dtype=np.uint8)
                         fullimg_pad[0:H0, 0:W0] = img_infer
-                        
+
                         conf_thresh = dp.get('conf_thresh', dp.get('tHRESHOLD', 0.25))
                         nms_iou = dp.get('nms_iou', dp.get('mINIOU', 0.45))
-                        
-                        raw_detections = np.empty((0, 6))
-                        
-                        # 滑动窗口批处理
+
+                        raw_det_chunks = []
                         batch_patches = []
                         batch_coords = []
                         BATCH_SIZE = 8
-                        
-                        for x in range(0, W_pad, step_win):
-                            for y in range(0, H_pad, step_win):
-                                patch = fullimg_pad[y:y+ysize, x:x+xsize]
-                                if patch.max() < 10: continue 
-                                
-                                batch_patches.append(patch)
-                                batch_coords.append((x, y))
-                                
-                                if len(batch_patches) == BATCH_SIZE:
-                                    results = _global_models['yolo'].predict(batch_patches, device=device, verbose=False, conf=conf_thresh, iou=nms_iou)
-                                    for i, res in enumerate(results):
-                                        if len(res.boxes) > 0:
-                                            bx, by = batch_coords[i]
-                                            boxes = res.boxes.xyxy.cpu().numpy() + np.array([bx, by, bx, by])
-                                            scores = res.boxes.conf.cpu().numpy()
-                                            labels = res.boxes.cls.cpu().numpy()
-                                            patch_res = np.hstack((boxes, scores[:, np.newaxis], labels[:, np.newaxis]))
-                                            raw_detections = np.append(raw_detections, patch_res, axis=0)
-                                    batch_patches = []
-                                    batch_coords = []
 
-                        if len(batch_patches) > 0:
-                            results = _global_models['yolo'].predict(batch_patches, device=device, verbose=False, conf=conf_thresh, iou=nms_iou)
-                            for i, res in enumerate(results):
+                        def _flush_yolo_batch(patches, coords):
+                            results = _global_models['yolo'].predict(patches, device=device, verbose=False, conf=conf_thresh, iou=nms_iou)
+                            for k, res in enumerate(results):
                                 if len(res.boxes) > 0:
-                                    bx, by = batch_coords[i]
+                                    bx, by = coords[k]
                                     boxes = res.boxes.xyxy.cpu().numpy() + np.array([bx, by, bx, by])
                                     scores = res.boxes.conf.cpu().numpy()
                                     labels = res.boxes.cls.cpu().numpy()
-                                    patch_res = np.hstack((boxes, scores[:, np.newaxis], labels[:, np.newaxis]))
-                                    raw_detections = np.append(raw_detections, patch_res, axis=0)
+                                    raw_det_chunks.append(np.hstack((boxes, scores[:, np.newaxis], labels[:, np.newaxis])))
+
+                        for x in range(0, W_pad, step_win):
+                            for y in range(0, H_pad, step_win):
+                                patch = fullimg_pad[y:y+ysize, x:x+xsize]
+                                if patch.max() < 10: continue
+
+                                batch_patches.append(patch)
+                                batch_coords.append((x, y))
+
+                                if len(batch_patches) == BATCH_SIZE:
+                                    _flush_yolo_batch(batch_patches, batch_coords)
+                                    batch_patches = []
+                                    batch_coords = []
+
+                        if batch_patches:
+                            _flush_yolo_batch(batch_patches, batch_coords)
+
+                        raw_detections = np.concatenate(raw_det_chunks, axis=0) if raw_det_chunks else np.empty((0, 6))
 
                         unique_labels = np.unique(raw_detections[:, 5]) if raw_detections.size > 0 else []
                         for lbl in unique_labels:
                             layer_label_data = raw_detections[raw_detections[:, 5] == lbl, :-1]
                             if layer_label_data.size > 0:
-                                # 调用基于 IoU 的新版 NMS
-                                cleaned_boxes = stitchDetection(layer_label_data) 
+                                cleaned_boxes = stitchDetection(layer_label_data)
                                 class_str = yolo_classes.get(str(int(lbl)), "unknown")
-                                
                                 for box in cleaned_boxes:
-                                    # 格式: [slice_name, x1, y1, x2, y2, class, score, mean, z_val]
                                     row = [name_no_ext, box[0], box[1], box[2], box[3], class_str, box[4], 0.0, current_z_real]
                                     csv_writers[ch_id].writerow(row)
 
-                    # --------- Cellpose 单通道密集细胞核检测 ---------
+                    # --------- Cellpose: 累积切片，循环后统一批量推断 ---------
                     elif ch_model == 'cellpose':
-                        masks, flows, styles = _global_models['cellpose'].eval(norm_img, diameter=None, channels=[0,0])
-                        cp_boxes = extract_boxes_from_masks(masks)
-                        
-                        for box in cp_boxes:
-                            # 格式: [slice_name, x1, y1, x2, y2, class, score, mean, z_val]
-                            row = [name_no_ext, box[0], box[1], box[2], box[3], box[5], box[4], 0.0, current_z_real]
-                            csv_writers[ch_id].writerow(row)
-                    
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                        cellpose_buffer[ch_id].append((name_no_ext, current_z_real, norm_img))
 
                 pbar.update(1)
+
+        # --- 3. Cellpose 批量推断（所有切片一次性送 GPU）---
+        for ch in cellpose_channels:
+            ch_id = ch['id']
+            buffer = cellpose_buffer[ch_id]
+            if not buffer:
+                continue
+
+            pbar.set_description(f"Tile:[{dir_name[:10]}] | Cellpose 批量推断 [{ch_id}] {len(buffer)} 层...")
+            names_cp, z_reals_cp, imgs_cp = zip(*buffer)
+
+            all_masks, _, _ = _global_models['cellpose'].eval(
+                list(imgs_cp), diameter=None, channels=[0, 0], batch_size=8
+            )
+
+            for slice_name, z_real, masks in zip(names_cp, z_reals_cp, all_masks):
+                cp_boxes = extract_boxes_from_masks(masks)
+                for box in cp_boxes:
+                    row = [slice_name, box[0], box[1], box[2], box[3], box[5], box[4], 0.0, z_real]
+                    csv_writers[ch_id].writerow(row)
+
+            current_logger.info(f"[{dir_name}][{ch_id}] Cellpose 批量推断完成: {len(buffer)} 层")
     finally:
         for f in file_handles.values():
             f.close()
@@ -344,7 +351,6 @@ def process_single_tile(i, pATHTEST, config):
     # =========================================================
     print(f"✅ Tile {dir_name} 单通道 2D 特征提取完成，已移交至全局 CSV。")
 
-    import torch
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         

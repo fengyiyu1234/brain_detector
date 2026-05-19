@@ -12,7 +12,7 @@
     "channels_routing": [
         {"id": "RFP", "type": "soma", "model": "yolo", "dir_key": "rfp_dir", "active": true},
         {"id": "GFP", "type": "soma", "model": "yolo", "dir_key": "gfp_dir", "active": true},
-        {"id": "Sox9", "type": "tf", "model": "cellpose", "dir_key": "sox9_dir", "active": true},
+        {"id": "Sox9", "type": "tf", "model": "cellpose", "dir_key": "sox9_dir", "active": true, "use_3d": false},
         {"id": "Olig2", "type": "tf", "model": "cellpose", "dir_key": "olig2_dir", "active": false}
     ],
 
@@ -20,7 +20,7 @@
         "rfp_dir": "y:/Fengyi/detection_infer_test/sample8/561",
         "gfp_dir": "y:/Fengyi/detection_infer_test/sample8/640",
         "sox9_dir": "y:/Fengyi/detection_infer_test/sample8/730", 
-        "pATHRESULT": "y:/Fengyi/detection_infer_test/sample8/detection_results"
+        "pATHRESULT": "y:/Fengyi/detection_infer_test/sample8/detection_results2"
     },
 
     "device": "cuda",
@@ -54,9 +54,13 @@
         "DOWNSAMPLE_Z_STEP": 11,
 
         "n_permutations": 100,
-        "max_soma_sample": 50000
-    },
+        "max_soma_sample": 50000,
 
-    "vISUALIZATIONSAMPLESTEP": 150,
-    "vISUALIZATIONSAMPLECOUNT": 10
+        "coloc_use_centroid_box": true,
+        "coloc_xy_tolerance_px": 5,
+
+        "cellpose_3d_anisotropy": null,
+        "cellpose_3d_diameter": null
+    }
+
 }

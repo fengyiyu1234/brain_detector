@@ -19,7 +19,7 @@ from src.utils.io import listTile, loadTeraxml, save_run_metadata
 from src.core.worker import process_single_tile_wrapper, init_worker
 from src.core.stitcher import combine_predictions
 from src.core.z_linker import run_z_linker
-from src.core.stitcher import colocalize_3d, permutation_test_colocalization
+from src.core.stitcher import colocalize_3d, colocalize_3d_centroid_in_box, permutation_test_colocalization
 
 
 if __name__ == '__main__':
@@ -261,7 +261,20 @@ if __name__ == '__main__':
 
             # ====== 3. 3D 物理空间共定位 ======
             logging.info("开始执行 3D 物理空间共定位...")
-            final_results = colocalize_3d(soma_3d, tf_3d, xy_res=xy_res, z_res=z_res, distance_thresh_um=dist_thresh)
+            use_centroid_box = dp.get('coloc_use_centroid_box', False)
+            if use_centroid_box:
+                xy_tol = dp.get('coloc_xy_tolerance_px', 5)
+                z_tol  = dp.get('z_distance_limit', 5)
+                final_results = colocalize_3d_centroid_in_box(
+                    soma_3d, tf_3d,
+                    xy_res=xy_res, z_res=z_res,
+                    xy_tolerance_px=xy_tol,
+                    z_tolerance_slices=z_tol,
+                )
+                logging.info(f"共定位方法: centroid-in-box (xy_tol=±{xy_tol}px, z_tol=±{z_tol} slices)")
+            else:
+                final_results = colocalize_3d(soma_3d, tf_3d, xy_res=xy_res, z_res=z_res, distance_thresh_um=dist_thresh)
+                logging.info(f"共定位方法: 距离球 (radius={dist_thresh}μm)")
             
         else:
             logging.info("⚠️ Z-Linker 已跳过，合并裸数据。")

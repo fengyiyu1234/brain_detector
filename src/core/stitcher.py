@@ -65,6 +65,73 @@ def colocalize_3d(soma_3d_boxes, nuc_3d_boxes, xy_res=1.0, z_res=0.008, distance
         
     return np.array(final_merged, dtype=object)
 
+def colocalize_3d_centroid_in_box(soma_3d_boxes, nuc_3d_boxes,
+                                   xy_res=1.0, z_res=8.0,
+                                   xy_tolerance_px=5, z_tolerance_slices=5):
+    """
+    Colocalize by checking whether a TF nucleus centroid falls inside the soma YOLO bbox,
+    expanded by xy_tolerance_px (XY) and z_tolerance_slices (Z).
+
+    Anatomically correct alternative to a distance sphere: the nucleus must be physically
+    inside its cell body. Works for both Cellpose 2D+Z-linker and Cellpose 3D centroids.
+    """
+    if len(soma_3d_boxes) == 0:
+        return np.empty((0, 8), dtype=object)
+    if len(nuc_3d_boxes) == 0:
+        return soma_3d_boxes
+
+    nuc_cx = (nuc_3d_boxes[:, 0].astype(float) + nuc_3d_boxes[:, 2].astype(float)) / 2
+    nuc_cy = (nuc_3d_boxes[:, 1].astype(float) + nuc_3d_boxes[:, 3].astype(float)) / 2
+    nuc_cz = nuc_3d_boxes[:, 7].astype(float)
+
+    # Scale Z to pixel-equivalent so KDTree distance is meaningful
+    z_scale = z_res / xy_res  # e.g. 8/0.65 ≈ 12.3
+    nuc_pts = np.column_stack([nuc_cx, nuc_cy, nuc_cz * z_scale])
+    nuc_tree = cKDTree(nuc_pts)
+
+    z_tol_scaled = z_tolerance_slices * z_scale
+    final_merged = []
+
+    for soma in soma_3d_boxes:
+        x1 = float(soma[0]) - xy_tolerance_px
+        y1 = float(soma[1]) - xy_tolerance_px
+        x2 = float(soma[2]) + xy_tolerance_px
+        y2 = float(soma[3]) + xy_tolerance_px
+        z_s = float(soma[7])
+
+        soma_cx_c = (x1 + x2) / 2
+        soma_cy_c = (y1 + y2) / 2
+
+        # Pre-filter: bounding sphere that contains the expanded box
+        half_w = (x2 - x1) / 2
+        half_h = (y2 - y1) / 2
+        rough_r = np.sqrt(half_w**2 + half_h**2 + z_tol_scaled**2) + 1.0
+        candidates = nuc_tree.query_ball_point([soma_cx_c, soma_cy_c, z_s * z_scale], r=rough_r)
+
+        matched_markers = []
+        for idx in candidates:
+            cx, cy, cz_raw = nuc_cx[idx], nuc_cy[idx], nuc_cz[idx]
+            if (x1 <= cx <= x2) and (y1 <= cy <= y2) and (abs(cz_raw - z_s) <= z_tolerance_slices):
+                parts = str(nuc_3d_boxes[idx][6]).split('_')
+                if len(parts) > 1:
+                    matched_markers.extend(parts[1:])
+
+        current_class = str(soma[6])
+        if matched_markers:
+            soma_parts = current_class.split('_')
+            base_type = soma_parts[0]
+            existing = soma_parts[1:] if len(soma_parts) > 1 else []
+            new_class = f"{base_type}_" + "_".join(sorted(set(existing + matched_markers)))
+        else:
+            new_class = current_class
+
+        merged = soma.copy()
+        merged[6] = new_class
+        final_merged.append(merged)
+
+    return np.array(final_merged, dtype=object)
+
+
 def permutation_test_colocalization(soma_3d_boxes, tf_3d_boxes,
                                     xy_res=1.0, z_res=8.0,
                                     distance_thresh_um=15.0,
