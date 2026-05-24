@@ -31,7 +31,6 @@
         "xy_resolution_um":0.65,
         "z_resolution_um":8,
         "z_distance_limit": 5,
-        "max_gap":0,
         "coloc_distance_um": 15,
 
         "vISUALIZE_TILE": true,

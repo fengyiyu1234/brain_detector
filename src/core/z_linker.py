@@ -23,11 +23,8 @@ def parse_class_string(cls_str):
     markers = set(parts[1:]) if len(parts) > 1 else set()
     return base_type, markers
 
-def run_z_linker(full_stack_matrix, iou_thresh=0.45, max_gap=1, min_z_layers=2, max_cell_z_span=5):
-    """
-    针对全量矩阵进行 Z 轴串联 (2.5D 细胞追踪算法) - 动态多通道版
-    输入格式: [x1, y1, x2, y2, score, mean, class_str, z] (8列)
-    """
+def run_z_linker(full_stack_matrix, iou_thresh=0.45, min_z_layers=2, max_cell_z_span=5):
+
     # 如果是空数组直接返回
     if isinstance(full_stack_matrix, list):
         full_stack_matrix = np.array(full_stack_matrix, dtype=object)
@@ -46,12 +43,9 @@ def run_z_linker(full_stack_matrix, iou_thresh=0.45, max_gap=1, min_z_layers=2, 
     # 2. 逐层连接
     for z in range(z_min, z_max + 1):
         curr_detections = z_groups[z]
-        
-        # 判定 track 失活
+
+        # 判定 track 失活：防止极高密度下的”糖葫芦”过度合并
         for track in active_tracks:
-            if z - track['last_z'] > max_gap:
-                track['active'] = False
-            # 防止极高密度下的“糖葫芦”过度合并
             if z - track['first_z'] >= max_cell_z_span:
                 track['active'] = False
 

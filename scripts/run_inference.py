@@ -127,7 +127,7 @@ if __name__ == '__main__':
     # ==========================================
     # 阶段 3: 线性 Checkpoint - 全局拼接与 Z-Linker共定位
     # ==========================================
-    bbox_path = os.path.join(paths['pATHRESULT'], "global_bboxes.csv") # 目标 4 的最终文件
+    bbox_path = os.path.join(derived['pATH_GLOBAL_3D_FINAL'], "global_bboxes.csv")
     final_results = None
     soma_3d = None   # 供阶段 5 置换检验使用（仅本次运行计算时有值，从 checkpoint 加载时为 None）
     tf_3d   = None
@@ -143,121 +143,96 @@ if __name__ == '__main__':
             final_results = final_results.reshape(1, -1)
     else:
         logging.info("阶段 3: 开始合并 Tile 并运行 Z-Linker (先独立 3D 追踪，再 3D 共定位)...")
-        
+
         routing_config = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
-        
-        soma_raw_detections = []
-        tf_raw_detections = []
+
+        per_ch_matrices = {}   # ch_id -> np.array, global 2D with marker applied
         metadata_registry = []
         num_tiles = len(pATHTILE_all)
-        
-        # ====== 1. 遍历每个通道，独立进行 2D 全局边缘拼接 ======
+        BOX_COLS  = ["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]
+
+        # ====== 1. 逐通道独立拼接全局 2D，每个通道单独保存 ======
         for ch in routing_config:
-            ch_id = ch['id']
+            ch_id   = ch['id']
             ch_type = ch.get('type', 'soma')
             logging.info(f" -> 正在拼接通道 2D 框: [{ch_id}] (类型: {ch_type})")
-            
+
             current_ch_global_2d = []
-            
+
             if num_tiles > 1:
-                # 每个通道重新初始化拼接矩阵，避免跨通道干扰
                 stitched_predictions = [[np.empty((0, 8)) for _ in range(2)] for _ in range(Z)]
                 for dir_name in dir_dict:
                     tile_name = os.path.split(dir_name)[-1]
-                    # 读取目标 1 的结果
-                    csv_tile = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_{ch_id}_result.csv")
-                    
+                    csv_tile  = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_{ch_id}_result.csv")
                     if os.path.isfile(csv_tile):
                         with open(csv_tile, newline='', encoding='utf-8') as tile_file:
-                            next(tile_file, None) # 跳过表头
-                            csv_reader = csv.reader(tile_file)
-                            # 自动映射偏移量去重
+                            next(tile_file, None)
                             stitched_predictions = combine_predictions(
-                                stitched_predictions, csv_reader, None, z_start, Z, 
-                                dir_dict[dir_name], disp_mat_fin, (H, W), metadata_registry, tile_name, tILESIZE=tile_size
+                                stitched_predictions, csv.reader(tile_file), None, z_start, Z,
+                                dir_dict[dir_name], disp_mat_fin, (H, W),
+                                metadata_registry, tile_name, tILESIZE=tile_size
                             )
-                
-                # 展平该通道的全局结果
                 for layer in stitched_predictions:
                     for group in layer:
                         if group.size > 0: current_ch_global_2d.append(group)
             else:
-                # 单 Tile 处理
                 csv_list = [f for f in os.listdir(derived['pATH_DET_RES']) if f.endswith(f'_{ch_id}_result.csv')]
                 if csv_list:
                     tile_name = csv_list[0].split(f"_{ch_id}_")[0]
                     with open(os.path.join(derived['pATH_DET_RES'], csv_list[0]), 'r', encoding='utf-8') as f:
-                        next(f, None) # 跳过表头
-                        reader = csv.reader(f)
+                        next(f, None)
                         temp_list = []
-                        for r in reader:
+                        for r in csv.reader(f):
                             if len(r) > 8 and r[0] != 'tile_id':
-                                slice_name = r[0]
-                                x1, y1, x2, y2, score, mean = map(float, r[1:5] + [r[6], r[7]])
-                                c = str(r[5])
-                                z = int(float(r[8]))
+                                x1, y1, x2, y2 = float(r[1]), float(r[2]), float(r[3]), float(r[4])
+                                score, mean, c, z = float(r[6]), float(r[7]), str(r[5]), int(float(r[8]))
                                 temp_list.append([x1, y1, x2, y2, score, mean, c, z])
-                                
-                                cx, cy = (x1+x2)/2, (y1+y2)/2
-                                metadata_registry.append([cx, cy, z, tile_name, slice_name])
+                                metadata_registry.append([(x1+x2)/2, (y1+y2)/2, z, tile_name, r[0]])
                         if temp_list:
                             current_ch_global_2d.append(np.array(temp_list, dtype=object))
-            
-            # 给这批全局 2D 框打上 Marker 并按类型分流
-            if len(current_ch_global_2d) > 0:
+
+            if current_ch_global_2d:
                 ch_matrix = np.concatenate(current_ch_global_2d, axis=0)
                 for row in ch_matrix:
-                    original_class = str(row[6])
-                    row[6] = f"{original_class}_{ch_id}" # e.g. "neuron" -> "neuron_RFP"
-                    
-                    if ch_type == 'tf':
-                        tf_raw_detections.append(row)
-                    else:
-                        soma_raw_detections.append(row)
+                    row[6] = f"{row[6]}_{ch_id}"   # "neuron" → "neuron_RFP"
+                per_ch_matrices[ch_id] = ch_matrix
+                out_2d = os.path.join(derived['pATH_GLOBAL_2D'], f"{ch_id}_2d_global.csv")
+                pd.DataFrame(ch_matrix, columns=BOX_COLS).to_csv(out_2d, index=False)
+                logging.info(f"✔️ [{ch_id}] 全局2D: {len(ch_matrix)} 框 → {out_2d}")
 
-        # 转换为 Numpy 矩阵
-        soma_matrix = np.array(soma_raw_detections, dtype=object) if soma_raw_detections else np.empty((0, 8), dtype=object)
-        tf_matrix = np.array(tf_raw_detections, dtype=object) if tf_raw_detections else np.empty((0, 8), dtype=object)
-
-        # 导出全局 2D 原始坐标 (Z-Linker 之前)
-        global_2d_raw_path = os.path.join(paths['pATHRESULT'], "global_2D_raw.csv")
-        global_2d_all = np.concatenate((soma_matrix, tf_matrix), axis=0) if len(soma_matrix) > 0 and len(tf_matrix) > 0 else (soma_matrix if len(soma_matrix) > 0 else tf_matrix)
-        if len(global_2d_all) > 0:
-            pd.DataFrame(global_2d_all, columns=["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]).to_csv(global_2d_raw_path, index=False)
-            logging.info(f"✔️ 已输出 目标2 (全局2D 原始): {global_2d_raw_path}")
+        # ====== 2. 逐通道独立 Z-Linker，保存每个通道的 3D 追踪结果 ======
+        soma_3d_parts = []
+        tf_3d_parts   = []
 
         if config.get('ENABLE_Z_LINKER', True):
-            logging.info(f"正在按 Config Type 分发 Z-Linker (先进行 3D 追踪)...")
-            
-            soma_3d = np.empty((0, 8), dtype=object)
-            tf_3d = np.empty((0, 8), dtype=object)
-            
-            if len(soma_matrix) > 0:
-                soma_3d = run_z_linker(
-                    soma_matrix, 
-                    iou_thresh=0.35, 
-                    max_gap=dp.get('max_gap', 0), 
-                    min_z_layers=2, # Soma 至少需出现 2 层
-                    max_cell_z_span=dp.get('z_distance_limit', 5)
-                )
-            
-            if len(tf_matrix) > 0:
-                tf_3d = run_z_linker(
-                    tf_matrix, 
-                    iou_thresh=0.25, 
-                    max_gap=dp.get('max_gap', 0), 
-                    min_z_layers=1,
-                    max_cell_z_span=3
-                )
-                
-            logging.info(f"✔️ Z-Linker 追踪完毕: {len(soma_3d)} 个 3D 胞体，{len(tf_3d)} 个 3D 核/TF。")
+            logging.info("正在逐通道运行 Z-Linker...")
+            for ch in routing_config:
+                ch_id   = ch['id']
+                ch_type = ch.get('type', 'soma')
+                ch_mat  = per_ch_matrices.get(ch_id)
+                if ch_mat is None or len(ch_mat) == 0:
+                    continue
 
-            #导出全局 3D 单通道追踪坐标 (Colocalize 之前) 
-            global_3d_single_path = os.path.join(paths['pATHRESULT'], "global_3D_single_channel.csv")
-            global_3d_single_all = np.concatenate((soma_3d, tf_3d), axis=0) if len(soma_3d) > 0 and len(tf_3d) > 0 else (soma_3d if len(soma_3d) > 0 else tf_3d)
-            if len(global_3d_single_all) > 0:
-                pd.DataFrame(global_3d_single_all, columns=["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]).to_csv(global_3d_single_path, index=False)
-                logging.info(f"✔️ 已输出 目标3 (全局3D 单通道): {global_3d_single_path}")
+                if ch_type == 'soma':
+                    ch_3d = run_z_linker(ch_mat, iou_thresh=0.35,
+                                         min_z_layers=2,
+                                         max_cell_z_span=dp.get('z_distance_limit', 5))
+                    soma_3d_parts.append(ch_3d)
+                else:
+                    ch_3d = run_z_linker(ch_mat, iou_thresh=0.25,
+                                         min_z_layers=1,
+                                         max_cell_z_span=3)
+                    tf_3d_parts.append(ch_3d)
+
+                out_3d = os.path.join(derived['pATH_GLOBAL_3D_SINGLE'], f"{ch_id}_3d_tracked.csv")
+                pd.DataFrame(ch_3d, columns=BOX_COLS).to_csv(out_3d, index=False)
+                logging.info(f"✔️ [{ch_id}] Z-Linker: {len(ch_3d)} 个 3D 细胞 → {out_3d}")
+
+            soma_3d = (np.concatenate(soma_3d_parts, axis=0) if soma_3d_parts
+                       else np.empty((0, 8), dtype=object))
+            tf_3d   = (np.concatenate(tf_3d_parts, axis=0) if tf_3d_parts
+                       else np.empty((0, 8), dtype=object))
+            logging.info(f"✔️ Z-Linker 汇总: {len(soma_3d)} 个 3D 胞体，{len(tf_3d)} 个 3D 核/TF。")
 
             # ====== 3. 3D 物理空间共定位 ======
             logging.info("开始执行 3D 物理空间共定位...")
@@ -266,52 +241,57 @@ if __name__ == '__main__':
                 xy_tol = dp.get('coloc_xy_tolerance_px', 5)
                 z_tol  = dp.get('z_distance_limit', 5)
                 final_results = colocalize_3d_centroid_in_box(
-                    soma_3d, tf_3d,
-                    xy_res=xy_res, z_res=z_res,
-                    xy_tolerance_px=xy_tol,
-                    z_tolerance_slices=z_tol,
+                    soma_3d, tf_3d, xy_res=xy_res, z_res=z_res,
+                    xy_tolerance_px=xy_tol, z_tolerance_slices=z_tol,
                 )
                 logging.info(f"共定位方法: centroid-in-box (xy_tol=±{xy_tol}px, z_tol=±{z_tol} slices)")
             else:
-                final_results = colocalize_3d(soma_3d, tf_3d, xy_res=xy_res, z_res=z_res, distance_thresh_um=dist_thresh)
+                final_results = colocalize_3d(soma_3d, tf_3d, xy_res=xy_res, z_res=z_res,
+                                              distance_thresh_um=dist_thresh)
                 logging.info(f"共定位方法: 距离球 (radius={dist_thresh}μm)")
-            
         else:
             logging.info("⚠️ Z-Linker 已跳过，合并裸数据。")
-            final_results = np.concatenate((soma_matrix, tf_matrix), axis=0) if len(soma_matrix) > 0 else tf_matrix
-        
+            all_parts = [m for m in per_ch_matrices.values() if len(m) > 0]
+            final_results = (np.concatenate(all_parts, axis=0) if all_parts
+                             else np.empty((0, 8), dtype=object))
+
         # ====== 4. 保存全局 3D 报告 (目标 4) ======
         if final_results is not None and len(final_results) > 0:
-            df = pd.DataFrame(final_results, columns=["x1", "y1", "x2", "y2", "score", "mean", "class", "z"])
-            
+            df = pd.DataFrame(final_results, columns=BOX_COLS)
+
             if len(metadata_registry) > 0:
-                meta_np = np.array(metadata_registry, dtype=object)
+                meta_np     = np.array(metadata_registry, dtype=object)
                 meta_coords = meta_np[:, :3].astype(float)
                 meta_coords[:, 2] *= 10.0
                 tree = cKDTree(meta_coords)
-                
                 final_coords = np.column_stack((
                     (final_results[:, 0] + final_results[:, 2]) / 2,
                     (final_results[:, 1] + final_results[:, 3]) / 2,
                     final_results[:, 7].astype(float) * 10.0
                 ))
-                
                 _, indices = tree.query(final_coords)
-                df['tile_name'] = meta_np[indices, 3]
+                df['tile_name']  = meta_np[indices, 3]
                 df['slice_name'] = meta_np[indices, 4]
             else:
-                df['tile_name'] = 'Unknown'
+                df['tile_name']  = 'Unknown'
                 df['slice_name'] = 'Unknown'
-            
-            df.to_csv(bbox_path, index=False) # 保存目标 4: global_bboxes.csv
-            logging.info(f"✔️ 已输出 目标4 (全局3D 共定位): {bbox_path}")
+
+            # Checkpoint CSV (全量，供 Stage 4/5 读取)
+            df.to_csv(bbox_path, index=False)
+            logging.info(f"✔️ 已输出 目标4 checkpoint: {bbox_path}")
+
+            # 按细胞类型分别保存 CSV (neuron_GFP.csv, glia_RFP_Sox9.csv, ...)
+            for cls, cls_df in df.groupby('class'):
+                safe_cls = str(cls).replace('/', '_').replace('\\', '_')
+                cls_df.to_csv(os.path.join(derived['pATH_GLOBAL_3D_FINAL'], f"{safe_cls}.csv"), index=False)
+            logging.info(f"✔️ 已输出 目标4 ({df['class'].nunique()} 种细胞类型) → {derived['pATH_GLOBAL_3D_FINAL']}")
         else:
             logging.warning("⚠️ 全局未检测到任何 3D 目标。")
 
     # ==========================================
     # 阶段 4: 生成分析级的统计报告与质心
     # ==========================================
-    report_path = os.path.join(paths['pATHRESULT'], "global_summary_statistics.csv")
+    report_path = os.path.join(derived['pATH_REPORT'], "global_summary_statistics.csv")
 
     if os.path.exists(report_path):
         logging.info("✔️ Checkpoint 3 达成: 全局统计报告已存在。")
