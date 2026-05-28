@@ -1,65 +1,104 @@
 {
+    // ── 模型权重路径 ──────────────────────────────────────────────────────────
     "models": {
-        "yolo_path": "d:/Fengyi/model_weight/MADM_single_channel/train18/weights/best.pt",
+        "yolo_path":     "d:/Fengyi/model_weight/MADM_single_channel/train18/weights/best.pt",
         "cellpose_path": "d:/Fengyi/model_weight/MADM_single_channel/models/nuclei_model_0515"
     },
 
+    // ── 模型输出类别映射 ──────────────────────────────────────────────────────
     "model_classes": {
-        "yolo": {"0": "neuron", "1": "glia"},
-        "cellpose": {"0": "nucleus"}
+        "yolo":     {"0": "neuron", "1": "glia"},   // 0=神经元, 1=胶质细胞
+        "cellpose": {"0": "nucleus"}                // 0=细胞核
     },
-    
+
+    // ── 通道路由配置 ──────────────────────────────────────────────────────────
+    // type "soma" → YOLO 检测细胞体；type "tf" → Cellpose 检测转录因子/细胞核
+    // active: false 的通道在推理时跳过
     "channels_routing": [
-        {"id": "RFP", "type": "soma", "model": "yolo", "dir_key": "rfp_dir", "active": true},
-        {"id": "GFP", "type": "soma", "model": "yolo", "dir_key": "gfp_dir", "active": true},
-        {"id": "Sox9", "type": "tf", "model": "cellpose", "dir_key": "sox9_dir", "active": true, "use_3d": false},
-        {"id": "Olig2", "type": "tf", "model": "cellpose", "dir_key": "olig2_dir", "active": false}
+        {"id": "RFP",   "type": "soma", "model": "yolo",     "dir_key": "rfp_dir",   "active": true},
+        {"id": "GFP",   "type": "soma", "model": "yolo",     "dir_key": "gfp_dir",   "active": true},
+        {"id": "Sox9",  "type": "tf",   "model": "cellpose", "dir_key": "sox9_dir",  "active": true, "use_3d": false},
+        {"id": "Olig2", "type": "tf",   "model": "cellpose", "dir_key": "olig2_dir",  "active": false, "use_3d": false}
     ],
 
-    "paths": { 
-        "rfp_dir": "y:/Fengyi/detection_infer_test/sample8/561",
-        "gfp_dir": "y:/Fengyi/detection_infer_test/sample8/640",
-        "sox9_dir": "y:/Fengyi/detection_infer_test/sample8/730", 
+    // ── 文件路径 ──────────────────────────────────────────────────────────────
+    "paths": {
+        "rfp_dir":    "y:/Fengyi/detection_infer_test/sample8/561",
+        "gfp_dir":    "y:/Fengyi/detection_infer_test/sample8/640",
+        "sox9_dir":   "y:/Fengyi/detection_infer_test/sample8/730",
         "pATHRESULT": "y:/Fengyi/detection_infer_test/sample8/detection_results2"
     },
 
-    "device": "cuda",
+    // "paths": {
+    //     "rfp_dir":    "y:/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/RFP",
+    //     "gfp_dir":    "y:/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/GFP_15",
+    //     "sox9_dir":   "y:/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/Sox9",
+    //     "olig2_dir":  "y:/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/Olig2",
+    //     "pATHRESULT": "y:/Fengyi/EGFR_brain/batch4/sample5/detection_results"
+    // },
 
-    "ENABLE_Z_LINKER": true,
+    "device": "cuda",               // 推理设备，"cuda" 或 "cpu"
 
+    "ENABLE_Z_LINKER": true,        // 是否执行 Z 轴串联；false 时直接输出 2D 结果
+
+    // ── Z-Linker 参数（按通道类型分组）────────────────────────────────────────
+    "z_linker": {
+        "soma": {
+            "iou_thresh":      0.35,    // 相邻 z 层 bbox 匹配所需最小 IoU
+            "min_z_layers":    1,       // 判定为真实 3D 细胞的最少 z 层数
+            "max_cell_z_span": 5        // 单个细胞允许跨越的最大 z 层数（防止过度合并）
+        },
+        "tf": {
+            "iou_thresh":      0.25,    // 细胞核较小，IoU 阈值适当降低
+            "min_z_layers":    1,       // 核标记较薄，允许单层即算 3D
+            "max_cell_z_span": 3        // 核一般横跨 2-3 个 z 层
+        }
+    },
+
+    // ── 检测参数 ──────────────────────────────────────────────────────────────
     "detection_params": {
-        "xy_resolution_um":0.65,
-        "z_resolution_um":8,
-        "z_distance_limit": 5,
-        "coloc_distance_um": 15,
+        // 物理分辨率
+        "xy_resolution_um": 0.65,   // XY 像素物理尺寸 (µm/pixel)
+        "z_resolution_um":  8,      // Z 轴切片间距 (µm)
 
-        "vISUALIZE_TILE": true,
+        // 3D 共定位
+        "z_distance_limit":     0,  // 共定位 Z 轴容差 (slices)；也作 centroid-in-box 的 z_tol
+        "coloc_distance_um":   15,  // 球距离法的共定位半径 (µm)
+        "coloc_use_centroid_box":   true,   // true=质心落在对方 bbox 内；false=球距离法
+        "coloc_xy_tolerance_px":    5,      // centroid-in-box 法 XY 容差 (px)
+        "soma_merge_iou_thresh":      0.1,   // 2D IoU 阈值：soma 跨通道合并（RFP↔GFP）
 
-        "conf_thresh": 0.3,
-        "nms_iou": 0.3,
+        // 检测阈值
+        "conf_thresh": 0.3,         // YOLO 置信度阈值
+        "nms_iou":     0.3,         // NMS IoU 阈值（去重）
 
-        "xsize": 512,
-        "ysize": 512,
-        "step": 384,
-        "tILESIZE": 2048,
+        // 推理 patch 参数
+        "xsize": 512,               // 推理 patch 宽 (px)
+        "ysize": 512,               // 推理 patch 高 (px)
+        "step":  384,               // 滑窗步长 (px)；重叠 = xsize - step = 128 px
+        "tILESIZE": 2048,           // TeraStitcher tile 边长 (px)
 
-        "sTARTID": null,
-        "eNDID": null, 
+        // 处理范围
+        "sTARTID": null,            // 起始 tile 编号（null = 从头）
+        "eNDID":   null,            // 结束 tile 编号（null = 到尾）
 
-        "normalize_PERCENTILE_LOW": 0.1,
-        "normalize_PERCENTILE_HIGH": 99.9,
+        // 图像归一化
+        "normalize_PERCENTILE_LOW":  0.1,   // 拉伸下分位数 (%)
+        "normalize_PERCENTILE_HIGH": 99.9,  // 拉伸上分位数 (%)
 
-        "DOWNSAMPLE": false,
-        "DOWNSAMPLE_Z_STEP": 11,
+        // Z 轴下采样（加速调试用）
+        "DOWNSAMPLE":        true, // 是否跳帧；true 时只处理每隔 DOWNSAMPLE_Z_STEP 的切片
+        "DOWNSAMPLE_Z_STEP": 41,    // 跳帧步长（DOWNSAMPLE=true 时生效）
 
-        "n_permutations": 100,
-        "max_soma_sample": 50000,
+        // 置换检验（共定位统计显著性）
+        "n_permutations":   100,    // 随机置换次数；越大越精确，越慢
+        "max_soma_sample": 50000,   // 置换时胞体随机采样上限（防止超大样本超时）
 
-        "coloc_use_centroid_box": true,
-        "coloc_xy_tolerance_px": 5,
+        // Cellpose 参数
+        "cellpose_3d_anisotropy": null,     // Z/XY 各向异性比（null = 自动估算）
+        "cellpose_3d_diameter":   null,     // 细胞直径估计 px（null = 自动检测）
 
-        "cellpose_3d_anisotropy": null,
-        "cellpose_3d_diameter": null
+        "vISUALIZE_TILE": true      // 保留调试字段，暂未使用
     }
 
 }

@@ -19,7 +19,8 @@ from src.utils.io import listTile, loadTeraxml, save_run_metadata
 from src.core.worker import process_single_tile_wrapper, init_worker
 from src.core.stitcher import combine_predictions
 from src.core.z_linker import run_z_linker
-from src.core.stitcher import colocalize_3d, colocalize_3d_centroid_in_box, permutation_test_colocalization
+from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_gmm,
+                               permutation_test_colocalization, _merge_class)
 
 
 if __name__ == '__main__':
@@ -45,8 +46,8 @@ if __name__ == '__main__':
     derived = {}
     derived['pATH_DET_RES'] = os.path.join(base_res_path, "1_tile_2d_raw")
     derived['pATH_GLOBAL_2D'] = os.path.join(base_res_path, "2_global_2d_raw")
-    derived['pATH_GLOBAL_3D_SINGLE'] = os.path.join(base_res_path, "3_global_3d_single")
-    derived['pATH_GLOBAL_3D_FINAL'] = os.path.join(base_res_path, "4_global_3d_final")
+    derived['pATH_CHANNEL_3D']    = os.path.join(base_res_path, "3_channel_3d")
+    derived['pATH_COLOCALIZATION'] = os.path.join(base_res_path, "4_colocalization")
     derived['pATH_REPORT'] = os.path.join(base_res_path, "5_analysis_report")
     derived['pATH_CENTROIDS'] = os.path.join(derived['pATH_REPORT'], "cell_centroids")
 
@@ -115,7 +116,7 @@ if __name__ == '__main__':
 
     if tasks_to_run:
         logging.info(f"阶段 2: 发现 {len(tasks_to_run)} 个缺失结果，开始多进程独立推理...")
-        num_processes = 4
+        num_processes = 1
         print("\n" * (num_processes + 2))
         with mp.Pool(processes=num_processes, initializer=init_worker, initargs=(config,)) as pool:
             with tqdm(total=len(tasks_to_run), desc="Tile Processing", position=0, leave=True) as pbar:
@@ -127,7 +128,7 @@ if __name__ == '__main__':
     # ==========================================
     # 阶段 3: 线性 Checkpoint - 全局拼接与 Z-Linker共定位
     # ==========================================
-    bbox_path = os.path.join(derived['pATH_GLOBAL_3D_FINAL'], "global_bboxes.csv")
+    bbox_path = os.path.join(derived['pATH_COLOCALIZATION'], "coloc_result.csv")
     final_results = None
     soma_3d = None   # 供阶段 5 置换检验使用（仅本次运行计算时有值，从 checkpoint 加载时为 None）
     tf_3d   = None
@@ -200,60 +201,105 @@ if __name__ == '__main__':
                 pd.DataFrame(ch_matrix, columns=BOX_COLS).to_csv(out_2d, index=False)
                 logging.info(f"✔️ [{ch_id}] 全局2D: {len(ch_matrix)} 框 → {out_2d}")
 
-        # ====== 2. 逐通道独立 Z-Linker，保存每个通道的 3D 追踪结果 ======
-        soma_3d_parts = []
-        tf_3d_parts   = []
+        # ====== 2. 独立 Z-Link 每个 channel ======
+        soma_ch_ids = [ch['id'] for ch in routing_config
+                       if ch.get('type', 'soma') == 'soma' and ch.get('active', True)]
+        tf_ch_ids   = [ch['id'] for ch in routing_config
+                       if ch.get('type', 'tf')   == 'tf'   and ch.get('active', True)]
 
-        if config.get('ENABLE_Z_LINKER', True):
-            logging.info("正在逐通道运行 Z-Linker...")
-            for ch in routing_config:
-                ch_id   = ch['id']
-                ch_type = ch.get('type', 'soma')
-                ch_mat  = per_ch_matrices.get(ch_id)
-                if ch_mat is None or len(ch_mat) == 0:
-                    continue
+        zl      = config.get('z_linker', {})
+        zl_soma = zl.get('soma', {})
+        zl_tf   = zl.get('tf', {})
 
-                if ch_type == 'soma':
-                    ch_3d = run_z_linker(ch_mat, iou_thresh=0.35,
-                                         min_z_layers=2,
-                                         max_cell_z_span=dp.get('z_distance_limit', 5))
-                    soma_3d_parts.append(ch_3d)
-                else:
-                    ch_3d = run_z_linker(ch_mat, iou_thresh=0.25,
-                                         min_z_layers=1,
-                                         max_cell_z_span=3)
-                    tf_3d_parts.append(ch_3d)
+        soma_vol_by_ch = {}   # ch_id → volumetric_list (for 3D coloc)
+        tf_vol_by_ch   = {}
 
-                out_3d = os.path.join(derived['pATH_GLOBAL_3D_SINGLE'], f"{ch_id}_3d_tracked.csv")
-                pd.DataFrame(ch_3d, columns=BOX_COLS).to_csv(out_3d, index=False)
-                logging.info(f"✔️ [{ch_id}] Z-Linker: {len(ch_3d)} 个 3D 细胞 → {out_3d}")
+        for cid in soma_ch_ids:
+            ch_mat = per_ch_matrices.get(cid)
+            if ch_mat is None or len(ch_mat) == 0:
+                continue
+            summary, vol_list = run_z_linker(
+                ch_mat,
+                iou_thresh=zl_soma.get('iou_thresh', 0.35),
+                min_z_layers=zl_soma.get('min_z_layers', 1),
+                max_cell_z_span=zl_soma.get('max_cell_z_span', 5),
+            )
+            soma_vol_by_ch[cid] = vol_list
+            out_3d = os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.csv")
+            pd.DataFrame(summary, columns=BOX_COLS).to_csv(out_3d, index=False)
+            logging.info(f"✔️ [{cid}] Z-Link soma: {len(vol_list)} 个细胞 → {out_3d}")
 
-            soma_3d = (np.concatenate(soma_3d_parts, axis=0) if soma_3d_parts
-                       else np.empty((0, 8), dtype=object))
-            tf_3d   = (np.concatenate(tf_3d_parts, axis=0) if tf_3d_parts
-                       else np.empty((0, 8), dtype=object))
-            logging.info(f"✔️ Z-Linker 汇总: {len(soma_3d)} 个 3D 胞体，{len(tf_3d)} 个 3D 核/TF。")
+        for cid in tf_ch_ids:
+            ch_mat = per_ch_matrices.get(cid)
+            if ch_mat is None or len(ch_mat) == 0:
+                continue
+            summary, vol_list = run_z_linker(
+                ch_mat,
+                iou_thresh=zl_tf.get('iou_thresh', 0.25),
+                min_z_layers=zl_tf.get('min_z_layers', 1),
+                max_cell_z_span=zl_tf.get('max_cell_z_span', 3),
+            )
+            tf_vol_by_ch[cid] = vol_list
+            out_3d = os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.csv")
+            pd.DataFrame(summary, columns=BOX_COLS).to_csv(out_3d, index=False)
+            logging.info(f"✔️ [{cid}] Z-Link TF: {len(vol_list)} 个细胞 → {out_3d}")
 
-            # ====== 3. 3D 物理空间共定位 ======
-            logging.info("开始执行 3D 物理空间共定位...")
-            use_centroid_box = dp.get('coloc_use_centroid_box', False)
-            if use_centroid_box:
-                xy_tol = dp.get('coloc_xy_tolerance_px', 5)
-                z_tol  = dp.get('z_distance_limit', 5)
-                final_results = colocalize_3d_centroid_in_box(
-                    soma_3d, tf_3d, xy_res=xy_res, z_res=z_res,
-                    xy_tolerance_px=xy_tol, z_tolerance_slices=z_tol,
-                )
-                logging.info(f"共定位方法: centroid-in-box (xy_tol=±{xy_tol}px, z_tol=±{z_tol} slices)")
-            else:
-                final_results = colocalize_3d(soma_3d, tf_3d, xy_res=xy_res, z_res=z_res,
-                                              distance_thresh_um=dist_thresh)
-                logging.info(f"共定位方法: 距离球 (radius={dist_thresh}μm)")
-        else:
-            logging.info("⚠️ Z-Linker 已跳过，合并裸数据。")
-            all_parts = [m for m in per_ch_matrices.values() if len(m) > 0]
-            final_results = (np.concatenate(all_parts, axis=0) if all_parts
-                             else np.empty((0, 8), dtype=object))
+        # ====== 3. 3D Colocalization ======
+        # Phase A: soma × soma 3D IoU（逐对匹配，依次合并到主列表）
+        iou_thresh_3d = zl_soma.get('iou_thresh_3d', 0.15)
+
+        merged_soma_vols = list(soma_vol_by_ch.get(soma_ch_ids[0], [])) if soma_ch_ids else []
+        for cid_b in soma_ch_ids[1:]:
+            cells_b = soma_vol_by_ch.get(cid_b, [])
+            matched_pairs, unmatched_a, unmatched_b = match_soma_3d_iou(
+                merged_soma_vols, cells_b, iou_thresh=iou_thresh_3d
+            )
+            for a_cell, b_cell in matched_pairs:
+                a_cell['class'] = _merge_class(a_cell['class'], b_cell['class'])
+            merged_soma_vols = merged_soma_vols + unmatched_b
+        n_multi  = sum(1 for c in merged_soma_vols if len(c['class'].split('_')) > 2)
+        n_single = len(merged_soma_vols) - n_multi
+        logging.info(f"✔️ [3A] Soma 3D IoU 匹配: {len(merged_soma_vols)} 个 "
+                     f"(多阳性 {n_multi}, 单阳性 {n_single})")
+
+        # Phase B: soma × TF GMM 标注
+        all_tf_vols = []
+        for cid in tf_ch_ids:
+            all_tf_vols.extend(tf_vol_by_ch.get(cid, []))
+
+        if all_tf_vols and merged_soma_vols:
+            p_thresh = zl_tf.get('gmm_p_thresh', 0.5)
+            merged_soma_vols = annotate_soma_with_tf_gmm(
+                merged_soma_vols, all_tf_vols, p_thresh=p_thresh
+            )
+            n_tf_annotated = sum(
+                1 for c in merged_soma_vols if len(c['class'].split('_')) > 2
+                and any(tf in c['class'] for cid in tf_ch_ids for tf in [cid])
+            )
+            logging.info(f"✔️ [3B] TF GMM 标注完成: {n_tf_annotated} 个 soma 有 TF marker")
+
+        # Phase C: 输出为 2D 形式（center_z处的bbox），排除TF单阳性
+        output_rows = []
+        for soma in merged_soma_vols:
+            center_z = int(round(soma['cz']))
+            bbox = soma['per_z_boxes'].get(
+                center_z,
+                [soma['x1_3d'], soma['y1_3d'], soma['x2_3d'], soma['y2_3d']]
+            )
+            output_rows.append([
+                bbox[0], bbox[1], bbox[2], bbox[3],
+                soma['score'], soma['mean'], soma['class'], center_z
+            ])
+
+        soma_3d = (np.array(output_rows, dtype=object)
+                   if output_rows else np.empty((0, 8), dtype=object))
+        tf_3d   = np.empty((0, 8), dtype=object)   # TF单阳性不输出
+
+        out_coloc = os.path.join(derived['pATH_COLOCALIZATION'], 'coloc_result.csv')
+        pd.DataFrame(soma_3d, columns=BOX_COLS).to_csv(out_coloc, index=False)
+        logging.info(f"✔️ [3C] 共定位结果: {len(soma_3d)} 个细胞 → {out_coloc}")
+
+        final_results = soma_3d
 
         # ====== 4. 保存全局 3D 报告 (目标 4) ======
         if final_results is not None and len(final_results) > 0:
@@ -283,8 +329,8 @@ if __name__ == '__main__':
             # 按细胞类型分别保存 CSV (neuron_GFP.csv, glia_RFP_Sox9.csv, ...)
             for cls, cls_df in df.groupby('class'):
                 safe_cls = str(cls).replace('/', '_').replace('\\', '_')
-                cls_df.to_csv(os.path.join(derived['pATH_GLOBAL_3D_FINAL'], f"{safe_cls}.csv"), index=False)
-            logging.info(f"✔️ 已输出 目标4 ({df['class'].nunique()} 种细胞类型) → {derived['pATH_GLOBAL_3D_FINAL']}")
+                cls_df.to_csv(os.path.join(derived['pATH_COLOCALIZATION'], f"{safe_cls}.csv"), index=False)
+            logging.info(f"✔️ 已输出 目标4 ({df['class'].nunique()} 种细胞类型) → {derived['pATH_COLOCALIZATION']}")
         else:
             logging.warning("⚠️ 全局未检测到任何 3D 目标。")
 

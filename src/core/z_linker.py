@@ -1,17 +1,19 @@
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-def calculate_iou(boxA, boxB):
-    """计算两个 2D 框的交并比 (IoU)"""
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-    interArea = max(0, xB - xA) * max(0, yB - yA)
-    if interArea == 0: return 0.0
-    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-    return interArea / float(boxAArea + boxBArea - interArea)
+
+def _iou_matrix(det_boxes, track_boxes):
+    """Vectorized IoU: (n_d, 4) × (n_t, 4) → (n_d, n_t)."""
+    x1 = np.maximum(det_boxes[:, 0:1], track_boxes[:, 0])
+    y1 = np.maximum(det_boxes[:, 1:2], track_boxes[:, 1])
+    x2 = np.minimum(det_boxes[:, 2:3], track_boxes[:, 2])
+    y2 = np.minimum(det_boxes[:, 3:4], track_boxes[:, 3])
+    inter = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+    area_d = (det_boxes[:, 2] - det_boxes[:, 0]) * (det_boxes[:, 3] - det_boxes[:, 1])
+    area_t = (track_boxes[:, 2] - track_boxes[:, 0]) * (track_boxes[:, 3] - track_boxes[:, 1])
+    union = area_d[:, None] + area_t[None, :] - inter
+    return inter / (union + 1e-8)
+
 
 def parse_class_string(cls_str):
     """
@@ -23,119 +25,126 @@ def parse_class_string(cls_str):
     markers = set(parts[1:]) if len(parts) > 1 else set()
     return base_type, markers
 
-def run_z_linker(full_stack_matrix, iou_thresh=0.45, min_z_layers=2, max_cell_z_span=5):
 
-    # 如果是空数组直接返回
+def run_z_linker(full_stack_matrix, iou_thresh=0.45, min_z_layers=2, max_cell_z_span=5):
+    """
+    Returns (summary_array, volumetric_list).
+      summary_array:    np.ndarray (N, 8) — one row per cell, center_z, for visualization CSV
+      volumetric_list:  list[dict]        — per-cell volumetric info for 3D colocalization
+    """
     if isinstance(full_stack_matrix, list):
         full_stack_matrix = np.array(full_stack_matrix, dtype=object)
     if full_stack_matrix.size == 0:
-        return full_stack_matrix
+        return np.empty((0, 8), dtype=object), []
 
-    # 1. 按 Z 轴排序并分组
     z_min, z_max = int(np.min(full_stack_matrix[:, 7])), int(np.max(full_stack_matrix[:, 7]))
     z_groups = {z: [] for z in range(z_min, z_max + 1)}
     for det in full_stack_matrix:
         z_groups[int(det[7])].append(det)
 
-    active_tracks = []   # 正在追踪的细胞串
-    finished_tracks = [] # 已结束的细胞串
+    active_tracks = []
+    finished_tracks = []
 
-    # 2. 逐层连接
     for z in range(z_min, z_max + 1):
         curr_detections = z_groups[z]
 
-        # 判定 track 失活：防止极高密度下的”糖葫芦”过度合并
         for track in active_tracks:
             if z - track['first_z'] >= max_cell_z_span:
                 track['active'] = False
 
         matched_det_indices = set()
-
-        # 仅对仍活跃的 track 建立候选列表
         active_t_indices = [ti for ti, t in enumerate(active_tracks) if t['active']]
 
         if curr_detections and active_t_indices:
-            n_d, n_t = len(curr_detections), len(active_t_indices)
-            # 代价矩阵：代价 = 1 - IoU；跨类型或无重叠保持 1e6（不可行）
-            cost_mat = np.full((n_d, n_t), 1e6)
-            for d_idx, det in enumerate(curr_detections):
-                det_base, _ = parse_class_string(det[6])
-                for t_pos, ti in enumerate(active_t_indices):
-                    track = active_tracks[ti]
-                    if det_base != track['base_type']:
-                        continue
-                    cost_mat[d_idx, t_pos] = 1.0 - calculate_iou(det[:4], track['last_box'])
+            # Pre-parse all class strings for this z-slice once
+            det_parsed   = [parse_class_string(d[6]) for d in curr_detections]
+            det_bases    = np.array([p[0] for p in det_parsed])
+            track_bases  = np.array([active_tracks[ti]['base_type'] for ti in active_t_indices])
+
+            # Vectorized IoU matrix replaces the nested per-pair Python loop
+            det_boxes    = np.array([d[:4] for d in curr_detections], dtype=float)
+            track_boxes  = np.array([active_tracks[ti]['last_box'] for ti in active_t_indices], dtype=float)
+            iou_mat      = _iou_matrix(det_boxes, track_boxes)     # (n_d, n_t)
+
+            cost_mat = 1.0 - iou_mat
+            cost_mat[det_bases[:, None] != track_bases[None, :]] = 1e6  # cross-type → infeasible
 
             row_ind, col_ind = linear_sum_assignment(cost_mat)
             for d_idx, t_pos in zip(row_ind, col_ind):
                 if cost_mat[d_idx, t_pos] > 1.0 - iou_thresh:
-                    continue  # 不可行或 IoU 不足阈值
-                ti = active_t_indices[t_pos]
+                    continue
+                ti    = active_t_indices[t_pos]
                 track = active_tracks[ti]
-                det = curr_detections[d_idx]
-                _, det_markers = parse_class_string(det[6])
+                det   = curr_detections[d_idx]
+                _, det_markers = det_parsed[d_idx]   # reuse pre-parsed result
                 track['all_boxes'].append(det)
                 track['last_box'] = det[:4]
-                track['last_z'] = z
+                track['last_z']   = z
                 track['all_markers'].update(det_markers)
+                track['per_z_boxes'][z] = [float(det[0]), float(det[1]), float(det[2]), float(det[3])]
                 matched_det_indices.add(d_idx)
 
-        # ==========================================
-        # 归档已失活的 track
-        # ==========================================
         finished_tracks.extend([t for t in active_tracks if not t['active']])
         active_tracks = [t for t in active_tracks if t['active']]
 
-        # ==========================================
-        # 当前层未匹配的框，作为新的 track 起点
-        # ==========================================
         for idx, det in enumerate(curr_detections):
             if idx not in matched_det_indices:
                 curr_base_type, curr_markers = parse_class_string(det[6])
                 active_tracks.append({
-                    'all_boxes': [det],
-                    'last_box': det[:4],
-                    'last_z': z,
-                    'first_z': z,
-                    'base_type': curr_base_type,
-                    'all_markers': curr_markers, # 初始 Markers
-                    'active': True
+                    'all_boxes':   [det],
+                    'last_box':    det[:4],
+                    'last_z':      z,
+                    'first_z':     z,
+                    'base_type':   curr_base_type,
+                    'all_markers': curr_markers,
+                    'active':      True,
+                    'per_z_boxes': {z: [float(det[0]), float(det[1]), float(det[2]), float(det[3])]},
                 })
 
-    # 循环结束，将剩下的 active_tracks 全部归档
     finished_tracks.extend(active_tracks)
 
-    # 3. 结果聚合：从每个 3D Track 中计算代表属性
     final_rows = []
+    volumetric_list = []
     for track in finished_tracks:
-        # 利用 3D 信息强力降噪。至少出现在 min_z_layers 层中的才算真细胞
         if len(track['all_boxes']) >= min_z_layers:
-            # 取出所有的检测框
-            boxes = track['all_boxes']
-            
-            # 方法：选取置信度 (score) 最高的那一层作为中心坐标和代表分数
-            # box[4] 是 score 所在列
-            best_det = max(boxes, key=lambda x: x[4])
+            boxes    = track['all_boxes']
+            best_det = max(boxes, key=lambda x: (len(str(x[6]).split('_')) - 1, float(x[4])))
             best_x1, best_y1, best_x2, best_y2, best_score, best_mean = best_det[:6]
-            
-            # Z 坐标可以使用最佳层，或者用跨度的几何中心
-            # 这里取所有层 Z 坐标的中位数
-            z_list = [b[7] for b in boxes]
+            z_list   = [b[7] for b in boxes]
             center_z = int(np.median(z_list))
-            
-            # === 核心修改 3: 重建最终 3D 细胞的名字 ===
-            # 将搜集到的所有特征排序后拼回去，例如 "neuron" + "_" + "GFP_RFP_Sox9"
-            marker_str = "_".join(sorted(list(track['all_markers'])))
-            if marker_str:
-                final_class_name = f"{track['base_type']}_{marker_str}"
-            else:
-                final_class_name = track['base_type']
-            
-            # 保持原始输出格式 [x1, y1, x2, y2, score, mean, class_str, z]
+            marker_str = "_".join(sorted(track['all_markers']))
+            final_class_name = (f"{track['base_type']}_{marker_str}" if marker_str
+                                else track['base_type'])
             final_rows.append([
-                best_x1, best_y1, best_x2, best_y2, 
-                best_score, best_mean, 
+                best_x1, best_y1, best_x2, best_y2,
+                best_score, best_mean,
                 final_class_name, center_z
             ])
 
-    return np.array(final_rows, dtype=object) if final_rows else np.empty((0, 8), dtype=object)
+            # Build cubic 3D bounding box (each axis independently)
+            pzb = track['per_z_boxes']
+            all_w = [v[2] - v[0] for v in pzb.values()]
+            all_h = [v[3] - v[1] for v in pzb.values()]
+            cx = (float(best_x1) + float(best_x2)) / 2
+            cy = (float(best_y1) + float(best_y2)) / 2
+            half_w = max(all_w) / 2
+            half_h = max(all_h) / 2
+            z_sorted = sorted(pzb.keys())
+            volumetric_list.append({
+                'cx': cx,
+                'cy': cy,
+                'cz': float(center_z),
+                'x1_3d': cx - half_w,
+                'y1_3d': cy - half_h,
+                'x2_3d': cx + half_w,
+                'y2_3d': cy + half_h,
+                'z_min': z_sorted[0],
+                'z_max': z_sorted[-1],
+                'per_z_boxes': pzb,
+                'class': final_class_name,
+                'score': float(best_score),
+                'mean':  float(best_mean),
+            })
+
+    summary = np.array(final_rows, dtype=object) if final_rows else np.empty((0, 8), dtype=object)
+    return summary, volumetric_list

@@ -100,22 +100,23 @@ def process_single_tile(i, pATHTEST, config):
         current_logger.error("配置文件中没有激活的 channels_routing！")
         return [], dir_name
 
-    # --- 2. Checkpoint (断点续传检查) ---
-    # 检查是否当前 Tile 所有激活通道的专属 CSV 都已经存在
-    all_channels_done = True
-    for ch in routing_config:
-        ch_csv_path = os.path.join(derived['pATH_DET_RES'], f"{dir_name}_{ch['id']}_result.csv")
-        if not os.path.exists(ch_csv_path):
-            all_channels_done = False
-            break
-
-    if all_channels_done:
-        print(f"[{dir_name}] 所有通道的单据 (Result CSVs) 均已存在，跳过该 Tile。")
+    # --- 2. Checkpoint (按通道精细跳过) ---
+    channels_to_run = [
+        ch for ch in routing_config
+        if not os.path.exists(
+            os.path.join(derived['pATH_DET_RES'], f"{dir_name}_{ch['id']}_result.csv")
+        )
+    ]
+    skipped = [ch['id'] for ch in routing_config if ch not in channels_to_run]
+    if skipped:
+        print(f"[{dir_name}] 已有结果，跳过通道: {skipped}")
+    if not channels_to_run:
+        print(f"[{dir_name}] 所有通道均已完成，跳过该 Tile。")
         return [], dir_name
 
     # --- 3. 打印确认通道路由 (模型已在 init_worker 中加载) ---
     print(f"\n[{dir_name}] === 确认通道推理路由 ===")
-    for ch in routing_config:
+    for ch in channels_to_run:
         ch_dir = paths.get(ch['dir_key'], 'Unknown')
         print(f" -> 通道: {ch['id']} ({ch.get('type', 'N/A')}) | 模型: {ch['model'].upper()} | 路径: {ch_dir}")
     print("================================\n")
@@ -165,7 +166,7 @@ def process_single_tile(i, pATHTEST, config):
     channel_files_indices = {}
 
     # 精准映射镜像通道
-    for ch in routing_config:
+    for ch in channels_to_run:
         ch_id = ch['id']
         ch_root = os.path.abspath(paths[ch['dir_key']])
         target_dir = os.path.join(ch_root, rel_tile_path)
@@ -190,7 +191,7 @@ def process_single_tile(i, pATHTEST, config):
     file_handles = {}
     csv_writers = {}
 
-    for ch in routing_config:
+    for ch in channels_to_run:
         ch_id = ch['id']
         ch_csv_path = os.path.join(derived['pATH_DET_RES'], f"{dir_name}_{ch_id}_result.csv")
         f_ch = open(ch_csv_path, 'w', newline='', encoding='utf-8')
@@ -205,7 +206,7 @@ def process_single_tile(i, pATHTEST, config):
         prefetch_futures = {}
 
         # Cellpose 批量推断缓冲区: ch_id -> [(name_no_ext, z_real, norm_img), ...]
-        cellpose_channels = [ch for ch in routing_config if ch['model'] == 'cellpose']
+        cellpose_channels = [ch for ch in channels_to_run if ch['model'] == 'cellpose']
         cellpose_buffer = {ch['id']: [] for ch in cellpose_channels}
 
         with ThreadPoolExecutor(max_workers=16) as downloader_pool:
@@ -215,7 +216,7 @@ def process_single_tile(i, pATHTEST, config):
             # --- 1. 填装初始弹药：提前把前 PREFETCH_DEPTH 层抛给后台 ---
             for pre_z in range(min(PREFETCH_DEPTH, len(testnames_no_ext))):
                 pre_name = testnames_no_ext[pre_z]
-                for ch in routing_config:
+                for ch in channels_to_run:
                     ch_id = ch['id']
                     img_path = channel_files_indices[ch_id].get(pre_name)
 
@@ -230,7 +231,7 @@ def process_single_tile(i, pATHTEST, config):
 
                 H0, W0 = 0, 0
 
-                for ch in routing_config:
+                for ch in channels_to_run:
                     ch_id = ch['id']
                     pbar.set_description(f"Tile:[{dir_name[:10]}] | Z层:[{current_z_real}/{len(testnames_no_ext)}] | 检测通道:[{ch_id}]")
                     ch_model = ch['model']
