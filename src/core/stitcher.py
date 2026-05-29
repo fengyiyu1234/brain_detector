@@ -450,20 +450,21 @@ def annotate_soma_with_tf_2d(soma_matrix, tf_matrix, z_tolerance_slices=0):
 # 3-D volumetric colocalization (replaces 2-D channel merging)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _iou_3d(a, b):
-    """3D IoU between two volumetric cell dicts."""
+def _iou_3d(a, b, z_pad=0):
+    """3D IoU between two volumetric cell dicts.
+    z_pad expands each cell's z range symmetrically to absorb cross-channel z registration offset."""
     ix = max(0.0, min(a['x2_3d'], b['x2_3d']) - max(a['x1_3d'], b['x1_3d']))
     iy = max(0.0, min(a['y2_3d'], b['y2_3d']) - max(a['y1_3d'], b['y1_3d']))
-    iz = max(0.0, min(a['z_max'], b['z_max']) - max(a['z_min'], b['z_min']) + 1)
+    iz = max(0.0, min(a['z_max'], b['z_max']) - max(a['z_min'], b['z_min']) + 1 + 2 * z_pad)
     inter = ix * iy * iz
     if inter == 0.0:
         return 0.0
-    va = (a['x2_3d'] - a['x1_3d']) * (a['y2_3d'] - a['y1_3d']) * (a['z_max'] - a['z_min'] + 1)
-    vb = (b['x2_3d'] - b['x1_3d']) * (b['y2_3d'] - b['y1_3d']) * (b['z_max'] - b['z_min'] + 1)
+    va = (a['x2_3d'] - a['x1_3d']) * (a['y2_3d'] - a['y1_3d']) * (a['z_max'] - a['z_min'] + 1 + 2 * z_pad)
+    vb = (b['x2_3d'] - b['x1_3d']) * (b['y2_3d'] - b['y1_3d']) * (b['z_max'] - b['z_min'] + 1 + 2 * z_pad)
     return inter / (va + vb - inter + 1e-8)
 
 
-def match_soma_3d_iou(cells_a, cells_b, iou_thresh=0.15):
+def match_soma_3d_iou(cells_a, cells_b, iou_thresh=0.15, z_pad=0):
     """
     Match two lists of volumetric soma cells using 3D IoU (Hungarian assignment).
     Returns (matched_pairs, unmatched_a, unmatched_b).
@@ -477,7 +478,7 @@ def match_soma_3d_iou(cells_a, cells_b, iou_thresh=0.15):
     iou_mat = np.zeros((n, m), dtype=float)
     for i, a in enumerate(cells_a):
         for j, b in enumerate(cells_b):
-            iou_mat[i, j] = _iou_3d(a, b)
+            iou_mat[i, j] = _iou_3d(a, b, z_pad=z_pad)
 
     cost = 1.0 - iou_mat
     cost[iou_mat < iou_thresh] = 1e6

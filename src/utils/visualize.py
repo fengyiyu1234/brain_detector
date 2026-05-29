@@ -114,7 +114,7 @@ def _read_tiff(fpath):
     return img[:, :, 0].astype(np.float32) if img.ndim == 3 else img.astype(np.float32)
 
 
-def load_volume(tile_dir, z_range=None):
+def load_volume(tile_dir, z_range=None, downsample_step=1):
     """Stack TIFFs from tile_dir into (Z, H, W) float32 normalised to [0, 1].
     TIFFs are read in parallel; percentile is estimated on a spatial subsample."""
     if not os.path.isdir(tile_dir):
@@ -122,7 +122,9 @@ def load_volume(tile_dir, z_range=None):
     files = sorted(f for f in os.listdir(tile_dir)
                    if f.lower().endswith(('.tif', '.tiff')))
     if z_range:
-        files = files[z_range[0]:z_range[1]]
+        files = files[z_range[0]:z_range[1]:downsample_step]
+    elif downsample_step > 1:
+        files = files[::downsample_step]
     if not files:
         return None
     fpaths = [os.path.join(tile_dir, f) for f in files]
@@ -140,7 +142,7 @@ def load_volume(tile_dir, z_range=None):
 def build_canvas(selected_tile_paths, ch_base_dir, anchor_root,
                  tile_size,
                  canvas_x0, canvas_y0, canvas_w, canvas_h,
-                 tile_positions_xy, z_range=None):
+                 tile_positions_xy, z_range=None, downsample_step=1):
     """
     Load selected tiles for one channel and stitch into a (Z, H, W) canvas.
     Overlap is resolved by cropping each tile's trailing edge at the boundary
@@ -157,7 +159,7 @@ def build_canvas(selected_tile_paths, ch_base_dir, anchor_root,
 
         rel      = os.path.relpath(tile_path, anchor_root)
         tile_dir = os.path.join(ch_base_dir, rel)
-        vol      = load_volume(tile_dir, z_range)
+        vol      = load_volume(tile_dir, z_range, downsample_step)
         if vol is None:
             print(f"  Not found: {tile_dir}")
             continue
@@ -190,7 +192,7 @@ def _build_shapes(df, z, y1, x1, y2, x2):
     return list(arr), colors
 
 
-def tile_csv_to_shapes(csv_path, canvas_ox, canvas_oy, z_range_start=0):
+def tile_csv_to_shapes(csv_path, canvas_ox, canvas_oy, z_range_start=0, downsample_step=1):
     """
     Tile-level 2D raw CSV (local pixel coords).
     canvas_ox / canvas_oy are the tile's top-left offset within the canvas.
@@ -202,7 +204,7 @@ def tile_csv_to_shapes(csv_path, canvas_ox, canvas_oy, z_range_start=0):
         names=['slice_name', 'x1', 'y1', 'x2', 'y2', 'class', 'score', 'mean', 'z'],
         skiprows=1,
     )
-    df['z'] = df['z'].astype(float).astype(int) - 1 - z_range_start
+    df['z'] = (df['z'].astype(float).astype(int) - 1 - z_range_start) // downsample_step
     df = df[df['z'] >= 0]
     if df.empty:
         return [], []
@@ -216,7 +218,7 @@ def tile_csv_to_shapes(csv_path, canvas_ox, canvas_oy, z_range_start=0):
 
 def _prepare_global_df(csv_path, canvas_x0, canvas_y0, z0,
                         canvas_w, canvas_h, z_range_start=0,
-                        tile_name_filter=None):
+                        tile_name_filter=None, downsample_step=1):
     """Load a global detection CSV and convert to canvas-local coordinates."""
     if not os.path.exists(csv_path):
         return None
@@ -228,7 +230,7 @@ def _prepare_global_df(csv_path, canvas_x0, canvas_y0, z0,
     df['cx2'] = df['x2'].astype(float) - canvas_x0
     df['cy1'] = df['y1'].astype(float) - canvas_y0
     df['cy2'] = df['y2'].astype(float) - canvas_y0
-    df['z_disp'] = df['z'].astype(float).astype(int) + z0 - 1 - z_range_start
+    df['z_disp'] = (df['z'].astype(float).astype(int) + z0 - 1 - z_range_start) // downsample_step
     df = df[(df['z_disp'] >= 0) &
             (df['cx1'] < canvas_w) & (df['cx2'] > 0) &
             (df['cy1'] < canvas_h) & (df['cy2'] > 0)]
@@ -237,7 +239,7 @@ def _prepare_global_df(csv_path, canvas_x0, canvas_y0, z0,
 
 def global_csv_to_shapes(csv_path, canvas_x0, canvas_y0, z0,
                           canvas_w, canvas_h, z_range_start=0,
-                          tile_name_filter=None):
+                          tile_name_filter=None, downsample_step=1):
     """
     Global detection CSV (absolute pixel coords) converted to canvas-local shapes.
     Boxes entirely outside the canvas are dropped.
@@ -245,7 +247,8 @@ def global_csv_to_shapes(csv_path, canvas_x0, canvas_y0, z0,
     only rows matching that set are kept.
     """
     df = _prepare_global_df(csv_path, canvas_x0, canvas_y0, z0,
-                             canvas_w, canvas_h, z_range_start, tile_name_filter)
+                             canvas_w, canvas_h, z_range_start, tile_name_filter,
+                             downsample_step)
     if df is None:
         return [], []
     return _build_shapes(df,
@@ -344,7 +347,9 @@ def _add_labels_layer(viewer, shapes, colors, canvas_shape, **kwargs):
     Z, H, W = canvas_shape
     vol, color_map = _rasterize_shapes_to_labels(shapes, colors, Z, H, W)
     labels_kwargs = {k: kwargs[k] for k in ('name', 'visible', 'opacity') if k in kwargs}
-    return viewer.add_labels(vol, color=color_map, **labels_kwargs)
+    layer = viewer.add_labels(vol, **labels_kwargs)
+    layer.color = color_map
+    return layer
 
 
 # ── Main ────────────────────────────────────────────────────────────────────────
@@ -357,8 +362,8 @@ def main():
     parser.add_argument('--tiles', nargs='+', type=int, default=None,
                         help='Tile indices to load (e.g. --tiles 0 1 4 5). '
                              'Omit for interactive prompt.')
-    parser.add_argument('--z-range', nargs=2, type=int, default=None,
-                        metavar=('Z_START', 'Z_END'))
+    parser.add_argument('--downsample-step', type=int, default=None,
+                        help='只显示每隔 N 层的检测平面；省略时自动读取 config 的 DOWNSAMPLE_Z_STEP')
     parser.add_argument('--list-tiles', action='store_true',
                         help='Print available tile names and exit.')
     parser.add_argument('--no-images', action='store_true',
@@ -392,8 +397,18 @@ def main():
 
     selected_names = {os.path.basename(p) for p in selected_paths}
 
-    z_range       = args.z_range
+    # ── 直接在此处修改加载范围 ─────────────────────────────────────────────────
+    z_range = 574, 861          # [start, end]，例如 [200, 500]；None = 加载全部
+    # ──────────────────────────────────────────────────────────────────────────
+
     z_range_start = z_range[0] if z_range else 0
+
+    if args.downsample_step is not None:
+        downsample_step = args.downsample_step
+    elif dp.get('DOWNSAMPLE', False):
+        downsample_step = int(dp.get('DOWNSAMPLE_Z_STEP', 2))
+    else:
+        downsample_step = 1
 
     # ── XML tile positions ─────────────────────────────────────────────────────
     xml_name = ('xml_merging.xml'
@@ -452,7 +467,7 @@ def main():
                 selected_paths, ch_base, anchor_root,
                 tile_size,
                 canvas_x0, canvas_y0, canvas_w, canvas_h,
-                tile_positions_xy, z_range,
+                tile_positions_xy, z_range, downsample_step,
             )
             if canvas_vol is None:
                 print(f"[img] {ch_id}: no data loaded")
@@ -472,7 +487,9 @@ def main():
             f for f in os.listdir(_tile_dir) if f.lower().endswith(('.tif', '.tiff'))
         ) if os.path.isdir(_tile_dir) else []
         if z_range:
-            _files = _files[z_range[0]:z_range[1]]
+            _files = _files[z_range[0]:z_range[1]:downsample_step]
+        elif downsample_step > 1:
+            _files = _files[::downsample_step]
         canvas_shape = (len(_files), canvas_h, canvas_w)
 
     base_res    = paths['pATHRESULT']
@@ -493,7 +510,7 @@ def main():
                 canvas_ox = pos[0] - canvas_x0
                 canvas_oy = pos[1] - canvas_y0
                 csv_p = os.path.join(det_res_dir, f"{name}_{ch_id}_result.csv")
-                sh, co = tile_csv_to_shapes(csv_p, canvas_ox, canvas_oy, z_range_start)
+                sh, co = tile_csv_to_shapes(csv_p, canvas_ox, canvas_oy, z_range_start, downsample_step)
                 all_shapes.extend(sh)
                 all_colors.extend(co)
             if all_shapes:
@@ -512,6 +529,7 @@ def main():
             shapes, colors = global_csv_to_shapes(
                 ch_csv, canvas_x0, canvas_y0, z0,
                 canvas_w, canvas_h, z_range_start,
+                downsample_step=downsample_step,
             )
             if shapes:
                 _add_labels_layer(
@@ -538,6 +556,7 @@ def main():
             shapes, colors = global_csv_to_shapes(
                 csv_s3, canvas_x0, canvas_y0, z0,
                 canvas_w, canvas_h, z_range_start,
+                downsample_step=downsample_step,
             )
             if shapes:
                 _add_labels_layer(
@@ -552,6 +571,7 @@ def main():
             path_s4, canvas_x0, canvas_y0, z0,
             canvas_w, canvas_h, z_range_start,
             tile_name_filter=selected_names,
+            downsample_step=downsample_step,
         )
         if df_s4 is not None:
             total = 0

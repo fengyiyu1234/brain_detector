@@ -247,12 +247,13 @@ if __name__ == '__main__':
         # ====== 3. 3D Colocalization ======
         # Phase A: soma × soma 3D IoU（逐对匹配，依次合并到主列表）
         iou_thresh_3d = zl_soma.get('iou_thresh_3d', 0.15)
+        z_pad_3d      = zl_soma.get('z_pad_3d', 2)
 
         merged_soma_vols = list(soma_vol_by_ch.get(soma_ch_ids[0], [])) if soma_ch_ids else []
         for cid_b in soma_ch_ids[1:]:
             cells_b = soma_vol_by_ch.get(cid_b, [])
             matched_pairs, unmatched_a, unmatched_b = match_soma_3d_iou(
-                merged_soma_vols, cells_b, iou_thresh=iou_thresh_3d
+                merged_soma_vols, cells_b, iou_thresh=iou_thresh_3d, z_pad=z_pad_3d
             )
             for a_cell, b_cell in matched_pairs:
                 a_cell['class'] = _merge_class(a_cell['class'], b_cell['class'])
