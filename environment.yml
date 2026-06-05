@@ -1,0 +1,41 @@
+name: brain_detector
+channels:
+  - pytorch         # official PyTorch channel (includes CUDA builds)
+  - nvidia          # CUDA runtime libraries
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.9
+
+  # ── Core scientific stack ───────────────────────────────────
+  - numpy>=1.24,<2.1
+  - pandas>=2.0
+  - scipy>=1.10
+  - scikit-learn>=1.3
+  - tqdm>=4.65
+
+  # ── Image processing ────────────────────────────────────────
+  - pillow>=10.0
+
+  # ── GUI / Visualization ─────────────────────────────────────
+  - pyqt>=5.15        # napari Qt backend
+  - napari>=0.4.19
+
+  # ── pip-only packages ───────────────────────────────────────
+  - pip
+  - pip:
+    # OpenCV (headless is lighter; replace with opencv-python if you need GUI)
+    - opencv-python-headless>=4.8
+
+    # PyTorch — replace the CPU build with the appropriate CUDA command:
+    #   CUDA 11.8:  pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118
+    #                           --index-url https://download.pytorch.org/whl/cu118
+    #   CUDA 12.1:  pip install torch==2.1.2+cu121 torchvision==0.16.2+cu121
+    #                           --index-url https://download.pytorch.org/whl/cu121
+    - torch>=2.1.0
+    - torchvision>=0.16.0
+
+    # Detection models
+    - ultralytics>=8.0       # YOLOv8/v9 (YOLO class)
+    - cellpose>=2.2          # nucleus segmentation
