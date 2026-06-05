@@ -39,6 +39,20 @@
 
     "device": "cuda",               // 推理设备，"cuda" 或 "cpu"
 
+    // ── Pipeline 模式 ──────────────────────────────────────────────────────────
+    // "post_align": 在 numorph+TeraStitcher 对齐后的图片上检测（默认行为）
+    // "pre_align" : 在未对齐的原始图片上检测，用点云匹配计算通道偏移（替代numorph）
+    "pipeline_mode": "post_align",
+
+    // ── Pre-Align 参数（仅 pipeline_mode="pre_align" 时生效）──────────────────
+    "pre_align_params": {
+        "sample_z_center_count": 50,    // 取z轴中心多少张切片用于点云对齐
+        "xy_search_range_px":    30,    // XY方向FFT互相关搜索半径（像素）
+        "z_search_range_slices": 5,     // Z方向暴力搜索范围（±切片数）；软上限5，硬上限10（超过10会强制归零）
+        "match_distance_px":     15,    // 点云IoU计算时的匹配距离阈值（像素）
+        "tile_overlap_pct":      15     // tile重叠率%（仅在无TeraStitcher XML时用于回退grid计算）
+    },
+
     "ENABLE_Z_LINKER": true,        // 是否执行 Z 轴串联；false 时直接输出 2D 结果
 
     // ── Z-Linker 参数（按通道类型分组）────────────────────────────────────────

@@ -21,6 +21,10 @@ from src.core.stitcher import combine_predictions
 from src.core.z_linker import run_z_linker
 from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_gmm,
                                permutation_test_colocalization, _merge_class)
+from src.core.point_cloud_aligner import (
+    build_point_cloud, compute_tile_channel_shifts,
+    apply_shift_to_csv, save_tile_offsets,
+)
 
 
 if __name__ == '__main__':
@@ -43,7 +47,12 @@ if __name__ == '__main__':
     if not base_res_path:
         raise ValueError("❌ 配置文件中缺失 pATHRESULT 输出根目录！")
         
+    pipeline_mode = config.get('pipeline_mode', 'post_align')  # "post_align" | "pre_align"
+    pre_align_cfg = config.get('pre_align_params', {})
+    print(f"Pipeline mode: {pipeline_mode.upper()}")
+
     derived = {}
+    derived['pATH_ALIGN_OFFSETS'] = os.path.join(base_res_path, "0_channel_alignment")
     derived['pATH_DET_RES'] = os.path.join(base_res_path, "1_tile_2d_raw")
     derived['pATH_GLOBAL_2D'] = os.path.join(base_res_path, "2_global_2d_raw")
     derived['pATH_CHANNEL_3D']    = os.path.join(base_res_path, "3_channel_3d")
@@ -93,15 +102,47 @@ if __name__ == '__main__':
     target_indices = list(range(sTARTID - 1, eNDID))
     pATHTILE = [pATHTILE_all[i] for i in target_indices]
 
-    # 5. 加载 TeraStitcher XML
+    # 5. 加载 TeraStitcher XML（pre_align 模式下如果不存在则回退到文件名 Grid 推算）
+    tile_size = dp.get('tILESIZE', 2048)
     xml_name = 'xml_merging.xml' if os.path.isfile(os.path.join(anchor_dir, 'xml_merging.xml')) else 'xml_import.xml'
     pATHxml = os.path.join(anchor_dir, xml_name)
+    has_tera_xml = os.path.exists(pATHxml)
 
-    if not os.path.exists(pATHxml):
+    if has_tera_xml:
+        dir_dict, H, W, Z, z_start, disp_mat_fin = loadTeraxml(pATHxml, tile_size)
+        logging.info(f"✔️ 已加载 TeraStitcher XML: {pATHxml}")
+    elif pipeline_mode == 'pre_align':
+        # 回退：从 tile 目录名解析行列号，用均匀 Grid 推算全局偏移
+        overlap = pre_align_cfg.get('tile_overlap_pct', 15) / 100.0
+        step_px = int(tile_size * (1.0 - overlap))
+        dir_dict = {}   # dir_name → (row, col)
+        disp_mat_rows = []
+        for tile_path in sorted(pATHTILE_all):
+            tile_name = os.path.split(tile_path)[-1]
+            parts = tile_name.split('_')
+            try:
+                row = int(parts[0]) if len(parts) >= 2 else 0
+                col = int(parts[1]) if len(parts) >= 2 else 0
+            except ValueError:
+                row, col = 0, 0
+            dir_dict[tile_name] = (row, col)
+            disp_mat_rows.append((row, col, col * step_px, row * step_px, 0))
+        if disp_mat_rows:
+            arr = np.array(disp_mat_rows)
+            n_row = int(arr[:, 0].max()) + 1
+            n_col = int(arr[:, 1].max()) + 1
+            disp_mat_fin = np.zeros((n_row, n_col, 3), dtype=int)
+            for r, c, ax, ay, az in disp_mat_rows:
+                disp_mat_fin[int(r), int(c)] = [ax, ay, az]
+        else:
+            disp_mat_fin = np.zeros((1, 1, 3), dtype=int)
+        H = disp_mat_fin[:, :, 1].max() + tile_size
+        W = disp_mat_fin[:, :, 0].max() + tile_size
+        Z = len(os.listdir(pATHTILE_all[0])) if pATHTILE_all else 1
+        z_start = 0
+        logging.warning("⚠️ 未找到 TeraStitcher XML，pre_align 模式使用文件名 Grid 推算全局偏移（近似值）。")
+    else:
         raise FileNotFoundError(f"❌ 找不到拼接坐标文件！确保 {anchor_dir} 存在 {xml_name}")
-
-    tile_size = dp.get('tILESIZE', 2048)
-    dir_dict, H, W, Z, z_start, disp_mat_fin = loadTeraxml(pATHxml, tile_size)
 
     # ==========================================
     # 阶段 2: 线性 Checkpoint - Tile 级别检测 
@@ -124,6 +165,99 @@ if __name__ == '__main__':
                     pbar.update(1)
     else:
         logging.info("✔️ Checkpoint 1 达成: 所有 Tile 检测完成。")
+
+    # ==========================================
+    # 阶段 2.5: 点云通道对齐 (仅 pre_align 模式)
+    # ==========================================
+    if pipeline_mode == 'pre_align':
+        align_done_flag = os.path.join(derived['pATH_ALIGN_OFFSETS'], "_align_done.flag")
+        if os.path.exists(align_done_flag):
+            logging.info("✔️ Checkpoint 2.5 达成: 通道点云对齐已完成，直接读取对齐结果。")
+        else:
+            logging.info("阶段 2.5: 开始点云通道对齐 (pre_align 模式)...")
+            os.makedirs(derived['pATH_ALIGN_OFFSETS'], exist_ok=True)
+
+            routing_cfg_align = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
+            soma_ch_ids_align = [ch['id'] for ch in routing_cfg_align if ch.get('type', 'soma') == 'soma']
+            tf_ch_ids_align   = [ch['id'] for ch in routing_cfg_align if ch.get('type') == 'tf']
+
+            zl_pre   = config.get('z_linker', {})
+            zl_soma  = zl_pre.get('soma', {})
+            zl_tf    = zl_pre.get('tf', {})
+
+            pa_sample_z   = pre_align_cfg.get('sample_z_center_count', 50)
+            pa_xy_range   = pre_align_cfg.get('xy_search_range_px', 30)
+            pa_z_range    = pre_align_cfg.get('z_search_range_slices', 3)
+            pa_match_dist = pre_align_cfg.get('match_distance_px', 15)
+
+            for tile_path in tqdm(pATHTILE, desc="Pre-Align Tiles"):
+                tile_name = os.path.split(tile_path)[-1]
+
+                # 1. 对每个通道轻量 z-link，得到 per-tile 3D vol_list
+                per_ch_vol_lists = {}
+                z_counts = []
+                for ch in routing_cfg_align:
+                    cid = ch['id']
+                    ctype = ch.get('type', 'soma')
+                    csv_path = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_{cid}_result.csv")
+                    if not os.path.isfile(csv_path):
+                        per_ch_vol_lists[cid] = []
+                        continue
+                    df_tile = pd.read_csv(csv_path)
+                    if df_tile.empty:
+                        per_ch_vol_lists[cid] = []
+                        continue
+
+                    mat = df_tile[["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]].values
+                    mat[:, 6] = np.array([f"{v}_{cid}" for v in mat[:, 6]])
+
+                    zl_params = zl_soma if ctype == 'soma' else zl_tf
+                    _, vol_list = run_z_linker(
+                        mat,
+                        iou_thresh=zl_params.get('iou_thresh', 0.35),
+                        min_z_layers=zl_params.get('min_z_layers', 1),
+                        max_cell_z_span=zl_params.get('max_cell_z_span', 5),
+                    )
+                    per_ch_vol_lists[cid] = vol_list
+                    if vol_list:
+                        z_counts.extend([c.get('cz', 0) for c in vol_list])
+
+                # 2. 估计 tile z 中心
+                z_center = float(np.median(z_counts)) if z_counts else 0.0
+                z_half   = pa_sample_z // 2
+
+                # 3. 两步点云对齐
+                shifts, scores = compute_tile_channel_shifts(
+                    per_ch_vol_lists,
+                    soma_ch_ids=soma_ch_ids_align,
+                    tf_ch_ids=tf_ch_ids_align,
+                    z_center=z_center,
+                    z_half_window=z_half,
+                    xy_range_px=pa_xy_range,
+                    z_range_slices=pa_z_range,
+                    match_dist_px=pa_match_dist,
+                )
+
+                # 4. 保存偏移 JSON
+                save_tile_offsets(tile_name, shifts, scores, derived['pATH_ALIGN_OFFSETS'])
+
+                # 5. 对每个通道的原始 CSV 应用偏移，写入 0_channel_alignment/
+                for ch in routing_cfg_align:
+                    cid = ch['id']
+                    dx, dy, dz = shifts.get(cid, (0, 0, 0))
+                    in_csv  = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_{cid}_result.csv")
+                    out_csv = os.path.join(derived['pATH_ALIGN_OFFSETS'], f"{tile_name}_{cid}_result.csv")
+                    if os.path.isfile(in_csv) and not os.path.isfile(out_csv):
+                        apply_shift_to_csv(in_csv, dx, dy, dz, out_csv)
+
+            # 写完成标记
+            open(align_done_flag, 'w').close()
+            logging.info("✔️ [2.5] 所有 Tile 点云对齐完成。")
+
+    # 决定 Phase 3 读取哪个 CSV 根目录
+    pATH_SRC_CSV = (derived['pATH_ALIGN_OFFSETS']
+                    if pipeline_mode == 'pre_align'
+                    else derived['pATH_DET_RES'])
 
     # ==========================================
     # 阶段 3: 线性 Checkpoint - 全局拼接与 Z-Linker共定位
@@ -164,7 +298,7 @@ if __name__ == '__main__':
                 stitched_predictions = [[np.empty((0, 8)) for _ in range(2)] for _ in range(Z)]
                 for dir_name in dir_dict:
                     tile_name = os.path.split(dir_name)[-1]
-                    csv_tile  = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_{ch_id}_result.csv")
+                    csv_tile  = os.path.join(pATH_SRC_CSV, f"{tile_name}_{ch_id}_result.csv")
                     if os.path.isfile(csv_tile):
                         with open(csv_tile, newline='', encoding='utf-8') as tile_file:
                             next(tile_file, None)
@@ -177,10 +311,10 @@ if __name__ == '__main__':
                     for group in layer:
                         if group.size > 0: current_ch_global_2d.append(group)
             else:
-                csv_list = [f for f in os.listdir(derived['pATH_DET_RES']) if f.endswith(f'_{ch_id}_result.csv')]
+                csv_list = [f for f in os.listdir(pATH_SRC_CSV) if f.endswith(f'_{ch_id}_result.csv')]
                 if csv_list:
                     tile_name = csv_list[0].split(f"_{ch_id}_")[0]
-                    with open(os.path.join(derived['pATH_DET_RES'], csv_list[0]), 'r', encoding='utf-8') as f:
+                    with open(os.path.join(pATH_SRC_CSV, csv_list[0]), 'r', encoding='utf-8') as f:
                         next(f, None)
                         temp_list = []
                         for r in csv.reader(f):
@@ -263,21 +397,20 @@ if __name__ == '__main__':
         logging.info(f"✔️ [3A] Soma 3D IoU 匹配: {len(merged_soma_vols)} 个 "
                      f"(多阳性 {n_multi}, 单阳性 {n_single})")
 
-        # Phase B: soma × TF GMM 标注
-        all_tf_vols = []
+        # Phase B: soma × TF GMM 标注（逐通道独立GMM，结果累积到soma）
+        p_thresh = zl_tf.get('gmm_p_thresh', 0.5)
         for cid in tf_ch_ids:
-            all_tf_vols.extend(tf_vol_by_ch.get(cid, []))
-
-        if all_tf_vols and merged_soma_vols:
-            p_thresh = zl_tf.get('gmm_p_thresh', 0.5)
-            merged_soma_vols = annotate_soma_with_tf_gmm(
-                merged_soma_vols, all_tf_vols, p_thresh=p_thresh
-            )
-            n_tf_annotated = sum(
-                1 for c in merged_soma_vols if len(c['class'].split('_')) > 2
-                and any(tf in c['class'] for cid in tf_ch_ids for tf in [cid])
-            )
-            logging.info(f"✔️ [3B] TF GMM 标注完成: {n_tf_annotated} 个 soma 有 TF marker")
+            tf_vols = tf_vol_by_ch.get(cid, [])
+            if tf_vols and merged_soma_vols:
+                merged_soma_vols = annotate_soma_with_tf_gmm(
+                    merged_soma_vols, tf_vols, p_thresh=p_thresh
+                )
+                logging.info(f"✔️ [3B] [{cid}] TF GMM 标注完成")
+        n_tf_annotated = sum(
+            1 for c in merged_soma_vols
+            if any(cid in c['class'] for cid in tf_ch_ids)
+        )
+        logging.info(f"✔️ [3B] 全部TF标注完成: {n_tf_annotated} 个 soma 有 TF marker")
 
         # Phase C: 输出为 2D 形式（center_z处的bbox），排除TF单阳性
         output_rows = []
