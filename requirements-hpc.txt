@@ -1,0 +1,16 @@
+# ── HPC Linux 推理环境（完整包含GPU支持）────────────────────────
+# 安装前先确认CUDA版本：nvcc --version 或 nvidia-smi
+#
+# 安装命令：
+#   CUDA 11.8:  pip install -r requirements-hpc.txt
+#   CUDA 12.1:  pip install -r requirements-hpc.txt --extra-index-url https://download.pytorch.org/whl/cu121
+#   CUDA 12.4:  pip install -r requirements-hpc.txt --extra-index-url https://download.pytorch.org/whl/cu124
+
+-r requirements.txt
+
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.1.2+cu118
+torchvision==0.16.2+cu118
+
+ultralytics>=8.0
+cellpose>=2.2

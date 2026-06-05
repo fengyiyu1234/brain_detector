@@ -1,0 +1,7 @@
+# ── macOS 本地环境（可视化 + 代码编辑）──────────────────────────
+# 安装命令：pip install -r requirements-local.txt
+
+-r requirements.txt
+
+napari>=0.4.19
+PyQt5>=5.15
