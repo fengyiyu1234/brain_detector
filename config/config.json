@@ -1,8 +1,8 @@
 {
     // ── 模型权重路径 ──────────────────────────────────────────────────────────
     "models": {
-        "yolo_path":     "d:/Fengyi/model_weight/MADM_single_channel/train18/weights/best.pt",
-        "cellpose_path": "d:/Fengyi/model_weight/MADM_single_channel/models/nuclei_model_0515"
+        "yolo_path":     "models/train18_best_0515.pt",
+        "cellpose_path": "models/custom_nuclei_model"
     },
 
     // ── 模型输出类别映射 ──────────────────────────────────────────────────────
@@ -17,25 +17,29 @@
     "channels_routing": [
         {"id": "RFP",   "type": "soma", "model": "yolo",     "dir_key": "rfp_dir",   "active": true},
         {"id": "GFP",   "type": "soma", "model": "yolo",     "dir_key": "gfp_dir",   "active": true},
-        {"id": "Sox9",  "type": "tf",   "model": "cellpose", "dir_key": "sox9_dir",  "active": true, "use_3d": false},
-        {"id": "Olig2", "type": "tf",   "model": "cellpose", "dir_key": "olig2_dir",  "active": false, "use_3d": false}
+        {"id": "Sox9",  "type": "tf",   "model": "cellpose", "dir_key": "sox9_dir",  "active": true},
+        {"id": "Olig2", "type": "tf",   "model": "cellpose", "dir_key": "olig2_dir",  "active": true}
     ],
 
     // ── 文件路径 ──────────────────────────────────────────────────────────────
-    "paths": {
-        "rfp_dir":    "y:/Fengyi/detection_infer_test/sample8/561",
-        "gfp_dir":    "y:/Fengyi/detection_infer_test/sample8/640",
-        "sox9_dir":   "y:/Fengyi/detection_infer_test/sample8/730",
-        "pATHRESULT": "y:/Fengyi/detection_infer_test/sample8/detection_results2"
-    },
 
-    // "paths": {
-    //     "rfp_dir":    "y:/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/RFP",
-    //     "gfp_dir":    "y:/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/GFP_15",
-    //     "sox9_dir":   "y:/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/Sox9",
-    //     "olig2_dir":  "y:/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/Olig2",
-    //     "pATHRESULT": "y:/Fengyi/EGFR_brain/batch4/sample5/detection_results"
-    // },
+        "paths": {
+
+            
+        // "rfp_dir":    "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/561nm",
+        // "gfp_dir":    "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/640nm_15",
+        // "sox9_dir":   "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/730nm",
+        // "olig2_dir":  "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/488nm",
+        // "pATHRESULT": "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/detection_results_PreAlign"
+
+
+        "rfp_dir":    "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/RFP",
+        "gfp_dir":    "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/GFP_15",
+        "sox9_dir":   "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/Sox9",
+        "olig2_dir":  "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/Olig2",
+        "pATHRESULT": "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/detection_results"
+
+    },
 
     "device": "cuda",               // 推理设备，"cuda" 或 "cpu"
 
@@ -60,12 +64,15 @@
         "soma": {
             "iou_thresh":      0.35,    // 相邻 z 层 bbox 匹配所需最小 IoU
             "min_z_layers":    1,       // 判定为真实 3D 细胞的最少 z 层数
-            "max_cell_z_span": 5        // 单个细胞允许跨越的最大 z 层数（防止过度合并）
+            "max_cell_z_span": 5,       // 单个细胞允许跨越的最大 z 层数（防止过度合并）
+            "iou_thresh_3d":   0.15,    // soma 跨通道 3D IoU 匹配阈值
+            "z_pad_3d":        2        // 3D IoU 匹配时 z 轴方向的扩展层数
         },
         "tf": {
             "iou_thresh":      0.25,    // 细胞核较小，IoU 阈值适当降低
             "min_z_layers":    1,       // 核标记较薄，允许单层即算 3D
-            "max_cell_z_span": 3        // 核一般横跨 2-3 个 z 层
+            "max_cell_z_span": 3,       // 核一般横跨 2-3 个 z 层
+            "gmm_p_thresh":    0.5      // GMM 标注概率阈值
         }
     },
 
@@ -74,13 +81,6 @@
         // 物理分辨率
         "xy_resolution_um": 0.65,   // XY 像素物理尺寸 (µm/pixel)
         "z_resolution_um":  8,      // Z 轴切片间距 (µm)
-
-        // 3D 共定位
-        "z_distance_limit":     0,  // 共定位 Z 轴容差 (slices)；也作 centroid-in-box 的 z_tol
-        "coloc_distance_um":   15,  // 球距离法的共定位半径 (µm)
-        "coloc_use_centroid_box":   true,   // true=质心落在对方 bbox 内；false=球距离法
-        "coloc_xy_tolerance_px":    5,      // centroid-in-box 法 XY 容差 (px)
-        "soma_merge_iou_thresh":      0.1,   // 2D IoU 阈值：soma 跨通道合并（RFP↔GFP）
 
         // 检测阈值
         "conf_thresh": 0.3,         // YOLO 置信度阈值
@@ -101,7 +101,7 @@
         "normalize_PERCENTILE_HIGH": 99.9,  // 拉伸上分位数 (%)
 
         // Z 轴下采样（加速调试用）
-        "DOWNSAMPLE":        true, // 是否跳帧；true 时只处理每隔 DOWNSAMPLE_Z_STEP 的切片
+        "DOWNSAMPLE":        false, // 是否跳帧；true 时只处理每隔 DOWNSAMPLE_Z_STEP 的切片
         "DOWNSAMPLE_Z_STEP": 41,    // 跳帧步长（DOWNSAMPLE=true 时生效）
 
         // 置换检验（共定位统计显著性）
@@ -109,6 +109,8 @@
         "max_soma_sample": 50000,   // 置换时胞体随机采样上限（防止超大样本超时）
 
         // Cellpose 参数
+        "cellpose_batch_size":    32,       // 每次送 GPU 的图片数，L40S 可调到 64
+        "cellpose_prob_threshold": 0.5,    // 概率图阈值，越高检测越严格（0.3~0.7）
         "cellpose_3d_anisotropy": null,     // Z/XY 各向异性比（null = 自动估算）
         "cellpose_3d_diameter":   null,     // 细胞直径估计 px（null = 自动检测）
 

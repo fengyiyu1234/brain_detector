@@ -6,7 +6,7 @@ channels:
   - defaults
 
 dependencies:
-  - python=3.9
+  - python=3.10
 
   # ── Core scientific stack ───────────────────────────────────
   - numpy>=1.24,<2.1
@@ -28,13 +28,10 @@ dependencies:
     # OpenCV (headless is lighter; replace with opencv-python if you need GUI)
     - opencv-python-headless>=4.8
 
-    # PyTorch — replace the CPU build with the appropriate CUDA command:
-    #   CUDA 11.8:  pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118
-    #                           --index-url https://download.pytorch.org/whl/cu118
-    #   CUDA 12.1:  pip install torch==2.1.2+cu121 torchvision==0.16.2+cu121
-    #                           --index-url https://download.pytorch.org/whl/cu121
-    - torch>=2.1.0
-    - torchvision>=0.16.0
+    # PyTorch — CUDA 12.6 build (compatible with driver 560.x on Hazel HPC)
+    # To reinstall: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+    - torch==2.6.0+cu126
+    - torchvision==0.21.0+cu126
 
     # Detection models
     - ultralytics>=8.0       # YOLOv8/v9 (YOLO class)

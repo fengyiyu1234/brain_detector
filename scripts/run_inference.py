@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import argparse
 import os
 import sys
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -34,10 +35,16 @@ if __name__ == '__main__':
     # 阶段 1: 准备工作 (配置读取、动态路径构建与校验)
     # ==========================================
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Running on device: {device.upper()}")
 
     # 1. 加载基础配置 (此时 load_config 仅作纯粹的 JSON 读取)
-    config = load_config('D:/Fengyi/brain_detector/config/config.json')
+    parser = argparse.ArgumentParser(description='Brain detector inference pipeline.')
+    parser.add_argument(
+        '--config',
+        default=os.path.join(project_root, 'config', 'config.json'),
+        help='Path to config.json (default: <project_root>/config/config.json)',
+    )
+    args = parser.parse_args()
+    config = load_config(args.config)
     config['device'] = device
     paths = config['paths']
     dp = config['detection_params']
@@ -49,7 +56,6 @@ if __name__ == '__main__':
         
     pipeline_mode = config.get('pipeline_mode', 'post_align')  # "post_align" | "pre_align"
     pre_align_cfg = config.get('pre_align_params', {})
-    print(f"Pipeline mode: {pipeline_mode.upper()}")
 
     derived = {}
     derived['pATH_ALIGN_OFFSETS'] = os.path.join(base_res_path, "0_channel_alignment")
@@ -69,6 +75,10 @@ if __name__ == '__main__':
         if not p_path.lower().endswith(('.txt', '.csv')):
             os.makedirs(p_path, exist_ok=True)
 
+    setup_logging(base_res_path)
+    logging.info("Starting Multi-Channel Inference...")
+    logging.info(f"Device: {device.upper()}, Pipeline mode: {pipeline_mode.upper()}")
+
     # 2. 动态解析路由，确定基准(Anchor)通道
     routing_config = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
     if not routing_config:
@@ -77,23 +87,19 @@ if __name__ == '__main__':
     anchor_ch = routing_config[0]
     anchor_dir = paths.get(anchor_ch['dir_key'])
 
-    print("\n=== 多通道路径检查 ===")
+    logging.info("=== 多通道路径检查 ===")
     for ch in routing_config:
         d_path = paths.get(ch['dir_key'])
         if not d_path or not os.path.exists(d_path):
             raise FileNotFoundError(f"❌ 通道 {ch['id']} 路径不存在: {d_path}")
-        print(f"✔️ [{ch['type'].upper()}] {ch['id']}: {d_path}")
-    print("======================\n")
+        logging.info(f"[{ch['type'].upper()}] {ch['id']}: {d_path}")
+    logging.info("=====================")
 
     # 3. 获取 Tile 列表 (基于锚点通道)
     dirnames, pATHTILE_all = listTile(anchor_dir)
     if not pATHTILE_all:
         raise ValueError(f"❌ 在锚点目录 {anchor_dir} 中没有找到合法的 Tile！")
 
-    # 日志绑定到输出根目录
-    setup_logging(base_res_path) 
-    logging.info("Starting Multi-Channel Inference...")
-    logging.info(f"Current device: {config['device']}")
     save_run_metadata(config, start_time)
 
     # 4. 范围筛选
@@ -115,32 +121,41 @@ if __name__ == '__main__':
         # 回退：从 tile 目录名解析行列号，用均匀 Grid 推算全局偏移
         overlap = pre_align_cfg.get('tile_overlap_pct', 15) / 100.0
         step_px = int(tile_size * (1.0 - overlap))
-        dir_dict = {}   # dir_name → (row, col)
-        disp_mat_rows = []
+        logging.warning(f"⚠️ 未找到 TeraStitcher XML（路径: {pATHxml}），pre_align 模式回退到文件名解析全局偏移。")
+        dir_dict = {}   # dir_name → (grid_row, grid_col)
+        raw_entries = []  # (tile_name, raw_row, raw_col)
         for tile_path in sorted(pATHTILE_all):
             tile_name = os.path.split(tile_path)[-1]
             parts = tile_name.split('_')
             try:
-                row = int(parts[0]) if len(parts) >= 2 else 0
-                col = int(parts[1]) if len(parts) >= 2 else 0
+                raw_row = int(parts[0]) if len(parts) >= 2 else 0
+                raw_col = int(parts[1]) if len(parts) >= 2 else 0
             except ValueError:
-                row, col = 0, 0
-            dir_dict[tile_name] = (row, col)
-            disp_mat_rows.append((row, col, col * step_px, row * step_px, 0))
-        if disp_mat_rows:
-            arr = np.array(disp_mat_rows)
-            n_row = int(arr[:, 0].max()) + 1
-            n_col = int(arr[:, 1].max()) + 1
+                raw_row, raw_col = 0, 0
+            raw_entries.append((tile_name, raw_row, raw_col))
+        if raw_entries:
+            # 目录名可能是像素偏移坐标而非网格索引，映射为紧凑 0..N-1 索引避免 OOM
+            sorted_rows = sorted(set(r for _, r, _ in raw_entries))
+            sorted_cols = sorted(set(c for _, _, c in raw_entries))
+            row_idx = {v: i for i, v in enumerate(sorted_rows)}
+            col_idx = {v: i for i, v in enumerate(sorted_cols)}
+            n_row, n_col = len(sorted_rows), len(sorted_cols)
+            use_raw_offset = (sorted_rows[-1] > step_px or sorted_cols[-1] > step_px)
             disp_mat_fin = np.zeros((n_row, n_col, 3), dtype=int)
-            for r, c, ax, ay, az in disp_mat_rows:
-                disp_mat_fin[int(r), int(c)] = [ax, ay, az]
+            for tile_name, raw_row, raw_col in raw_entries:
+                gi, gj = row_idx[raw_row], col_idx[raw_col]
+                dir_dict[tile_name] = (gi, gj)
+                ax = raw_col if use_raw_offset else gj * step_px
+                ay = raw_row if use_raw_offset else gi * step_px
+                disp_mat_fin[gi, gj] = [ax, ay, 0]
+            logging.info(f"  解析到 {len(raw_entries)} 个 tile，网格 {n_row}×{n_col}，"
+                         f"偏移模式: {'像素坐标' if use_raw_offset else '均匀Grid'}")
         else:
             disp_mat_fin = np.zeros((1, 1, 3), dtype=int)
         H = disp_mat_fin[:, :, 1].max() + tile_size
         W = disp_mat_fin[:, :, 0].max() + tile_size
         Z = len(os.listdir(pATHTILE_all[0])) if pATHTILE_all else 1
         z_start = 0
-        logging.warning("⚠️ 未找到 TeraStitcher XML，pre_align 模式使用文件名 Grid 推算全局偏移（近似值）。")
     else:
         raise FileNotFoundError(f"❌ 找不到拼接坐标文件！确保 {anchor_dir} 存在 {xml_name}")
 
@@ -156,10 +171,13 @@ if __name__ == '__main__':
             tasks_to_run.append((i, path, config))
 
     if tasks_to_run:
-        logging.info(f"阶段 2: 发现 {len(tasks_to_run)} 个缺失结果，开始多进程独立推理...")
-        num_processes = 1
-        print("\n" * (num_processes + 2))
-        with mp.Pool(processes=num_processes, initializer=init_worker, initargs=(config,)) as pool:
+        num_gpus = torch.cuda.device_count()
+        num_processes = max(1, num_gpus)
+        logging.info(f"阶段 2: 发现 {len(tasks_to_run)} 个缺失结果，启动 {num_processes} 个进程 ({num_gpus} GPU)...")
+        gpu_queue = mp.Queue()
+        for _i in range(num_gpus):
+            gpu_queue.put(_i)
+        with mp.Pool(processes=num_processes, initializer=init_worker, initargs=(config, gpu_queue)) as pool:
             with tqdm(total=len(tasks_to_run), desc="Tile Processing", position=0, leave=True) as pbar:
                 for _ in pool.imap_unordered(process_single_tile_wrapper, tasks_to_run):
                     pbar.update(1)
@@ -264,11 +282,10 @@ if __name__ == '__main__':
     # ==========================================
     bbox_path = os.path.join(derived['pATH_COLOCALIZATION'], "coloc_result.csv")
     final_results = None
-    soma_3d = None   # 供阶段 5 置换检验使用（仅本次运行计算时有值，从 checkpoint 加载时为 None）
+    soma_3d = None
     tf_3d   = None
-    xy_res      = dp.get('xy_resolution_um', 0.65)
-    z_res       = dp.get('z_resolution_um', 8.0)
-    dist_thresh = dp.get('coloc_distance_um', 15.0)
+    xy_res  = dp.get('xy_resolution_um', 0.65)
+    z_res   = dp.get('z_resolution_um', 8.0)
 
     if os.path.exists(bbox_path):
         logging.info(f"✔️ Checkpoint 2 达成: 加载已有的全局检测结果 {bbox_path}")
@@ -548,7 +565,6 @@ if __name__ == '__main__':
         perm_df = permutation_test_colocalization(
             soma_3d, tf_3d,
             xy_res=xy_res, z_res=z_res,
-            distance_thresh_um=dist_thresh,
             n_permutations=n_perm,
             max_soma_sample=dp.get('max_soma_sample', 50_000),
         )
@@ -562,9 +578,6 @@ if __name__ == '__main__':
                     f"  z={row['z_score']}  p={row['p_value']}  {sig}"
                 )
     else:
-        logging.warning(
-            "⚠️ 置换检验跳过：soma_3d/tf_3d 不在本次内存中。"
-            "如需重新运行，请删除 global_bboxes.csv 以跳过 Checkpoint 2。"
-        )
+        logging.warning("⚠️ 置换检验跳过：soma_3d/tf_3d 不在本次内存中。")
 
     logging.info(f"🎉 动态多通道推断全部完成！总耗时: {(time.time() - start_time)/60:.2f} 分钟。")

@@ -21,17 +21,28 @@ from src.utils.logger import setup_logging
 logger = logging.getLogger(__name__)
 
 _global_models = {}
+_worker_device = 'cpu'
 
-def init_worker(config):
+def init_worker(config, gpu_queue=None):
     """Pool initializer: load models once per worker process instead of once per tile."""
-    global _global_models
-    device = config['device']
+    global _global_models, _worker_device
+    if gpu_queue is not None and torch.cuda.is_available():
+        gpu_id = gpu_queue.get()
+        torch.cuda.set_device(gpu_id)
+        _worker_device = f'cuda:{gpu_id}'
+    else:
+        _worker_device = config['device']
+    device = _worker_device
     routing_config = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
     required_models = {ch['model'].lower() for ch in routing_config}
 
     if 'yolo' in required_models:
         try:
-            _global_models['yolo'] = YOLO(config['models']['yolo_path'])
+            _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            yolo_path = config['models']['yolo_path']
+            if not os.path.isabs(yolo_path):
+                yolo_path = os.path.join(_project_root, yolo_path)
+            _global_models['yolo'] = YOLO(yolo_path, task='detect')
             _global_models['yolo_classes'] = config.get('model_classes', {}).get('yolo', {"0": "neuron", "1": "glia"})
             print(f"[Worker PID:{os.getpid()}] ✔️ YOLO 模型加载成功")
         except Exception as e:
@@ -39,9 +50,13 @@ def init_worker(config):
 
     if 'cellpose' in required_models:
         try:
+            _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            cellpose_path = config['models']['cellpose_path']
+            if not os.path.isabs(cellpose_path):
+                cellpose_path = os.path.join(_project_root, cellpose_path)
             _global_models['cellpose'] = cp_models.CellposeModel(
-                pretrained_model=config['models']['cellpose_path'],
-                gpu=(device == 'cuda')
+                pretrained_model=cellpose_path,
+                gpu=device.startswith('cuda')
             )
             print(f"[Worker PID:{os.getpid()}] ✔️ Cellpose 模型加载成功")
         except Exception as e:
@@ -65,15 +80,29 @@ def calculate_ioa(box_nuc, box_soma):
 def extract_boxes_from_masks(masks):
     """将 Cellpose 得到的 2D 实例 mask 转换为 Bounding Box"""
     boxes = []
-    # 0 是背景，细胞从 1 开始
     for val in np.unique(masks):
         if val == 0: continue
         y_idx, x_idx = np.where(masks == val)
         if len(y_idx) == 0: continue
         x1, x2 = np.min(x_idx), np.max(x_idx)
         y1, y2 = np.min(y_idx), np.max(y_idx)
-        # 固定赋予 nucleus 类别和 1.0 的分数
         boxes.append([x1, y1, x2, y2, 1.0, "nucleus"])
+    return boxes
+
+
+def boxes_from_prob_map(prob_map, threshold=0.5, min_area=10):
+    """从 Cellpose 概率图直接提取 BBox，跳过 flow dynamics 后处理（更快）"""
+    from skimage.measure import label as sk_label, regionprops
+    binary = prob_map > threshold
+    if not binary.any():
+        return []
+    labeled = sk_label(binary)
+    boxes = []
+    for region in regionprops(labeled):
+        if region.area < min_area:
+            continue
+        min_r, min_c, max_r, max_c = region.bbox
+        boxes.append([int(min_c), int(min_r), int(max_c), int(max_r), 1.0, "nucleus"])
     return boxes
 
 
@@ -84,7 +113,7 @@ def process_single_tile(i, pATHTEST, config):
     dp = config['detection_params']
     derived = config['derived_paths']
     paths = config['paths']
-    device = config['device']
+    device = _worker_device
 
     output_dir = derived.get('pATH_DET_RES')
     if output_dir:
@@ -205,7 +234,6 @@ def process_single_tile(i, pATHTEST, config):
         PREFETCH_DEPTH = 24  # 预取深度：网络盘 latency 高，多预取更多层掩盖延迟
         prefetch_futures = {}
 
-        # Cellpose 批量推断缓冲区: ch_id -> [(name_no_ext, z_real, norm_img), ...]
         cellpose_channels = [ch for ch in channels_to_run if ch['model'] == 'cellpose']
         cellpose_buffer = {ch['id']: [] for ch in cellpose_channels}
 
@@ -331,12 +359,16 @@ def process_single_tile(i, pATHTEST, config):
             pbar.set_description(f"Tile:[{dir_name[:10]}] | Cellpose 批量推断 [{ch_id}] {len(buffer)} 层...")
             names_cp, z_reals_cp, imgs_cp = zip(*buffer)
 
-            all_masks, _, _ = _global_models['cellpose'].eval(
-                list(imgs_cp), diameter=None, channels=[0, 0], batch_size=8
+            _, flows, _ = _global_models['cellpose'].eval(
+                list(imgs_cp), diameter=None, channels=[0, 0],
+                batch_size=dp.get('cellpose_batch_size', 32),
+                compute_masks=False
             )
+            cp_threshold = dp.get('cellpose_prob_threshold', 0.5)
+            prob_maps = flows[2]  # list of [H, W] cell probability maps，由 GPU 前向传播生成
 
-            for slice_name, z_real, masks in zip(names_cp, z_reals_cp, all_masks):
-                cp_boxes = extract_boxes_from_masks(masks)
+            for slice_name, z_real, prob_map in zip(names_cp, z_reals_cp, prob_maps):
+                cp_boxes = boxes_from_prob_map(prob_map, threshold=cp_threshold)
                 for box in cp_boxes:
                     row = [slice_name, box[0], box[1], box[2], box[3], box[5], box[4], 0.0, z_real]
                     csv_writers[ch_id].writerow(row)

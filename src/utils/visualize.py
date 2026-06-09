@@ -358,7 +358,7 @@ def main():
     parser = argparse.ArgumentParser(
         description='Napari multi-tile visualization of brain_detector results.'
     )
-    parser.add_argument('--config', default='D:/Fengyi/brain_detector/config/config.json')
+    parser.add_argument('--config', default=os.path.join(project_root, 'config', 'config.json'))
     parser.add_argument('--tiles', nargs='+', type=int, default=None,
                         help='Tile indices to load (e.g. --tiles 0 1 4 5). '
                              'Omit for interactive prompt.')

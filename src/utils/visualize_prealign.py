@@ -129,7 +129,7 @@ def main():
         description='Pre-align channel alignment visualizer (napari).'
     )
     parser.add_argument(
-        '--config', default='D:/Fengyi/brain_detector/config/config.json',
+        '--config', default=os.path.join(project_root, 'config', 'config.json'),
         help='Path to config.json',
     )
     parser.add_argument(

@@ -18,5 +18,8 @@ venv/
 *.raw
 *.yaml
 *.json
+*.out
 images/
 labels/
+models/
+scripts/logs/
