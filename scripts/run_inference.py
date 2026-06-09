@@ -165,9 +165,11 @@ if __name__ == '__main__':
     tasks_to_run = []
     for i, path in enumerate(pATHTILE):
         tile_name = os.path.split(path)[-1]
-        csv_tile = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_result.csv")
-        
-        if not os.path.exists(csv_tile):
+        all_done = all(
+            os.path.exists(os.path.join(derived['pATH_DET_RES'], f"{tile_name}_{ch['id']}_result.csv"))
+            for ch in routing_config
+        )
+        if not all_done:
             tasks_to_run.append((i, path, config))
 
     if tasks_to_run:
