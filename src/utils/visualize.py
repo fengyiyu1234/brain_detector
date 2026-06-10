@@ -362,6 +362,9 @@ def main():
     parser.add_argument('--tiles', nargs='+', type=int, default=None,
                         help='Tile indices to load (e.g. --tiles 0 1 4 5). '
                              'Omit for interactive prompt.')
+    parser.add_argument('--z-range', nargs=2, type=int, default=None,
+                        metavar=('START', 'END'),
+                        help='只加载第 START..END 层（如 --z-range 574 861）；省略则加载全部')
     parser.add_argument('--downsample-step', type=int, default=None,
                         help='只显示每隔 N 层的检测平面；省略时自动读取 config 的 DOWNSAMPLE_Z_STEP')
     parser.add_argument('--list-tiles', action='store_true',
@@ -397,9 +400,7 @@ def main():
 
     selected_names = {os.path.basename(p) for p in selected_paths}
 
-    # ── 直接在此处修改加载范围 ─────────────────────────────────────────────────
-    z_range = 574, 861          # [start, end]，例如 [200, 500]；None = 加载全部
-    # ──────────────────────────────────────────────────────────────────────────
+    z_range = tuple(args.z_range) if args.z_range else None
 
     z_range_start = z_range[0] if z_range else 0
 
