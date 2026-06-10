@@ -62,6 +62,14 @@ def init_worker(config, gpu_queue=None):
         except Exception as e:
             print(f"[Worker PID:{os.getpid()}] ❌ Cellpose 加载失败: {e}")
 
+    if 'stardist' in required_models:
+        try:
+            from stardist.models import StarDist2D
+            _global_models['stardist'] = StarDist2D.from_pretrained('2D_versatile_fluo')
+            print(f"[Worker PID:{os.getpid()}] ✔️ StarDist 模型加载成功")
+        except Exception as e:
+            print(f"[Worker PID:{os.getpid()}] ❌ StarDist 加载失败: {e}")
+
 def fast_cloud_read(local_path):
     # 没有任何乱七八糟的拷贝，纯粹的极速直读
     return cv2.imread(local_path, cv2.IMREAD_ANYDEPTH)
@@ -104,6 +112,19 @@ def boxes_from_prob_map(prob_map, threshold=0.5, min_area=10):
         min_r, min_c, max_r, max_c = region.bbox
         boxes.append([int(min_c), int(min_r), int(max_c), int(max_r), 1.0, "nucleus"])
     return boxes
+
+
+def filter_stardist_labels(labels, diam_min, diam_max):
+    """Remove StarDist instances outside expected nucleus diameter range."""
+    from skimage.measure import regionprops
+    filtered = np.zeros_like(labels)
+    new_id = 1
+    for prop in regionprops(labels):
+        d = prop.equivalent_diameter_approx
+        if diam_min <= d <= diam_max:
+            filtered[labels == prop.label] = new_id
+            new_id += 1
+    return filtered
 
 
 def process_single_tile(i, pATHTEST, config):
@@ -236,6 +257,7 @@ def process_single_tile(i, pATHTEST, config):
 
         cellpose_channels = [ch for ch in channels_to_run if ch['model'] == 'cellpose']
         cellpose_buffer = {ch['id']: [] for ch in cellpose_channels}
+        stardist_channels = [ch for ch in channels_to_run if ch['model'] == 'stardist']
 
         with ThreadPoolExecutor(max_workers=16) as downloader_pool:
 
@@ -346,6 +368,34 @@ def process_single_tile(i, pATHTEST, config):
                     # --------- Cellpose: 累积切片，循环后统一批量推断 ---------
                     elif ch_model == 'cellpose':
                         cellpose_buffer[ch_id].append((name_no_ext, current_z_real, norm_img))
+
+                    # --------- StarDist: 逐切片推断，直接写出 BBox ---------
+                    elif ch_model == 'stardist':
+                        from csbdeep.utils import normalize as csbdeep_normalize
+                        from skimage.measure import regionprops
+                        sd_dp = dp.get('stardist', {})
+                        sd_img = csbdeep_normalize(
+                            img_raw.astype(np.float32),
+                            sd_dp.get('norm_low', 1),
+                            sd_dp.get('norm_high', 99.8),
+                        )
+                        labels, _ = _global_models['stardist'].predict_instances(
+                            sd_img, axes='YX',
+                            n_tiles=tuple(sd_dp.get('n_tiles', [2, 2])),
+                            prob_thresh=sd_dp.get('prob_thresh', 0.5),
+                            nms_thresh=sd_dp.get('nms_thresh', 0.4),
+                        )
+                        labels = filter_stardist_labels(
+                            labels,
+                            sd_dp.get('nucleus_diam_min', 7),
+                            sd_dp.get('nucleus_diam_max', 17),
+                        )
+                        for prop in regionprops(labels):
+                            min_r, min_c, max_r, max_c = prop.bbox
+                            csv_writers[ch_id].writerow([
+                                name_no_ext, int(min_c), int(min_r), int(max_c), int(max_r),
+                                "nucleus", 1.0, 0.0, current_z_real,
+                            ])
 
                 pbar.update(1)
 

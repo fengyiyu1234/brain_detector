@@ -12,7 +12,7 @@
     },
 
     // ── 通道路由配置 ──────────────────────────────────────────────────────────
-    // type "soma" → YOLO 检测细胞体；type "tf" → Cellpose 检测转录因子/细胞核
+    // type "soma" → YOLO 检测细胞体；type "tf" → model "cellpose" 或 "stardist" 均支持
     // active: false 的通道在推理时跳过
     "channels_routing": [
         {"id": "RFP",   "type": "soma", "model": "yolo",     "dir_key": "rfp_dir",   "active": true},
@@ -113,6 +113,17 @@
         "cellpose_prob_threshold": 0.5,    // 概率图阈值，越高检测越严格（0.3~0.7）
         "cellpose_3d_anisotropy": null,     // Z/XY 各向异性比（null = 自动估算）
         "cellpose_3d_diameter":   null,     // 细胞直径估计 px（null = 自动检测）
+
+        // StarDist 参数（仅 model="stardist" 通道生效）
+        "stardist": {
+            "norm_low":         1,      // 归一化下分位数 (%)
+            "norm_high":        99.8,   // 归一化上分位数 (%)
+            "prob_thresh":      0.5,    // 实例概率阈值（越高检测越严格）
+            "nms_thresh":       0.4,    // NMS 重叠阈值
+            "n_tiles":          [2, 2], // 推理分块数 [Y, X]，大图用 [2,2] 或 [4,4]
+            "nucleus_diam_min": 7,      // 细胞核最小等效直径 (px)，小于此视为噪点
+            "nucleus_diam_max": 17      // 细胞核最大等效直径 (px)，大于此视为 bleed-through
+        },
 
         "vISUALIZE_TILE": true      // 保留调试字段，暂未使用
     }

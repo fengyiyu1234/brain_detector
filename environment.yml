@@ -36,3 +36,4 @@ dependencies:
     # Detection models
     - ultralytics>=8.0       # YOLOv8/v9 (YOLO class)
     - cellpose>=2.2          # nucleus segmentation
+    - stardist>=0.8.0        # pretrained nucleus segmentation (TF channels)
