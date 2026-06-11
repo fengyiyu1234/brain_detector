@@ -69,6 +69,7 @@ def init_worker(config, gpu_queue=None):
             print(f"[Worker PID:{os.getpid()}] ✔️ StarDist 模型加载成功")
         except Exception as e:
             print(f"[Worker PID:{os.getpid()}] ❌ StarDist 加载失败: {e}")
+            raise RuntimeError(f"StarDist model failed to load: {e}") from e
 
 def fast_cloud_read(local_path):
     # 没有任何乱七八糟的拷贝，纯粹的极速直读
@@ -120,7 +121,7 @@ def filter_stardist_labels(labels, diam_min, diam_max):
     filtered = np.zeros_like(labels)
     new_id = 1
     for prop in regionprops(labels):
-        d = prop.equivalent_diameter_approx
+        d = getattr(prop, 'equivalent_diameter_approx', None) or (2 * (prop.area / np.pi) ** 0.5)
         if diam_min <= d <= diam_max:
             filtered[labels == prop.label] = new_id
             new_id += 1

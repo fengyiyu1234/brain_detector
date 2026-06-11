@@ -22,18 +22,21 @@ dependencies:
   - pyqt>=5.15        # napari Qt backend
   - napari>=0.4.19
 
+  # ── PyTorch — installed via conda (CUDA build from pytorch channel) ──
+  - pytorch>=2.6
+  - torchvision
+  - pytorch-cuda=12.6
+
   # ── pip-only packages ───────────────────────────────────────
   - pip
   - pip:
     # OpenCV (headless is lighter; replace with opencv-python if you need GUI)
     - opencv-python-headless>=4.8
 
-    # PyTorch — CUDA 12.6 build (compatible with driver 560.x on Hazel HPC)
-    # To reinstall: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-    - torch==2.6.0+cu126
-    - torchvision==0.21.0+cu126
+    # TensorFlow GPU on Windows via DirectML (no CUDA version conflict)
+    - tensorflow-directml
 
     # Detection models
     - ultralytics>=8.0       # YOLOv8/v9 (YOLO class)
     - cellpose>=2.2          # nucleus segmentation
-    - stardist>=0.8.0        # pretrained nucleus segmentation (TF channels)
+    - stardist>=0.8.0        # pretrained nucleus segmentation (TF backend)
