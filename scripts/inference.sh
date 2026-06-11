@@ -1,12 +1,12 @@
 #!/bin/bash
-#BSUB -J brain_detector
+#BSUB -J brain_detector_post
 #BSUB -o logs/lsf_%J.out
 #BSUB -e logs/lsf_%J.err
 #BSUB -n 4
 #BSUB -R "rusage[mem=32]"
 #BSUB -W 48:00
 #BSUB -q bme_gpu
-#BSUB -gpu "num=2:mps=yes"
+#BSUB -gpu "num=2:mps=no:j_exclusive=yes"
 
 # ── 环境 ──────────────────────────────────────────────────────────────────────
 source /share/lsmsmart/fyu7/miniconda3/etc/profile.d/conda.sh
@@ -36,7 +36,7 @@ echo "===================="
 
 # ── 运行推理 ──────────────────────────────────────────────────────────────────
 python scripts/run_inference.py \
-    --config config/config_PreAlign.json
+    --config config/config.json
 
 #config_PreAlign.json
 #config.json

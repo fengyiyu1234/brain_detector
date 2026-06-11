@@ -19,6 +19,8 @@ venv/
 *.yaml
 *.json
 *.out
+*.sh
+*.h5
 images/
 labels/
 models/

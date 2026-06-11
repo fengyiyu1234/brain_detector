@@ -43,6 +43,7 @@ def init_worker(config, gpu_queue=None):
             if not os.path.isabs(yolo_path):
                 yolo_path = os.path.join(_project_root, yolo_path)
             _global_models['yolo'] = YOLO(yolo_path, task='detect')
+            _global_models['yolo'].model.to(device)  # 提前占 GPU 显存，防止 TF 后来挤占
             _global_models['yolo_classes'] = config.get('model_classes', {}).get('yolo', {"0": "neuron", "1": "glia"})
             print(f"[Worker PID:{os.getpid()}] ✔️ YOLO 模型加载成功")
         except Exception as e:
@@ -64,8 +65,25 @@ def init_worker(config, gpu_queue=None):
 
     if 'stardist' in required_models:
         try:
+            import tensorflow as tf
+            tf_gpus = tf.config.list_physical_devices('GPU')
+            if tf_gpus:
+                gpu_idx = int(_worker_device.split(':')[-1]) if ':' in _worker_device else 0
+                # TF 放另一块 GPU，彻底避免与 PyTorch 争显存
+                tf_gpu_idx = (gpu_idx + 1) % len(tf_gpus)
+                target_gpu = tf_gpus[tf_gpu_idx]
+                tf.config.set_visible_devices(target_gpu, 'GPU')
+                tf.config.experimental.set_memory_growth(target_gpu, True)
             from stardist.models import StarDist2D
-            _global_models['stardist'] = StarDist2D.from_pretrained('2D_versatile_fluo')
+            _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            sd_basedir = config.get('models', {}).get('stardist_basedir', None)
+            sd_name    = config.get('models', {}).get('stardist_name', '2D_versatile_fluo')
+            if sd_basedir:
+                if not os.path.isabs(sd_basedir):
+                    sd_basedir = os.path.join(_project_root, sd_basedir)
+                _global_models['stardist'] = StarDist2D(None, name=sd_name, basedir=sd_basedir)
+            else:
+                _global_models['stardist'] = StarDist2D.from_pretrained('2D_versatile_fluo')
             print(f"[Worker PID:{os.getpid()}] ✔️ StarDist 模型加载成功")
         except Exception as e:
             print(f"[Worker PID:{os.getpid()}] ❌ StarDist 加载失败: {e}")

@@ -1,8 +1,10 @@
 {
     // ── 模型权重路径 ──────────────────────────────────────────────────────────
     "models": {
-        "yolo_path":     "models/train18_best_0515.pt",
-        "cellpose_path": "models/custom_nuclei_model"
+        "yolo_path":       "models/train18_best_0515.pt",
+        "cellpose_path":   "models/custom_nuclei_model",
+        "stardist_basedir": "models",           // StarDist 模型所在目录（相对项目根目录）
+        "stardist_name":    "2D_versatile_fluo" // 目录名，即 models/2D_versatile_fluo/
     },
 
     // ── 模型输出类别映射 ──────────────────────────────────────────────────────
@@ -17,27 +19,19 @@
     "channels_routing": [
         {"id": "RFP",   "type": "soma", "model": "yolo",     "dir_key": "rfp_dir",   "active": true},
         {"id": "GFP",   "type": "soma", "model": "yolo",     "dir_key": "gfp_dir",   "active": true},
-        {"id": "Sox9",  "type": "tf",   "model": "cellpose", "dir_key": "sox9_dir",  "active": true},
-        {"id": "Olig2", "type": "tf",   "model": "cellpose", "dir_key": "olig2_dir",  "active": true}
+        {"id": "Sox9",  "type": "tf",   "model": "stardist", "dir_key": "sox9_dir",  "active": true},
+        {"id": "Olig2", "type": "tf",   "model": "stardist", "dir_key": "olig2_dir",  "active": true}
     ],
 
     // ── 文件路径 ──────────────────────────────────────────────────────────────
 
         "paths": {
 
-            
-        // "rfp_dir":    "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/561nm",
-        // "gfp_dir":    "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/640nm_15",
-        // "sox9_dir":   "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/730nm",
-        // "olig2_dir":  "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/488nm",
-        // "pATHRESULT": "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/detection_results_PreAlign"
-
-
         "rfp_dir":    "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/RFP",
         "gfp_dir":    "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/GFP_15",
         "sox9_dir":   "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/Sox9",
         "olig2_dir":  "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/Olig2",
-        "pATHRESULT": "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/detection_results"
+        "pATHRESULT": "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/detection_results_stardist"
 
     },
 
