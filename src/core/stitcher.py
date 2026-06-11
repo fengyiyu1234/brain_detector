@@ -1,4 +1,5 @@
 import os
+import logging
 import numpy as np
 import pandas as pd
 from collections import defaultdict
@@ -495,6 +496,30 @@ def match_soma_3d_iou(cells_a, cells_b, iou_thresh=0.15, z_pad=0):
     unmatched_a = [cells_a[i] for i in range(n) if i not in matched_a]
     unmatched_b = [cells_b[j] for j in range(m) if j not in matched_b]
     return matched_pairs, unmatched_a, unmatched_b
+
+
+def suppress_cross_class_overlap(cells, iou_thresh=0.5, z_pad=2):
+    """
+    For any (neuron, glia) pair with 3D IoU > iou_thresh, drop the neuron.
+    Glia takes priority.  Runs after Phase-A soma merging, before TF annotation.
+    """
+    neurons = [c for c in cells if str(c['class']).split('_')[0] == 'neuron']
+    glias   = [c for c in cells if str(c['class']).split('_')[0] == 'glia']
+    others  = [c for c in cells if str(c['class']).split('_')[0] not in ('neuron', 'glia')]
+
+    if not neurons or not glias:
+        return cells
+
+    iou_mat = np.zeros((len(neurons), len(glias)), dtype=float)
+    for i, n in enumerate(neurons):
+        for j, g in enumerate(glias):
+            iou_mat[i, j] = _iou_3d(n, g, z_pad=z_pad)
+
+    suppressed = set(np.where(iou_mat.max(axis=1) > iou_thresh)[0])
+    surviving  = [n for i, n in enumerate(neurons) if i not in suppressed]
+    logging.info(f"Cross-class dedup: suppressed {len(suppressed)} neuron(s) "
+                 f"overlapping glia (iou_thresh={iou_thresh})")
+    return surviving + glias + others
 
 
 def annotate_soma_with_tf_gmm(soma_vol_list, tf_vol_list, p_thresh=0.5):

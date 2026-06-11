@@ -60,7 +60,8 @@
             "min_z_layers":    1,       // 判定为真实 3D 细胞的最少 z 层数
             "max_cell_z_span": 5,       // 单个细胞允许跨越的最大 z 层数（防止过度合并）
             "iou_thresh_3d":   0.15,    // soma 跨通道 3D IoU 匹配阈值
-            "z_pad_3d":        2        // 3D IoU 匹配时 z 轴方向的扩展层数
+            "z_pad_3d":        2,       // 3D IoU 匹配时 z 轴方向的扩展层数
+            "cross_class_iou_thresh": 0.5  // neuron-glia 跨类别去重阈值（glia 优先）
         },
         "tf": {
             "iou_thresh":      0.25,    // 细胞核较小，IoU 阈值适当降低

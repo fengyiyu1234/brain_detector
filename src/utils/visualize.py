@@ -3,29 +3,10 @@
 """
 Napari multi-tile visualization of brain_detector pipeline results.
 
-Loads raw images for one or more tiles, stitches them into a single canvas
-using TeraStitcher merge XML coordinates.  Overlap is resolved by cropping
-each tile's trailing (right/bottom) edge at the start of its nearest selected
-neighbour — no blending needed for quality inspection.
-
-Layers added
-------------
-  [img] <channel>   stitched Z-volume per active channel
-  [s1] <channel>    tile-level 2D raw detections  (hidden by default)
-  [s3] <channel>    per-channel Z-linked 3D cells
-  [s4] colocalized  final result from global_bboxes.csv
-
-Usage
------
-  python src/utils/visualize.py                       # interactive tile selection
-  python src/utils/visualize.py --tiles 0 1 4 5      # select by index
-  python src/utils/visualize.py --list-tiles
-  python src/utils/visualize.py --z-range 0 80
-  python src/utils/visualize.py --no-images
-  python src/utils/visualize.py --stage s4
+所有参数在 config/vis_config.json 中配置，直接运行即可：
+  python src/utils/visualize.py
 """
 
-import argparse
 import os
 import sys
 
@@ -60,6 +41,12 @@ CLASS_COLOR = {
 def _color(class_str):
     base = str(class_str).split('_')[0]
     return CLASS_COLOR.get(base, [1.0, 1.0, 1.0, 1.0])
+
+
+def _extract_markers(class_str):
+    """'neuron_GFP_RFP_Sox9' → {'GFP', 'RFP', 'Sox9'}"""
+    parts = str(class_str).split('_')
+    return set(parts[1:])
 
 
 # ── Tile selection ──────────────────────────────────────────────────────────────
@@ -291,13 +278,12 @@ def _add_dynamic_shapes_layer_slow(viewer, shapes, colors, **kwargs):
 
 # ── Labels volume (fast z-scroll) ─────────────────────────────────────────────
 
-def _rasterize_shapes_to_labels(shapes, colors, Z, H, W, outline_width=2):
+def _rasterize_shapes_to_labels(shapes, colors, Z, H, W,
+                                 outline_width=2, dash_sizes=None):
     """Draw box outlines into a (Z, H, W) uint32 volume.
 
-    Returns (vol, color_map) where color_map is {label_id: [r,g,b,a]} suitable
-    for viewer.add_labels(color=...).  Label 0 is the transparent background.
-    The rasterization runs once at startup; z-sliding then costs only a numpy
-    view + one GPU texture upload — no per-frame triangulation.
+    dash_sizes: list of ints parallel to shapes. 0 = solid; >0 = dash period
+    in pixels (only on horizontal/vertical edges — glia style).
     """
     vol = np.zeros((Z, H, W), dtype=np.uint32)
     color_to_id: dict = {}
@@ -306,7 +292,7 @@ def _rasterize_shapes_to_labels(shapes, colors, Z, H, W, outline_width=2):
 
     hw = max(1, outline_width // 2)
 
-    for arr, col in zip(shapes, colors):
+    for i, (arr, col) in enumerate(zip(shapes, colors)):
         col_key = tuple(col)
         if col_key not in color_to_id:
             color_to_id[col_key] = next_id
@@ -325,27 +311,42 @@ def _rasterize_shapes_to_labels(shapes, colors, Z, H, W, outline_width=2):
         y1c = max(0, y1);  y2c = min(H - 1, y2)
         x1c = max(0, x1);  x2c = min(W - 1, x2)
 
+        dash = dash_sizes[i] if dash_sizes else 0
+
         for d in range(hw):
             ty = np.clip(y1c + d, 0, H - 1);  by = np.clip(y2c - d, 0, H - 1)
             lx = np.clip(x1c + d, 0, W - 1);  rx = np.clip(x2c - d, 0, W - 1)
-            vol[z, ty, x1c:x2c + 1] = label_id
-            vol[z, by, x1c:x2c + 1] = label_id
-            vol[z, y1c:y2c + 1, lx] = label_id
-            vol[z, y1c:y2c + 1, rx] = label_id
+            if dash > 0:
+                dh = max(1, dash // 2)
+                xs = np.arange(x1c, x2c + 1)
+                hm = (xs // dh) % 2 == 0
+                vol[z, ty, xs[hm]] = label_id
+                vol[z, by, xs[hm]] = label_id
+                ys = np.arange(y1c, y2c + 1)
+                vm = (ys // dh) % 2 == 0
+                vol[z, ys[vm], lx] = label_id
+                vol[z, ys[vm], rx] = label_id
+            else:
+                vol[z, ty, x1c:x2c + 1] = label_id
+                vol[z, by, x1c:x2c + 1] = label_id
+                vol[z, y1c:y2c + 1, lx] = label_id
+                vol[z, y1c:y2c + 1, rx] = label_id
 
     return vol, color_map
 
 
-def _add_labels_layer(viewer, shapes, colors, canvas_shape, **kwargs):
-    """Rasterize shapes into a labels volume and add to viewer (zero-lag z-scroll).
-
-    Only 'name' and 'visible' are forwarded from **kwargs; ShapesLayer-specific
-    kwargs like face_color / edge_width are silently dropped.
-    """
+def _add_labels_layer(viewer, shapes, colors, canvas_shape,
+                       dash_sizes=None, **kwargs):
+    """Rasterize shapes into a labels volume and add to viewer (zero-lag z-scroll)."""
     if not shapes:
         return None
     Z, H, W = canvas_shape
-    vol, color_map = _rasterize_shapes_to_labels(shapes, colors, Z, H, W)
+    outline_width = kwargs.pop('outline_width', 2)
+    vol, color_map = _rasterize_shapes_to_labels(
+        shapes, colors, Z, H, W,
+        outline_width=outline_width,
+        dash_sizes=dash_sizes,
+    )
     labels_kwargs = {k: kwargs[k] for k in ('name', 'visible', 'opacity') if k in kwargs}
     layer = viewer.add_labels(vol, **labels_kwargs)
     layer.color = color_map
@@ -355,28 +356,23 @@ def _add_labels_layer(viewer, shapes, colors, canvas_shape, **kwargs):
 # ── Main ────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Napari multi-tile visualization of brain_detector results.'
-    )
-    parser.add_argument('--config', default=os.path.join(project_root, 'config', 'config.json'))
-    parser.add_argument('--tiles', nargs='+', type=int, default=None,
-                        help='Tile indices to load (e.g. --tiles 0 1 4 5). '
-                             'Omit for interactive prompt.')
-    parser.add_argument('--z-range', nargs=2, type=int, default=None,
-                        metavar=('START', 'END'),
-                        help='只加载第 START..END 层（如 --z-range 574 861）；省略则加载全部')
-    parser.add_argument('--downsample-step', type=int, default=None,
-                        help='只显示每隔 N 层的检测平面；省略时自动读取 config 的 DOWNSAMPLE_Z_STEP')
-    parser.add_argument('--list-tiles', action='store_true',
-                        help='Print available tile names and exit.')
-    parser.add_argument('--no-images', action='store_true',
-                        help='Skip raw image loading; show bounding boxes only.')
-    parser.add_argument('--stage', choices=['all', 'tile', 's2', 's3', 's4'], default='all')
-    args = parser.parse_args()
+    vis_cfg_path = os.path.join(project_root, 'config', 'vis_config.json')
+    vis_cfg      = load_config(vis_cfg_path)
 
-    config = load_config(args.config)
+    config = load_config(os.path.join(project_root, 'config', 'config.json'))
     paths  = config['paths']
     dp     = config['detection_params']
+
+    # override paths with any non-empty values from vis_config
+    for key, val in vis_cfg.get('paths', {}).items():
+        if val:
+            paths[key] = val
+
+    tile_indices    = vis_cfg.get('tiles', None)       # list[int] or null
+    z_range_cfg     = vis_cfg.get('z_range', None)     # [start, end] or null
+    downsample_cfg  = vis_cfg.get('downsample_step', None)
+    stage_cfg       = vis_cfg.get('stage', 'all')
+    no_images_cfg   = vis_cfg.get('no_images', False)
     routing_config = [ch for ch in config['channels_routing'] if ch.get('active', True)]
 
     anchor_ch   = routing_config[0]
@@ -385,27 +381,21 @@ def main():
 
     _, tile_paths = listTile(anchor_dir)
 
-    if args.list_tiles:
-        print(f"Available tiles ({len(tile_paths)}):")
-        for i, p in enumerate(tile_paths):
-            print(f"  [{i:3d}] {os.path.basename(p)}")
-        return
-
     # ── Select tiles ──────────────────────────────────────────────────────────
-    if args.tiles is not None:
-        selected_paths = [tile_paths[i] for i in args.tiles]
+    if tile_indices is not None:
+        selected_paths = [tile_paths[i] for i in tile_indices]
         print(f"Selected: {[os.path.basename(p) for p in selected_paths]}")
     else:
         selected_paths = select_tiles_interactive(tile_paths)
 
     selected_names = {os.path.basename(p) for p in selected_paths}
 
-    z_range = tuple(args.z_range) if args.z_range else None
+    z_range = tuple(z_range_cfg) if z_range_cfg else None
 
     z_range_start = z_range[0] if z_range else 0
 
-    if args.downsample_step is not None:
-        downsample_step = args.downsample_step
+    if downsample_cfg is not None:
+        downsample_step = downsample_cfg
     elif dp.get('DOWNSAMPLE', False):
         downsample_step = int(dp.get('DOWNSAMPLE_Z_STEP', 2))
     else:
@@ -459,7 +449,7 @@ def main():
 
     # ── Raw images ────────────────────────────────────────────────────────────
     canvas_shape = None   # (Z, H, W) — set on first successful canvas load
-    if not args.no_images:
+    if not no_images_cfg:
         for ch in routing_config:
             ch_id   = ch['id']
             ch_base = os.path.abspath(paths[ch['dir_key']])
@@ -499,7 +489,7 @@ def main():
     path_s4     = os.path.join(base_res, '4_colocalization', 'coloc_result.csv')
 
     # ── Stage 1: tile-level 2D raw ────────────────────────────────────────────
-    if args.stage in ('all', 'tile'):
+    if stage_cfg in ('all', 'tile'):
         for ch in routing_config:
             ch_id = ch['id']
             all_shapes, all_colors = [], []
@@ -522,7 +512,7 @@ def main():
                 print(f"[s1] {ch_id}: {len(all_shapes)} raw 2D boxes")
 
     # ── Stage 2: per-channel Z-link QC (center-Z slice of each 3D track) ────
-    if args.stage in ('all', 's2'):
+    if stage_cfg in ('all', 's2'):
         for ch in routing_config:
             ch_csv = os.path.join(s3_dir, f"{ch['id']}_3d_tracked.csv")
             if not os.path.exists(ch_csv):
@@ -540,7 +530,7 @@ def main():
                 print(f"[s2] {ch['id']}: {len(shapes)} z-linked cells")
 
     # ── Stage 3: per-channel Z-link (3_channel_3d) ───────────────────────────
-    if args.stage in ('all', 's3'):
+    if stage_cfg in ('all', 's3'):
         s3_files = []
         for ch in routing_config:
             if ch.get('type', 'soma') == 'soma':
@@ -567,32 +557,77 @@ def main():
                 print(f"{layer_name}: {len(shapes)} 3D tracked cells")
 
     # ── Stage 4: 3D colocalization result (4_colocalization/coloc_result.csv) ──
-    if args.stage in ('all', 's4'):
-        df_s4 = _prepare_global_df(
+    if stage_cfg in ('all', 's4'):
+        df_s4_all = _prepare_global_df(
             path_s4, canvas_x0, canvas_y0, z0,
             canvas_w, canvas_h, z_range_start,
             tile_name_filter=selected_names,
             downsample_step=downsample_step,
         )
-        if df_s4 is not None:
-            total = 0
-            for cls_name, df_cls in df_s4.groupby('class'):
-                shapes, colors = _build_shapes(
-                    df_cls,
-                    z=df_cls['z_disp'].values,
-                    y1=df_cls['cy1'].values, x1=df_cls['cx1'].values,
-                    y2=df_cls['cy2'].values, x2=df_cls['cx2'].values,
-                )
-                _add_labels_layer(
-                    viewer, shapes, colors, canvas_shape,
-                    name=f'[s4] {cls_name}', visible=True,
-                )
-                print(f"[s4] {cls_name}: {len(shapes)} cells")
-                total += len(shapes)
-            print(f"[s4] total: {total} colocalized cells")
-            print("\nClass breakdown:")
-            for cls, cnt in df_s4['class'].value_counts().items():
+        if df_s4_all is not None:
+            print(f"\n[s4] total: {len(df_s4_all)} colocalized cells")
+            print("Class breakdown:")
+            for cls, cnt in df_s4_all['class'].value_counts().items():
                 print(f"  {cls:35s} {cnt}")
+
+            s4_groups = vis_cfg.get('s4_groups', [])
+            if not s4_groups:
+                # fallback: one layer per class string
+                for cls_name, df_cls in df_s4_all.groupby('class'):
+                    shapes, colors = _build_shapes(
+                        df_cls,
+                        z=df_cls['z_disp'].values,
+                        y1=df_cls['cy1'].values, x1=df_cls['cx1'].values,
+                        y2=df_cls['cy2'].values, x2=df_cls['cx2'].values,
+                    )
+                    _add_labels_layer(
+                        viewer, shapes, colors, canvas_shape,
+                        name=f'[s4] {cls_name}', visible=True,
+                    )
+                    print(f"[s4] {cls_name}: {len(shapes)} cells")
+            else:
+                base_col = df_s4_all['class'].apply(lambda c: str(c).split('_')[0])
+                for grp in s4_groups:
+                    req = {c.lower() for c in grp['channels']}
+                    mask = df_s4_all['class'].apply(
+                        lambda c: req.issubset(
+                            {m.lower() for m in _extract_markers(c)}
+                        )
+                    )
+                    df_grp = df_s4_all[mask]
+                    if df_grp.empty:
+                        print(f"[s4] {grp['name']}: 0 cells")
+                        continue
+
+                    all_shapes, all_colors, all_dash = [], [], []
+                    bc_col = base_col[df_grp.index]
+                    for bc in ('neuron', 'glia', 'nucleus'):
+                        df_bc = df_grp[bc_col == bc]
+                        if df_bc.empty:
+                            continue
+                        color = grp.get(f'{bc}_color',
+                                        CLASS_COLOR.get(bc, [1.0, 1.0, 1.0, 1.0]))
+                        dash = grp.get('dash_size', 0) if bc == 'glia' else 0
+                        sh, _ = _build_shapes(
+                            df_bc,
+                            z=df_bc['z_disp'].values,
+                            y1=df_bc['cy1'].values, x1=df_bc['cx1'].values,
+                            y2=df_bc['cy2'].values, x2=df_bc['cx2'].values,
+                        )
+                        all_shapes.extend(sh)
+                        all_colors.extend([color] * len(sh))
+                        all_dash.extend([dash] * len(sh))
+
+                    n_solid = sum(1 for d in all_dash if d == 0)
+                    n_dash  = sum(1 for d in all_dash if d > 0)
+                    _add_labels_layer(
+                        viewer, all_shapes, all_colors, canvas_shape,
+                        dash_sizes=all_dash,
+                        outline_width=grp.get('outline_width', 2),
+                        name=f'[s4] {grp["name"]}', visible=True,
+                    )
+                    print(f"[s4] {grp['name']}: {len(all_shapes)} cells "
+                          f"({n_solid} neuron solid, {n_dash} glia dashed)")
 
     perm_path = os.path.join(base_res, '5_analysis_report', 'colocalization_significance.csv')
     if os.path.exists(perm_path):

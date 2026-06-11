@@ -8,6 +8,7 @@ if project_root not in sys.path:
 import time
 import csv
 import logging
+import pickle
 import multiprocessing as mp
 import numpy as np
 import torch
@@ -21,7 +22,8 @@ from src.core.worker import process_single_tile_wrapper, init_worker
 from src.core.stitcher import combine_predictions
 from src.core.z_linker import run_z_linker
 from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_gmm,
-                               permutation_test_colocalization, _merge_class)
+                               permutation_test_colocalization, _merge_class,
+                               suppress_cross_class_overlap)
 from src.core.point_cloud_aligner import (
     build_point_cloud, compute_tile_channel_shifts,
     apply_shift_to_csv, save_tile_offsets,
@@ -49,7 +51,6 @@ if __name__ == '__main__':
     paths = config['paths']
     dp = config['detection_params']
 
-    # --- ✨ 核心重构：统一接管派生目录生成，建立 5 层数字化输出结构 ---
     base_res_path = paths.get('pATHRESULT')
     if not base_res_path:
         raise ValueError("❌ 配置文件中缺失 pATHRESULT 输出根目录！")
@@ -305,54 +306,64 @@ if __name__ == '__main__':
         num_tiles = len(pATHTILE_all)
         BOX_COLS  = ["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]
 
-        # ====== 1. 逐通道独立拼接全局 2D，每个通道单独保存 ======
-        for ch in routing_config:
-            ch_id   = ch['id']
-            ch_type = ch.get('type', 'soma')
-            logging.info(f" -> 正在拼接通道 2D 框: [{ch_id}] (类型: {ch_type})")
+        # ====== Checkpoint 2a: 若 2_global_2d_raw 已有内容，直接加载，跳过 Tile 拼接 ======
+        global_2d_paths = {
+            ch['id']: os.path.join(derived['pATH_GLOBAL_2D'], f"{ch['id']}_2d_global.csv")
+            for ch in routing_config
+        }
+        if routing_config and all(os.path.exists(p) for p in global_2d_paths.values()):
+            logging.info("✔️ Checkpoint 2a 达成: 直接加载已有的全局 2D 结果，跳过 Tile 拼接。")
+            for ch_id, p in global_2d_paths.items():
+                per_ch_matrices[ch_id] = pd.read_csv(p)[BOX_COLS].values
+        else:
+            # ====== 1. 逐通道独立拼接全局 2D，每个通道单独保存 ======
+            for ch in routing_config:
+                ch_id   = ch['id']
+                ch_type = ch.get('type', 'soma')
+                logging.info(f" -> 正在拼接通道 2D 框: [{ch_id}] (类型: {ch_type})")
 
-            current_ch_global_2d = []
+                current_ch_global_2d = []
 
-            if num_tiles > 1:
-                stitched_predictions = [[np.empty((0, 8)) for _ in range(2)] for _ in range(Z)]
-                for dir_name in dir_dict:
-                    tile_name = os.path.split(dir_name)[-1]
-                    csv_tile  = os.path.join(pATH_SRC_CSV, f"{tile_name}_{ch_id}_result.csv")
-                    if os.path.isfile(csv_tile):
-                        with open(csv_tile, newline='', encoding='utf-8') as tile_file:
-                            next(tile_file, None)
-                            stitched_predictions = combine_predictions(
-                                stitched_predictions, csv.reader(tile_file), None, z_start, Z,
-                                dir_dict[dir_name], disp_mat_fin, (H, W),
-                                metadata_registry, tile_name, tILESIZE=tile_size
-                            )
-                for layer in stitched_predictions:
-                    for group in layer:
-                        if group.size > 0: current_ch_global_2d.append(group)
-            else:
-                csv_list = [f for f in os.listdir(pATH_SRC_CSV) if f.endswith(f'_{ch_id}_result.csv')]
-                if csv_list:
-                    tile_name = csv_list[0].split(f"_{ch_id}_")[0]
-                    with open(os.path.join(pATH_SRC_CSV, csv_list[0]), 'r', encoding='utf-8') as f:
-                        next(f, None)
-                        temp_list = []
-                        for r in csv.reader(f):
-                            if len(r) > 8 and r[0] != 'tile_id':
-                                x1, y1, x2, y2 = float(r[1]), float(r[2]), float(r[3]), float(r[4])
-                                score, mean, c, z = float(r[6]), float(r[7]), str(r[5]), int(float(r[8]))
-                                temp_list.append([x1, y1, x2, y2, score, mean, c, z])
-                                metadata_registry.append([(x1+x2)/2, (y1+y2)/2, z, tile_name, r[0]])
-                        if temp_list:
-                            current_ch_global_2d.append(np.array(temp_list, dtype=object))
+                if num_tiles > 1:
+                    stitched_predictions = [[np.empty((0, 8)) for _ in range(2)] for _ in range(Z)]
+                    for dir_name in dir_dict:
+                        tile_name = os.path.split(dir_name)[-1]
+                        csv_tile  = os.path.join(pATH_SRC_CSV, f"{tile_name}_{ch_id}_result.csv")
+                        if os.path.isfile(csv_tile):
+                            with open(csv_tile, newline='', encoding='utf-8') as tile_file:
+                                next(tile_file, None)
+                                stitched_predictions = combine_predictions(
+                                    stitched_predictions, csv.reader(tile_file), None, z_start, Z,
+                                    dir_dict[dir_name], disp_mat_fin, (H, W),
+                                    metadata_registry, tile_name, tILESIZE=tile_size
+                                )
+                    for layer in stitched_predictions:
+                        for group in layer:
+                            if group.size > 0: current_ch_global_2d.append(group)
+                else:
+                    csv_list = [f for f in os.listdir(pATH_SRC_CSV) if f.endswith(f'_{ch_id}_result.csv')]
+                    if csv_list:
+                        tile_name = csv_list[0].split(f"_{ch_id}_")[0]
+                        with open(os.path.join(pATH_SRC_CSV, csv_list[0]), 'r', encoding='utf-8') as f:
+                            next(f, None)
+                            temp_list = []
+                            for r in csv.reader(f):
+                                if len(r) > 8 and r[0] != 'tile_id':
+                                    x1, y1, x2, y2 = float(r[1]), float(r[2]), float(r[3]), float(r[4])
+                                    score, mean, c, z = float(r[6]), float(r[7]), str(r[5]), int(float(r[8]))
+                                    temp_list.append([x1, y1, x2, y2, score, mean, c, z])
+                                    metadata_registry.append([(x1+x2)/2, (y1+y2)/2, z, tile_name, r[0]])
+                            if temp_list:
+                                current_ch_global_2d.append(np.array(temp_list, dtype=object))
 
-            if current_ch_global_2d:
-                ch_matrix = np.concatenate(current_ch_global_2d, axis=0)
-                for row in ch_matrix:
-                    row[6] = f"{row[6]}_{ch_id}"   # "neuron" → "neuron_RFP"
-                per_ch_matrices[ch_id] = ch_matrix
-                out_2d = os.path.join(derived['pATH_GLOBAL_2D'], f"{ch_id}_2d_global.csv")
-                pd.DataFrame(ch_matrix, columns=BOX_COLS).to_csv(out_2d, index=False)
-                logging.info(f"✔️ [{ch_id}] 全局2D: {len(ch_matrix)} 框 → {out_2d}")
+                if current_ch_global_2d:
+                    ch_matrix = np.concatenate(current_ch_global_2d, axis=0)
+                    for row in ch_matrix:
+                        row[6] = f"{row[6]}_{ch_id}"   # "neuron" → "neuron_RFP"
+                    per_ch_matrices[ch_id] = ch_matrix
+                    out_2d = os.path.join(derived['pATH_GLOBAL_2D'], f"{ch_id}_2d_global.csv")
+                    pd.DataFrame(ch_matrix, columns=BOX_COLS).to_csv(out_2d, index=False)
+                    logging.info(f"✔️ [{ch_id}] 全局2D: {len(ch_matrix)} 框 → {out_2d}")
 
         # ====== 2. 独立 Z-Link 每个 channel ======
         soma_ch_ids = [ch['id'] for ch in routing_config
@@ -367,35 +378,54 @@ if __name__ == '__main__':
         soma_vol_by_ch = {}   # ch_id → volumetric_list (for 3D coloc)
         tf_vol_by_ch   = {}
 
-        for cid in soma_ch_ids:
-            ch_mat = per_ch_matrices.get(cid)
-            if ch_mat is None or len(ch_mat) == 0:
-                continue
-            summary, vol_list = run_z_linker(
-                ch_mat,
-                iou_thresh=zl_soma.get('iou_thresh', 0.35),
-                min_z_layers=zl_soma.get('min_z_layers', 1),
-                max_cell_z_span=zl_soma.get('max_cell_z_span', 5),
-            )
-            soma_vol_by_ch[cid] = vol_list
-            out_3d = os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.csv")
-            pd.DataFrame(summary, columns=BOX_COLS).to_csv(out_3d, index=False)
-            logging.info(f"✔️ [{cid}] Z-Link soma: {len(vol_list)} 个细胞 → {out_3d}")
+        # ====== Checkpoint 2b: 若 3_channel_3d pkl 已有内容，直接加载，跳过 Z-Linker ======
+        all_ch_ids = soma_ch_ids + tf_ch_ids
+        pkl_paths = {
+            cid: os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.pkl")
+            for cid in all_ch_ids
+        }
+        if all_ch_ids and all(os.path.exists(p) for p in pkl_paths.values()):
+            logging.info("✔️ Checkpoint 2b 达成: 直接加载已有的 3D 追踪结果，跳过 Z-Linker。")
+            for cid in soma_ch_ids:
+                with open(pkl_paths[cid], 'rb') as pf:
+                    soma_vol_by_ch[cid] = pickle.load(pf)
+            for cid in tf_ch_ids:
+                with open(pkl_paths[cid], 'rb') as pf:
+                    tf_vol_by_ch[cid] = pickle.load(pf)
+        else:
+            for cid in soma_ch_ids:
+                ch_mat = per_ch_matrices.get(cid)
+                if ch_mat is None or len(ch_mat) == 0:
+                    continue
+                summary, vol_list = run_z_linker(
+                    ch_mat,
+                    iou_thresh=zl_soma.get('iou_thresh', 0.35),
+                    min_z_layers=zl_soma.get('min_z_layers', 1),
+                    max_cell_z_span=zl_soma.get('max_cell_z_span', 5),
+                )
+                soma_vol_by_ch[cid] = vol_list
+                out_3d = os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.csv")
+                pd.DataFrame(summary, columns=BOX_COLS).to_csv(out_3d, index=False)
+                with open(os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.pkl"), 'wb') as pf:
+                    pickle.dump(vol_list, pf)
+                logging.info(f"✔️ [{cid}] Z-Link soma: {len(vol_list)} 个细胞 → {out_3d}")
 
-        for cid in tf_ch_ids:
-            ch_mat = per_ch_matrices.get(cid)
-            if ch_mat is None or len(ch_mat) == 0:
-                continue
-            summary, vol_list = run_z_linker(
-                ch_mat,
-                iou_thresh=zl_tf.get('iou_thresh', 0.25),
-                min_z_layers=zl_tf.get('min_z_layers', 1),
-                max_cell_z_span=zl_tf.get('max_cell_z_span', 3),
-            )
-            tf_vol_by_ch[cid] = vol_list
-            out_3d = os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.csv")
-            pd.DataFrame(summary, columns=BOX_COLS).to_csv(out_3d, index=False)
-            logging.info(f"✔️ [{cid}] Z-Link TF: {len(vol_list)} 个细胞 → {out_3d}")
+            for cid in tf_ch_ids:
+                ch_mat = per_ch_matrices.get(cid)
+                if ch_mat is None or len(ch_mat) == 0:
+                    continue
+                summary, vol_list = run_z_linker(
+                    ch_mat,
+                    iou_thresh=zl_tf.get('iou_thresh', 0.25),
+                    min_z_layers=zl_tf.get('min_z_layers', 1),
+                    max_cell_z_span=zl_tf.get('max_cell_z_span', 3),
+                )
+                tf_vol_by_ch[cid] = vol_list
+                out_3d = os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.csv")
+                pd.DataFrame(summary, columns=BOX_COLS).to_csv(out_3d, index=False)
+                with open(os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.pkl"), 'wb') as pf:
+                    pickle.dump(vol_list, pf)
+                logging.info(f"✔️ [{cid}] Z-Link TF: {len(vol_list)} 个细胞 → {out_3d}")
 
         # ====== 3. 3D Colocalization ======
         # Phase A: soma × soma 3D IoU（逐对匹配，依次合并到主列表）
@@ -411,6 +441,10 @@ if __name__ == '__main__':
             for a_cell, b_cell in matched_pairs:
                 a_cell['class'] = _merge_class(a_cell['class'], b_cell['class'])
             merged_soma_vols = merged_soma_vols + unmatched_b
+        cross_iou = zl_soma.get('cross_class_iou_thresh', 0.5)
+        merged_soma_vols = suppress_cross_class_overlap(
+            merged_soma_vols, iou_thresh=cross_iou, z_pad=z_pad_3d
+        )
         n_multi  = sum(1 for c in merged_soma_vols if len(c['class'].split('_')) > 2)
         n_single = len(merged_soma_vols) - n_multi
         logging.info(f"✔️ [3A] Soma 3D IoU 匹配: {len(merged_soma_vols)} 个 "
