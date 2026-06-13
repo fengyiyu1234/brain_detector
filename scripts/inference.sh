@@ -37,6 +37,3 @@ echo "===================="
 # ── 运行推理 ──────────────────────────────────────────────────────────────────
 python scripts/run_inference.py \
     --config config/config.json
-
-#config_PreAlign.json
-#config.json

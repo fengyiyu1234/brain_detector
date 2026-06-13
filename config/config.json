@@ -51,6 +51,8 @@
         "tile_overlap_pct":      15     // tile重叠率%（仅在无TeraStitcher XML时用于回退grid计算）
     },
 
+    "stop_after_detection": false,  // true = Stage 1 完成后立即退出，释放 GPU；Stage 2~5 可在 CPU 或本地单独运行
+
     "ENABLE_Z_LINKER": true,        // 是否执行 Z 轴串联；false 时直接输出 2D 结果
 
     // ── Z-Linker 参数（按通道类型分组）────────────────────────────────────────

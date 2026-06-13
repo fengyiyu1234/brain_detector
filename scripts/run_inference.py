@@ -187,6 +187,10 @@ if __name__ == '__main__':
     else:
         logging.info("✔️ Checkpoint 1 达成: 所有 Tile 检测完成。")
 
+    if config.get('stop_after_detection', False):
+        logging.info("🛑 stop_after_detection=true：Stage 1 完成，正常退出。Stage 2~5 可在 CPU 或单 GPU 上单独运行。")
+        sys.exit(0)
+
     # ==========================================
     # 阶段 2.5: 点云通道对齐 (仅 pre_align 模式)
     # ==========================================
