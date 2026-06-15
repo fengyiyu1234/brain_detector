@@ -44,10 +44,12 @@
 
     // ── Pre-Align 参数（仅 pipeline_mode="pre_align" 时生效）──────────────────
     "pre_align_params": {
-        "sample_z_center_count": 50,    // 取z轴中心多少张切片用于点云对齐
-        "xy_search_range_px":    30,    // XY方向FFT互相关搜索半径（像素）
-        "z_search_range_slices": 5,     // Z方向暴力搜索范围（±切片数）；软上限5，硬上限10（超过10会强制归零）
-        "match_distance_px":     15,    // 点云IoU计算时的匹配距离阈值（像素）
+        "sample_z_center_count": 50,    // 取z轴中心多少张切片用于体素对齐
+        "voxel_bin_size_px":     4,     // XY体素大小（像素/bin）；越小越精确但越慢
+        "xy_search_range_px":    30,    // 3D FFT粗搜索XY半径（像素）
+        "z_search_range_slices": 5,     // 3D FFT粗搜索Z半径（切片数）
+        "xy_fine_search_px":     8,     // FFT峰值周围精细搜索XY范围（像素）
+        "z_fine_search_slices":  2,     // FFT峰值周围精细搜索Z范围（切片数）
         "tile_overlap_pct":      15     // tile重叠率%（仅在无TeraStitcher XML时用于回退grid计算）
     },
 

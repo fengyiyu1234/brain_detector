@@ -25,7 +25,7 @@ from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_gmm,
                                permutation_test_colocalization, _merge_class,
                                suppress_cross_class_overlap)
 from src.core.point_cloud_aligner import (
-    build_point_cloud, compute_tile_channel_shifts,
+    compute_tile_channel_shifts,
     apply_shift_to_csv, save_tile_offsets,
 )
 
@@ -210,10 +210,14 @@ if __name__ == '__main__':
             zl_soma  = zl_pre.get('soma', {})
             zl_tf    = zl_pre.get('tf', {})
 
-            pa_sample_z   = pre_align_cfg.get('sample_z_center_count', 50)
-            pa_xy_range   = pre_align_cfg.get('xy_search_range_px', 30)
-            pa_z_range    = pre_align_cfg.get('z_search_range_slices', 3)
-            pa_match_dist = pre_align_cfg.get('match_distance_px', 15)
+            pa_sample_z      = pre_align_cfg.get('sample_z_center_count', 50)
+            pa_bin_size      = pre_align_cfg.get('voxel_bin_size_px', 4)
+            pa_xy_range      = pre_align_cfg.get('xy_search_range_px', 30)
+            pa_z_range       = pre_align_cfg.get('z_search_range_slices', 5)
+            pa_fine_xy       = pre_align_cfg.get('xy_fine_search_px', 8)
+            pa_fine_z        = pre_align_cfg.get('z_fine_search_slices', 2)
+            pa_xy_res        = dp.get('xy_resolution_um', 0.65)
+            pa_z_res         = dp.get('z_resolution_um', 8.0)
 
             for tile_path in tqdm(pATHTILE, desc="Pre-Align Tiles"):
                 tile_name = os.path.split(tile_path)[-1]
@@ -251,16 +255,20 @@ if __name__ == '__main__':
                 z_center = float(np.median(z_counts)) if z_counts else 0.0
                 z_half   = pa_sample_z // 2
 
-                # 3. 两步点云对齐
+                # 3. 两步体素对齐
                 shifts, scores = compute_tile_channel_shifts(
                     per_ch_vol_lists,
                     soma_ch_ids=soma_ch_ids_align,
                     tf_ch_ids=tf_ch_ids_align,
                     z_center=z_center,
                     z_half_window=z_half,
+                    bin_size=pa_bin_size,
+                    xy_res_um=pa_xy_res,
+                    z_res_um=pa_z_res,
                     xy_range_px=pa_xy_range,
                     z_range_slices=pa_z_range,
-                    match_dist_px=pa_match_dist,
+                    fine_xy_px=pa_fine_xy,
+                    fine_z_slices=pa_fine_z,
                 )
 
                 # 4. 保存偏移 JSON
