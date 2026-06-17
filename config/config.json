@@ -27,11 +27,11 @@
 
         "paths": {
 
-        "rfp_dir":    "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/RFP",
-        "gfp_dir":    "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/GFP_15",
-        "sox9_dir":   "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/Sox9",
-        "olig2_dir":  "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/numorph_align/aligned/Olig2",
-        "pATHRESULT": "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample5/detection_results_stardist"
+        "rfp_dir":    "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample4/numorph_align/aligned/RFP",
+        "gfp_dir":    "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample4/numorph_align/aligned/GFP_15",
+        "sox9_dir":   "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample4/numorph_align/aligned/Sox9",
+        "olig2_dir":  "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample4/numorph_align/aligned/Olig2",
+        "pATHRESULT": "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/batch4/sample4/detection_results_stardist"
 
     },
 
@@ -119,7 +119,7 @@
             "norm_high":        99.8,   // 归一化上分位数 (%)
             "prob_thresh":      0.5,    // 实例概率阈值（越高检测越严格）
             "nms_thresh":       0.4,    // NMS 重叠阈值
-            "n_tiles":          [2, 2], // 推理分块数 [Y, X]，大图用 [2,2] 或 [4,4]
+            "n_tiles":          [4, 4], // 推理分块数 [Y, X]；[4,4] 比 [2,2] 峰值显存低 4x
             "nucleus_diam_min": 7,      // 细胞核最小等效直径 (px)，小于此视为噪点
             "nucleus_diam_max": 17      // 细胞核最大等效直径 (px)，大于此视为 bleed-through
         },

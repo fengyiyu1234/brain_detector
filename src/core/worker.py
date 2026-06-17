@@ -69,8 +69,11 @@ def init_worker(config, gpu_queue=None):
             tf_gpus = tf.config.list_physical_devices('GPU')
             if tf_gpus:
                 gpu_idx = int(_worker_device.split(':')[-1]) if ':' in _worker_device else 0
-                # TF 放另一块 GPU，彻底避免与 PyTorch 争显存
-                tf_gpu_idx = (gpu_idx + 1) % len(tf_gpus)
+                # 多卡时 TF 放另一块 GPU 避免与 PyTorch 争显存；单卡共用同一块
+                if len(tf_gpus) > 1:
+                    tf_gpu_idx = (gpu_idx + 1) % len(tf_gpus)
+                else:
+                    tf_gpu_idx = 0
                 target_gpu = tf_gpus[tf_gpu_idx]
                 tf.config.set_visible_devices(target_gpu, 'GPU')
                 tf.config.experimental.set_memory_growth(target_gpu, True)
@@ -271,7 +274,7 @@ def process_single_tile(i, pATHTEST, config):
         csv_writers[ch_id].writerow(['slice_name', 'x1', 'y1', 'x2', 'y2', 'class', 'score', 'mean', 'z'])
         
     try:
-        PREFETCH_DEPTH = 24  # 预取深度：网络盘 latency 高，多预取更多层掩盖延迟
+        PREFETCH_DEPTH = 8  # 预取深度：降低以减少内存峰值压力
         prefetch_futures = {}
 
         cellpose_channels = [ch for ch in channels_to_run if ch['model'] == 'cellpose']
@@ -344,7 +347,7 @@ def process_single_tile(i, pATHTEST, config):
                         raw_det_chunks = []
                         batch_patches = []
                         batch_coords = []
-                        BATCH_SIZE = 8
+                        BATCH_SIZE = 4
 
                         def _flush_yolo_batch(patches, coords):
                             results = _global_models['yolo'].predict(patches, device=device, verbose=False, conf=conf_thresh, iou=nms_iou)
@@ -392,6 +395,8 @@ def process_single_tile(i, pATHTEST, config):
                     elif ch_model == 'stardist':
                         from csbdeep.utils import normalize as csbdeep_normalize
                         from skimage.measure import regionprops
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                         sd_dp = dp.get('stardist', {})
                         sd_img = csbdeep_normalize(
                             img_raw.astype(np.float32),
