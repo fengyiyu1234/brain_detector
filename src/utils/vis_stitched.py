@@ -3,7 +3,8 @@
 """
 vis_stitched.py — Draw detection boxes onto stitched TIFF slices, save as 16-bit PNG.
 
-Edit CONFIG below. No CLI arguments needed.
+Config is loaded from config/vis/vis_stitched.json (project root).
+Override with --config <path>.
 
 Outputs:
   {output_dir}/1_raw2d/{CH}/z{z:04d}.png    — per-channel grayscale + 2D raw detections
@@ -11,6 +12,7 @@ Outputs:
   {output_dir}/3_coloc/{combo}/z{z:04d}.png — RGB composite + colocalization boxes
 """
 
+import argparse
 import os
 import sys
 import re
@@ -24,34 +26,9 @@ import numpy as np
 import pandas as pd
 
 from src.utils.io import loadTeraxml
+from src.config.loader import load_config
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PARAMETERS — edit this block before running
-# ─────────────────────────────────────────────────────────────────────────────
-CONFIG = {
-    # Per-channel paths: name → Y_X block folder containing per-slice .tif files
-    'channels': {
-        'RFP':  r'y:\Fengyi\EGFR_brain\batch4\sample5\stitched\RFP\RES(4003x3150x321)\422850\422850_302400',
-        'GFP':  r'y:\Fengyi\EGFR_brain\batch4\sample5\stitched\GFP_3\RES(4003x3150x321)\422850\422850_302400',
-        'Sox9': r'y:\Fengyi\EGFR_brain\batch4\sample5\stitched\sox9\RES(4003x3150x321)\422850\422850_302400',
-    },
-    # Colors for RGB composite (BGR, 0–255 scale)
-    'channel_colors': {
-        'RFP':  (0,   0,   255),   # red
-        'GFP':  (0,   255, 0  ),   # green
-        'Sox9': (255, 100, 0  ),   # blue-ish
-    },
-    'z_start':    100,        # 0-based file index of first slice to load
-    'n_layers':   10,          # number of consecutive slices to load
-    'result_dir': r'y:\Fengyi\EGFR_brain\batch4\sample5\detection_results_stardist',
-    'xml':        r'y:\Fengyi\EGFR_brain\batch4\sample5\numorph_align\aligned\RFP\xml_merging.xml',
-    'xy_scale':   None,       # None = auto-detect from RES folder name + XML
-    'z_scale':    None,       # None = auto-detect from file count + XML
-    'output_dir': r'y:\Fengyi\EGFR_brain\batch4\sample5\vis_output2',
-    'box_thickness':  4,
-    'normalise_pct': (0.1, 99.9),
-}
-# ─────────────────────────────────────────────────────────────────────────────
+_DEFAULT_CFG = os.path.join(project_root, 'config', 'vis', 'vis_stitched.json')
 
 
 # ── Slice discovery ───────────────────────────────────────────────────────────
@@ -271,7 +248,16 @@ def save_image(img, path):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    cfg          = CONFIG
+    parser = argparse.ArgumentParser(
+        description='Draw detection boxes onto stitched TIFF slices, save as 16-bit PNG.'
+    )
+    parser.add_argument(
+        '--config', default=_DEFAULT_CFG,
+        help=f'Path to vis_stitched.json (default: {_DEFAULT_CFG})',
+    )
+    args = parser.parse_args()
+
+    cfg          = load_config(args.config)
     channels     = cfg['channels']
     ch_colors    = cfg['channel_colors']
     z_start      = cfg['z_start']
