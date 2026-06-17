@@ -467,7 +467,8 @@ def _iou_3d(a, b, z_pad=0):
 
 def match_soma_3d_iou(cells_a, cells_b, iou_thresh=0.15, z_pad=0):
     """
-    Match two lists of volumetric soma cells using 3D IoU (Hungarian assignment).
+    Match two lists of volumetric soma cells using 3D IoU (greedy matching).
+    Uses cKDTree spatial indexing to avoid O(n*m) memory allocation.
     Returns (matched_pairs, unmatched_a, unmatched_b).
       matched_pairs: list of (cell_a, cell_b) dicts
       unmatched_a/b: lists of unmatched cell dicts
@@ -475,23 +476,44 @@ def match_soma_3d_iou(cells_a, cells_b, iou_thresh=0.15, z_pad=0):
     if not cells_a or not cells_b:
         return [], list(cells_a), list(cells_b)
 
+    from scipy.spatial import cKDTree
+
     n, m = len(cells_a), len(cells_b)
-    iou_mat = np.zeros((n, m), dtype=float)
-    for i, a in enumerate(cells_a):
-        for j, b in enumerate(cells_b):
-            iou_mat[i, j] = _iou_3d(a, b, z_pad=z_pad)
 
-    cost = 1.0 - iou_mat
-    cost[iou_mat < iou_thresh] = 1e6
-    row_ind, col_ind = linear_sum_assignment(cost)
+    def _centroids_radii(cells):
+        cx = np.array([(c['x1_3d'] + c['x2_3d']) / 2.0 for c in cells])
+        cy = np.array([(c['y1_3d'] + c['y2_3d']) / 2.0 for c in cells])
+        cz = np.array([(c['z_min'] + c['z_max']) / 2.0 for c in cells])
+        rx = np.array([(c['x2_3d'] - c['x1_3d']) / 2.0 for c in cells])
+        ry = np.array([(c['y2_3d'] - c['y1_3d']) / 2.0 for c in cells])
+        rz = np.array([(c['z_max'] - c['z_min'] + 1 + 2 * z_pad) / 2.0 for c in cells])
+        radii = np.sqrt(rx**2 + ry**2 + rz**2)
+        return np.stack([cx, cy, cz], axis=1), radii
 
-    matched_pairs, matched_a, matched_b = [], set(), set()
-    for ri, ci in zip(row_ind, col_ind):
-        if cost[ri, ci] >= 1e6:
-            continue
-        matched_pairs.append((cells_a[ri], cells_b[ci]))
-        matched_a.add(ri)
-        matched_b.add(ci)
+    coords_a, radii_a = _centroids_radii(cells_a)
+    coords_b, radii_b = _centroids_radii(cells_b)
+    max_r_b = float(radii_b.max())
+
+    tree_b = cKDTree(coords_b)
+
+    # Collect candidate pairs whose bounding spheres overlap, then compute IoU
+    candidates = []
+    for i in range(n):
+        nearby = tree_b.query_ball_point(coords_a[i], r=radii_a[i] + max_r_b)
+        for j in nearby:
+            iou = _iou_3d(cells_a[i], cells_b[j], z_pad=z_pad)
+            if iou >= iou_thresh:
+                candidates.append((iou, i, j))
+
+    # Greedy matching: highest IoU first, skip already-matched cells
+    candidates.sort(key=lambda x: -x[0])
+    matched_a, matched_b = set(), set()
+    matched_pairs = []
+    for iou, i, j in candidates:
+        if i not in matched_a and j not in matched_b:
+            matched_pairs.append((cells_a[i], cells_b[j]))
+            matched_a.add(i)
+            matched_b.add(j)
 
     unmatched_a = [cells_a[i] for i in range(n) if i not in matched_a]
     unmatched_b = [cells_b[j] for j in range(m) if j not in matched_b]
@@ -510,12 +532,29 @@ def suppress_cross_class_overlap(cells, iou_thresh=0.5, z_pad=2):
     if not neurons or not glias:
         return cells
 
-    iou_mat = np.zeros((len(neurons), len(glias)), dtype=float)
-    for i, n in enumerate(neurons):
-        for j, g in enumerate(glias):
-            iou_mat[i, j] = _iou_3d(n, g, z_pad=z_pad)
+    from scipy.spatial import cKDTree
 
-    suppressed = set(np.where(iou_mat.max(axis=1) > iou_thresh)[0])
+    def _centroids_radii_zpad(cells, zp):
+        cx = np.array([(c['x1_3d'] + c['x2_3d']) / 2.0 for c in cells])
+        cy = np.array([(c['y1_3d'] + c['y2_3d']) / 2.0 for c in cells])
+        cz = np.array([(c['z_min'] + c['z_max']) / 2.0 for c in cells])
+        rx = np.array([(c['x2_3d'] - c['x1_3d']) / 2.0 for c in cells])
+        ry = np.array([(c['y2_3d'] - c['y1_3d']) / 2.0 for c in cells])
+        rz = np.array([(c['z_max'] - c['z_min'] + 1 + 2 * zp) / 2.0 for c in cells])
+        return np.stack([cx, cy, cz], axis=1), np.sqrt(rx**2 + ry**2 + rz**2)
+
+    coords_n, radii_n = _centroids_radii_zpad(neurons, z_pad)
+    coords_g, radii_g = _centroids_radii_zpad(glias, z_pad)
+    max_r_g = float(radii_g.max())
+    tree_g = cKDTree(coords_g)
+
+    suppressed = set()
+    for i in range(len(neurons)):
+        nearby = tree_g.query_ball_point(coords_n[i], r=radii_n[i] + max_r_g)
+        for j in nearby:
+            if _iou_3d(neurons[i], glias[j], z_pad=z_pad) > iou_thresh:
+                suppressed.add(i)
+                break
     surviving  = [n for i, n in enumerate(neurons) if i not in suppressed]
     logging.info(f"Cross-class dedup: suppressed {len(suppressed)} neuron(s) "
                  f"overlapping glia (iou_thresh={iou_thresh})")
