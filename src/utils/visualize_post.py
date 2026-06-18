@@ -3,8 +3,8 @@
 """
 Napari multi-tile visualization of brain_detector pipeline results.
 
-所有参数在 config/vis_config.json 中配置，直接运行即可：
-  python src/utils/visualize.py
+所有参数在 config/vis/vis_config_post.json 中配置，直接运行即可：
+  python src/utils/visualize_post.py
 """
 
 import os
@@ -356,7 +356,7 @@ def _add_labels_layer(viewer, shapes, colors, canvas_shape,
 # ── Main ────────────────────────────────────────────────────────────────────────
 
 def main():
-    vis_cfg_path = os.path.join(project_root, 'config', 'vis_config.json')
+    vis_cfg_path = os.path.join(project_root, 'config','vis', 'vis_config_post.json')
     vis_cfg      = load_config(vis_cfg_path)
 
     config = load_config(os.path.join(project_root, 'config', 'config.json'))

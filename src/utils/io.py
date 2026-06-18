@@ -52,6 +52,22 @@ def listTile(path):
             dirname_list.append(os.path.basename(r))
     return sorted(dirname_list), sorted(dir_list)
 
+def listTile_from_local_csvs(det_res_path, anchor_ch_id, anchor_dir):
+    """Fast alternative to listTile() when tile detection is already done.
+    Scans local 1_tile_2d_raw/ for *_{anchor_ch_id}_result.csv files,
+    extracts tile names, and reconstructs full paths under anchor_dir."""
+    suffix = f"_{anchor_ch_id}_result.csv"
+    names = []
+    if os.path.isdir(det_res_path):
+        for fname in os.listdir(det_res_path):
+            if fname.endswith(suffix):
+                tile_name = fname[: -len(suffix)]
+                if tile_name:
+                    names.append(tile_name)
+    dirnames = sorted(names)
+    pATHTILE_all = [os.path.join(anchor_dir, name) for name in dirnames]
+    return dirnames, pATHTILE_all
+
 def load_cached_detections(csv_path):
     detection_map = {}
     if not os.path.exists(csv_path): return detection_map

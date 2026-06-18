@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+#python scripts/run_inference.py --config config/config_IMARIS_post.json
 import argparse
 import os
 import sys
@@ -17,7 +18,7 @@ import pandas as pd
 from scipy.spatial import cKDTree
 from src.config.loader import load_config
 from src.utils.logger import setup_logging
-from src.utils.io import listTile, loadTeraxml, save_run_metadata
+from src.utils.io import listTile, listTile_from_local_csvs, loadTeraxml, save_run_metadata
 from src.core.worker import process_single_tile_wrapper, init_worker
 from src.core.stitcher import combine_predictions
 from src.core.z_linker import run_z_linker
@@ -56,6 +57,7 @@ if __name__ == '__main__':
         raise ValueError("❌ 配置文件中缺失 pATHRESULT 输出根目录！")
         
     pipeline_mode = config.get('pipeline_mode', 'post_align')  # "post_align" | "pre_align"
+    start_from_stage = config.get('start_from_stage', 1)
     pre_align_cfg = config.get('pre_align_params', {})
 
     derived = {}
@@ -88,18 +90,34 @@ if __name__ == '__main__':
     anchor_ch = routing_config[0]
     anchor_dir = paths.get(anchor_ch['dir_key'])
 
-    logging.info("=== 多通道路径检查 ===")
-    for ch in routing_config:
-        d_path = paths.get(ch['dir_key'])
-        if not d_path or not os.path.exists(d_path):
-            raise FileNotFoundError(f"❌ 通道 {ch['id']} 路径不存在: {d_path}")
-        logging.info(f"[{ch['type'].upper()}] {ch['id']}: {d_path}")
-    logging.info("=====================")
+    if start_from_stage < 2:
+        logging.info("=== 多通道路径检查 ===")
+        for ch in routing_config:
+            d_path = paths.get(ch['dir_key'])
+            if not d_path or not os.path.exists(d_path):
+                raise FileNotFoundError(f"❌ 通道 {ch['id']} 路径不存在: {d_path}")
+            logging.info(f"[{ch['type'].upper()}] {ch['id']}: {d_path}")
+        logging.info("=====================")
+    else:
+        logging.info(f"[start_from_stage={start_from_stage}] 跳过网络通道路径校验。")
 
     # 3. 获取 Tile 列表 (基于锚点通道)
-    dirnames, pATHTILE_all = listTile(anchor_dir)
-    if not pATHTILE_all:
-        raise ValueError(f"❌ 在锚点目录 {anchor_dir} 中没有找到合法的 Tile！")
+    anchor_ch_id = anchor_ch['id']
+    if start_from_stage >= 2:
+        logging.info(f"[start_from_stage={start_from_stage}] 跳过网络扫描，从本地 CSV 推导 Tile 列表...")
+        dirnames, pATHTILE_all = listTile_from_local_csvs(
+            derived['pATH_DET_RES'], anchor_ch_id, anchor_dir
+        )
+        if not pATHTILE_all:
+            raise ValueError(
+                f"❌ start_from_stage={start_from_stage} 但在 {derived['pATH_DET_RES']} "
+                f"中未找到 *_{anchor_ch_id}_result.csv 文件。请先完成 Stage 2 检测。"
+            )
+        logging.info(f"  从本地 CSV 推导出 {len(pATHTILE_all)} 个 Tile。")
+    else:
+        dirnames, pATHTILE_all = listTile(anchor_dir)
+        if not pATHTILE_all:
+            raise ValueError(f"❌ 在锚点目录 {anchor_dir} 中没有找到合法的 Tile！")
 
     save_run_metadata(config, start_time)
 
