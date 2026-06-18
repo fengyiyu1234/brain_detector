@@ -619,6 +619,63 @@ def annotate_soma_with_tf_gmm(soma_vol_list, tf_vol_list, p_thresh=0.5):
     return soma_vol_list
 
 
+def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_margin=0):
+    """
+    Annotate soma cells with TF markers using strict 3D bbox containment.
+    A TF is colocalized only if its 3D bounding box is fully enclosed within
+    a soma's 3D bounding box (with optional xy_margin and z_pad tolerance).
+    """
+    if not soma_vol_list or not tf_vol_list:
+        return soma_vol_list
+
+    soma_arr = np.array([[s['cx'], s['cy'], s['cz']] for s in soma_vol_list], dtype=float)
+    soma_radii = np.array([
+        np.sqrt((s['x2_3d'] - s['x1_3d']) ** 2 + (s['y2_3d'] - s['y1_3d']) ** 2) / 2
+        for s in soma_vol_list
+    ], dtype=float)
+    soma_radii = np.maximum(soma_radii, 1.0)
+    max_radius = float(soma_radii.max())
+
+    tree = cKDTree(soma_arr)
+
+    soma_markers = defaultdict(set)
+    for tf in tf_vol_list:
+        tf_pt = np.array([tf['cx'], tf['cy'], tf['cz']], dtype=float)
+        tf_marker = tf['class'].split('_')[-1]
+
+        # Query candidate somas within reach — use max soma radius as search bound
+        candidate_idxs = tree.query_ball_point(tf_pt, r=max_radius * 2)
+
+        best_dist, best_idx = float('inf'), None
+        for idx in candidate_idxs:
+            s = soma_vol_list[idx]
+            contained_xy = (
+                s['x1_3d'] - xy_margin <= tf['x1_3d'] and
+                tf['x2_3d'] <= s['x2_3d'] + xy_margin and
+                s['y1_3d'] - xy_margin <= tf['y1_3d'] and
+                tf['y2_3d'] <= s['y2_3d'] + xy_margin
+            )
+            contained_z = (
+                s['z_min'] - z_pad <= tf['z_min'] and
+                tf['z_max'] <= s['z_max'] + z_pad
+            )
+            if contained_xy and contained_z:
+                dist = float(np.linalg.norm(soma_arr[idx] - tf_pt))
+                if dist < best_dist:
+                    best_dist, best_idx = dist, idx
+
+        if best_idx is not None:
+            soma_markers[best_idx].add(tf_marker)
+
+    for idx, soma in enumerate(soma_vol_list):
+        if idx in soma_markers:
+            soma['class'] = _merge_class(
+                soma['class'], '_'.join(sorted(soma_markers[idx]))
+            )
+
+    return soma_vol_list
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Permutation test
 # ──────────────────────────────────────────────────────────────────────────────

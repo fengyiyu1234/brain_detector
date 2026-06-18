@@ -21,7 +21,7 @@ from src.utils.io import listTile, loadTeraxml, save_run_metadata
 from src.core.worker import process_single_tile_wrapper, init_worker
 from src.core.stitcher import combine_predictions
 from src.core.z_linker import run_z_linker
-from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_gmm,
+from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_containment,
                                permutation_test_colocalization, _merge_class,
                                suppress_cross_class_overlap)
 from src.core.point_cloud_aligner import (
@@ -462,15 +462,16 @@ if __name__ == '__main__':
         logging.info(f"✔️ [3A] Soma 3D IoU 匹配: {len(merged_soma_vols)} 个 "
                      f"(多阳性 {n_multi}, 单阳性 {n_single})")
 
-        # Phase B: soma × TF GMM 标注（逐通道独立GMM，结果累积到soma）
-        p_thresh = zl_tf.get('gmm_p_thresh', 0.5)
+        # Phase B: soma × TF 严格包含标注（TF框必须完全在soma框内）
+        xy_margin = zl_tf.get('containment_xy_margin', 0)
+        z_pad_tf  = zl_tf.get('containment_z_pad', 2)
         for cid in tf_ch_ids:
             tf_vols = tf_vol_by_ch.get(cid, [])
             if tf_vols and merged_soma_vols:
-                merged_soma_vols = annotate_soma_with_tf_gmm(
-                    merged_soma_vols, tf_vols, p_thresh=p_thresh
+                merged_soma_vols = annotate_soma_with_tf_containment(
+                    merged_soma_vols, tf_vols, z_pad=z_pad_tf, xy_margin=xy_margin
                 )
-                logging.info(f"✔️ [3B] [{cid}] TF GMM 标注完成")
+                logging.info(f"✔️ [3B] [{cid}] TF containment 标注完成")
         n_tf_annotated = sum(
             1 for c in merged_soma_vols
             if any(cid in c['class'] for cid in tf_ch_ids)
