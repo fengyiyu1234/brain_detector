@@ -481,10 +481,21 @@ if __name__ == '__main__':
                      f"(多阳性 {n_multi}, 单阳性 {n_single})")
 
         # Phase B: soma × TF 严格包含标注（TF框必须完全在soma框内）
-        xy_margin = zl_tf.get('containment_xy_margin', 0)
-        z_pad_tf  = zl_tf.get('containment_z_pad', 2)
+        xy_margin    = zl_tf.get('containment_xy_margin', 0)
+        z_pad_tf     = zl_tf.get('containment_z_pad', 2)
+        tf_bbox_max_w = zl_tf.get('bbox_max_w', None)
+        tf_bbox_max_h = zl_tf.get('bbox_max_h', None)
         for cid in tf_ch_ids:
             tf_vols = tf_vol_by_ch.get(cid, [])
+            if (tf_bbox_max_w is not None or tf_bbox_max_h is not None) and tf_vols:
+                n_before = len(tf_vols)
+                tf_vols = [
+                    v for v in tf_vols
+                    if (tf_bbox_max_w is None or v['x2_3d'] - v['x1_3d'] <= tf_bbox_max_w)
+                    and (tf_bbox_max_h is None or v['y2_3d'] - v['y1_3d'] <= tf_bbox_max_h)
+                ]
+                logging.info(f"  [{cid}] TF size filter: {n_before} → {len(tf_vols)} "
+                             f"(bbox_max_w={tf_bbox_max_w}, bbox_max_h={tf_bbox_max_h})")
             if tf_vols and merged_soma_vols:
                 merged_soma_vols = annotate_soma_with_tf_containment(
                     merged_soma_vols, tf_vols, z_pad=z_pad_tf, xy_margin=xy_margin

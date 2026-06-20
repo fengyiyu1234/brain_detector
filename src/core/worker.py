@@ -11,9 +11,7 @@ import logging
 from tqdm import tqdm
 from .stitcher import stitchDetection
 from src.utils.image import normalize_for_detection
-from cellpose import models as cp_models
 from concurrent.futures import ThreadPoolExecutor
-import time
 import logging
 import torch
 from src.utils.logger import setup_logging  
@@ -49,19 +47,6 @@ def init_worker(config, gpu_queue=None):
         except Exception as e:
             print(f"[Worker PID:{os.getpid()}] ❌ YOLO 加载失败: {e}")
 
-    if 'cellpose' in required_models:
-        try:
-            _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            cellpose_path = config['models']['cellpose_path']
-            if not os.path.isabs(cellpose_path):
-                cellpose_path = os.path.join(_project_root, cellpose_path)
-            _global_models['cellpose'] = cp_models.CellposeModel(
-                pretrained_model=cellpose_path,
-                gpu=device.startswith('cuda')
-            )
-            print(f"[Worker PID:{os.getpid()}] ✔️ Cellpose 模型加载成功")
-        except Exception as e:
-            print(f"[Worker PID:{os.getpid()}] ❌ Cellpose 加载失败: {e}")
 
     if 'stardist' in required_models:
         try:
@@ -107,46 +92,52 @@ def calculate_ioa(box_nuc, box_soma):
     nucArea = (box_nuc[2] - box_nuc[0]) * (box_nuc[3] - box_nuc[1])
     return interArea / float(nucArea)
 
-def extract_boxes_from_masks(masks):
-    """将 Cellpose 得到的 2D 实例 mask 转换为 Bounding Box"""
-    boxes = []
-    for val in np.unique(masks):
-        if val == 0: continue
-        y_idx, x_idx = np.where(masks == val)
-        if len(y_idx) == 0: continue
-        x1, x2 = np.min(x_idx), np.max(x_idx)
-        y1, y2 = np.min(y_idx), np.max(y_idx)
-        boxes.append([x1, y1, x2, y2, 1.0, "nucleus"])
-    return boxes
 
 
-def boxes_from_prob_map(prob_map, threshold=0.5, min_area=10):
-    """从 Cellpose 概率图直接提取 BBox，跳过 flow dynamics 后处理（更快）"""
-    from skimage.measure import label as sk_label, regionprops
-    binary = prob_map > threshold
-    if not binary.any():
-        return []
-    labeled = sk_label(binary)
-    boxes = []
-    for region in regionprops(labeled):
-        if region.area < min_area:
+def _write_filtered_detections(det_buf, csv_writers, dp, ch_model_map):
+    """Apply per-tile intensity (percentile or absolute) and size filters, then write CSV.
+
+    Config keys (under detection_params):
+      yolo sub-dict:    bbox_min, bbox_max, bbox_mean_pct_min, bbox_mean_min
+      stardist sub-dict: bbox_min, bbox_max, bbox_mean_pct_min, nucleus_mean_min
+    bbox_mean_pct_min=20 keeps the top 80% brightest boxes (filters bottom 20%).
+    bbox_min/bbox_max apply to both width and height.
+    """
+    sd_dp   = dp.get('stardist', {})
+    yolo_dp = dp.get('yolo', {})
+    for ch_id, rows in det_buf.items():
+        if not rows:
             continue
-        min_r, min_c, max_r, max_c = region.bbox
-        boxes.append([int(min_c), int(min_r), int(max_c), int(max_r), 1.0, "nucleus"])
-    return boxes
+        model = ch_model_map.get(ch_id, 'yolo')
+        if model == 'stardist':
+            pct_min  = sd_dp.get('bbox_mean_pct_min', None)
+            abs_min  = sd_dp.get('nucleus_mean_min', 0) or 0
+            bbox_min = sd_dp.get('bbox_min', None)
+            bbox_max = sd_dp.get('bbox_max', None)
+        else:
+            pct_min  = yolo_dp.get('bbox_mean_pct_min', None)
+            abs_min  = yolo_dp.get('bbox_mean_min', 0) or 0
+            bbox_min = yolo_dp.get('bbox_min', None)
+            bbox_max = yolo_dp.get('bbox_max', None)
 
+        # Percentile filter: computed across all detections in the tile
+        if pct_min is not None:
+            means = [r[7] for r in rows]
+            threshold = float(np.percentile(means, pct_min))
+            rows = [r for r in rows if r[7] >= threshold]
 
-def filter_stardist_labels(labels, diam_min, diam_max):
-    """Remove StarDist instances outside expected nucleus diameter range."""
-    from skimage.measure import regionprops
-    filtered = np.zeros_like(labels)
-    new_id = 1
-    for prop in regionprops(labels):
-        d = getattr(prop, 'equivalent_diameter_approx', None) or (2 * (prop.area / np.pi) ** 0.5)
-        if diam_min <= d <= diam_max:
-            filtered[labels == prop.label] = new_id
-            new_id += 1
-    return filtered
+        # Absolute mean floor
+        if abs_min > 0:
+            rows = [r for r in rows if r[7] >= abs_min]
+
+        # Bounding-box size range (applies to both w and h): row layout [name, x1, y1, x2, y2, ...]
+        if bbox_min is not None or bbox_max is not None:
+            rows = [r for r in rows
+                    if (bbox_min is None or (r[3] - r[1] >= bbox_min and r[4] - r[2] >= bbox_min))
+                    and (bbox_max is None or (r[3] - r[1] <= bbox_max and r[4] - r[2] <= bbox_max))]
+
+        for row in rows:
+            csv_writers[ch_id].writerow(row)
 
 
 def process_single_tile(i, pATHTEST, config):
@@ -277,9 +268,8 @@ def process_single_tile(i, pATHTEST, config):
         PREFETCH_DEPTH = 8  # 预取深度：降低以减少内存峰值压力
         prefetch_futures = {}
 
-        cellpose_channels = [ch for ch in channels_to_run if ch['model'] == 'cellpose']
-        cellpose_buffer = {ch['id']: [] for ch in cellpose_channels}
-        stardist_channels = [ch for ch in channels_to_run if ch['model'] == 'stardist']
+        det_buf       = {ch['id']: [] for ch in channels_to_run}
+        ch_model_map  = {ch['id']: ch['model'] for ch in channels_to_run}
 
         with ThreadPoolExecutor(max_workers=16) as downloader_pool:
 
@@ -384,12 +374,10 @@ def process_single_tile(i, pATHTEST, config):
                                 cleaned_boxes = stitchDetection(layer_label_data)
                                 class_str = yolo_classes.get(str(int(lbl)), "unknown")
                                 for box in cleaned_boxes:
-                                    row = [name_no_ext, box[0], box[1], box[2], box[3], class_str, box[4], 0.0, current_z_real]
-                                    csv_writers[ch_id].writerow(row)
-
-                    # --------- Cellpose: 累积切片，循环后统一批量推断 ---------
-                    elif ch_model == 'cellpose':
-                        cellpose_buffer[ch_id].append((name_no_ext, current_z_real, norm_img))
+                                    x1r = max(0, int(round(box[0]))); x2r = min(W0, int(round(box[2])))
+                                    y1r = max(0, int(round(box[1]))); y2r = min(H0, int(round(box[3])))
+                                    mean_val = float(img_raw[y1r:y2r, x1r:x2r].mean()) if y2r > y1r and x2r > x1r else 0.0
+                                    det_buf[ch_id].append([name_no_ext, box[0], box[1], box[2], box[3], class_str, box[4], mean_val, current_z_real])
 
                     # --------- StarDist: 逐切片推断，直接写出 BBox ---------
                     elif ch_model == 'stardist':
@@ -409,45 +397,18 @@ def process_single_tile(i, pATHTEST, config):
                             prob_thresh=sd_dp.get('prob_thresh', 0.5),
                             nms_thresh=sd_dp.get('nms_thresh', 0.4),
                         )
-                        labels = filter_stardist_labels(
-                            labels,
-                            sd_dp.get('nucleus_diam_min', 7),
-                            sd_dp.get('nucleus_diam_max', 17),
-                        )
-                        for prop in regionprops(labels):
+                        for prop in regionprops(labels, intensity_image=img_raw):
                             min_r, min_c, max_r, max_c = prop.bbox
-                            csv_writers[ch_id].writerow([
+                            det_buf[ch_id].append([
                                 name_no_ext, int(min_c), int(min_r), int(max_c), int(max_r),
-                                "nucleus", 1.0, 0.0, current_z_real,
+                                "nucleus", 1.0, float(prop.mean_intensity), current_z_real,
                             ])
 
                 pbar.update(1)
 
-        # --- 3. Cellpose 批量推断（所有切片一次性送 GPU）---
-        for ch in cellpose_channels:
-            ch_id = ch['id']
-            buffer = cellpose_buffer[ch_id]
-            if not buffer:
-                continue
+        # --- 3. Per-tile filter and write ---
+        _write_filtered_detections(det_buf, csv_writers, dp, ch_model_map)
 
-            pbar.set_description(f"Tile:[{dir_name[:10]}] | Cellpose 批量推断 [{ch_id}] {len(buffer)} 层...")
-            names_cp, z_reals_cp, imgs_cp = zip(*buffer)
-
-            _, flows, _ = _global_models['cellpose'].eval(
-                list(imgs_cp), diameter=None, channels=[0, 0],
-                batch_size=dp.get('cellpose_batch_size', 32),
-                compute_masks=False
-            )
-            cp_threshold = dp.get('cellpose_prob_threshold', 0.5)
-            prob_maps = flows[2]  # list of [H, W] cell probability maps，由 GPU 前向传播生成
-
-            for slice_name, z_real, prob_map in zip(names_cp, z_reals_cp, prob_maps):
-                cp_boxes = boxes_from_prob_map(prob_map, threshold=cp_threshold)
-                for box in cp_boxes:
-                    row = [slice_name, box[0], box[1], box[2], box[3], box[5], box[4], 0.0, z_real]
-                    csv_writers[ch_id].writerow(row)
-
-            current_logger.info(f"[{dir_name}][{ch_id}] Cellpose 批量推断完成: {len(buffer)} 层")
     finally:
         for f in file_handles.values():
             f.close()
