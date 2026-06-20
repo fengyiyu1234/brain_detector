@@ -40,7 +40,7 @@ from src.core.stitcher import (
     suppress_cross_class_overlap, _merge_class,
 )
 
-from src.utils.visualize import (
+from src.utils.visualize_post import (
     load_volume,
     _rasterize_shapes_to_labels,
     _add_labels_layer,
