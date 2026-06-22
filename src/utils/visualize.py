@@ -71,6 +71,7 @@ SPHERE_COLORS = {
     'Olig2': [1.0,  0.2,  1.0,  0.85],
 }
 _DEFAULT_SPHERE_COLOR = [0.9, 0.9, 0.9, 0.7]
+_REJECTED_COLOR       = [0.5, 0.5, 0.5, 0.6]   # gray — boxes removed by vis filter
 
 _MARKER_RGB = {
     'rfp':   [1.0,  0.20, 0.20],
@@ -85,6 +86,11 @@ _MARKER_RGB = {
 def _color(class_str):
     base = str(class_str).split('_')[0]
     return CLASS_COLOR.get(base, [1.0, 1.0, 1.0, 1.0])
+
+
+def _get_ch_filter(filter_cfg, ch):
+    """Look up vis filter by channel type ('soma'/'tf'), fall back to channel id."""
+    return filter_cfg.get(ch.get('type', 'soma')) or filter_cfg.get(ch.get('id', '')) or None
 
 
 def _extract_markers(class_str):
@@ -247,9 +253,11 @@ def _plot_intensity_histograms(ch_means_dict, tile_name='', out_dir=None):
 def _filter_df_by_size_and_intensity(x1, y1, x2, y2, z_col, raw_vol, filt):
     """Return (keep_mask, comp_means_or_None).
 
-    Size filter applied first; percentile for intensity computed on size-surviving rows.
+    Filter order (each stage operates on survivors of the previous):
+      1. bbox_min / bbox_max  — absolute size bounds (width AND height)
+      2. bbox_area_pct_min    — area percentile on size-surviving rows
+      3. bbox_mean_pct_min / bbox_mean_min — intensity on area-surviving rows
     raw_vol: float32 (Z, H, W) with original 16-bit values, tile-local coords.
-    filt keys: bbox_max_w, bbox_max_h, bbox_mean_pct_min, bbox_mean_min.
     """
     n = len(x1)
     keep = np.ones(n, dtype=bool)
@@ -262,6 +270,13 @@ def _filter_df_by_size_and_intensity(x1, y1, x2, y2, z_col, raw_vol, filt):
     if bbox_max is not None:
         keep &= (x2 - x1) <= bbox_max
         keep &= (y2 - y1) <= bbox_max
+
+    area_pct_min = filt.get('bbox_area_pct_min')
+    if area_pct_min is not None:
+        areas = (x2 - x1) * (y2 - y1)
+        surviving_areas = areas[keep]
+        if surviving_areas.size > 0:
+            keep &= areas >= float(np.percentile(surviving_areas, area_pct_min))
 
     pct_min = filt.get('bbox_mean_pct_min')
     abs_min = filt.get('bbox_mean_min')
@@ -446,24 +461,26 @@ def _load_tile_csv_shapes(csv_path, z_range=None, raw_vol=None, filt=None):
     """Load a tile-local detection CSV (1-indexed z) → napari shapes.
 
     raw_vol: optional float32 (Z,H,W) with 16-bit values for intensity filtering.
-    filt: optional dict — bbox_max_w, bbox_max_h, bbox_mean_pct_min, bbox_mean_min.
-    Returns (shapes, colors, box_meta).
+    filt: optional dict — bbox_min, bbox_max, bbox_mean_pct_min, bbox_mean_min.
+    Returns ((shapes, colors, meta), (rej_shapes, rej_colors, rej_meta)).
+    rej_* holds boxes removed by filt; both lists are empty when filt is None.
     """
+    _empty = ([], [], [])
     if not os.path.isfile(csv_path):
-        return [], [], []
+        return _empty, _empty
     df = pd.read_csv(
         csv_path,
         names=['slice_name', 'x1', 'y1', 'x2', 'y2', 'class', 'score', 'mean', 'z'],
         skiprows=1,
     )
     if df.empty:
-        return [], [], []
+        return _empty, _empty
     df['z'] = df['z'].astype(float).astype(int) - 1
     if z_range is not None:
         df['z_local'] = df['z'] - z_range[0]
         df = df[(df['z_local'] >= 0) & (df['z_local'] < z_range[1] - z_range[0])]
         if df.empty:
-            return [], [], []
+            return _empty, _empty
         z_col = df['z_local'].values
     else:
         z_col = df['z'].values
@@ -473,16 +490,39 @@ def _load_tile_csv_shapes(csv_path, z_range=None, raw_vol=None, filt=None):
     if filt:
         keep, comp_means = _filter_df_by_size_and_intensity(
             x1, y1, x2, y2, z_col, raw_vol, filt)
+        rej_idx = np.where(~keep)[0]
+        idx     = np.where(keep)[0]
+        # Build rejected shapes
+        if len(rej_idx) > 0:
+            rx1, ry1 = x1[rej_idx], y1[rej_idx]
+            rx2, ry2 = x2[rej_idx], y2[rej_idx]
+            rz = z_col[rej_idx]; rn = len(rej_idx)
+            rarr = np.empty((rn, 4, 3), dtype=np.float64)
+            rarr[:, 0] = np.column_stack([rz, ry1, rx1])
+            rarr[:, 1] = np.column_stack([rz, ry1, rx2])
+            rarr[:, 2] = np.column_stack([rz, ry2, rx2])
+            rarr[:, 3] = np.column_stack([rz, ry2, rx1])
+            rdf = df.iloc[rej_idx]; rcls = rdf['class'].values
+            rmeans = comp_means[rej_idx] if comp_means is not None else rdf['mean'].values.astype(float)
+            rej_meta = [
+                {'z': int(rz[i]), 'x1': float(rx1[i]), 'y1': float(ry1[i]),
+                 'x2': float(rx2[i]), 'y2': float(ry2[i]), 'cls': str(rcls[i]),
+                 'mean': float(rmeans[i])}
+                for i in range(rn)
+            ]
+            rej_data = (list(rarr), [_REJECTED_COLOR] * rn, rej_meta)
+        else:
+            rej_data = _empty
+        print(f"  [filter] {n_before} → {len(idx)} kept, {len(rej_idx)} rejected")
         if not keep.any():
-            return [], [], []
-        idx = np.where(keep)[0]
+            return _empty, rej_data
         x1, y1, x2, y2 = x1[idx], y1[idx], x2[idx], y2[idx]
         z_col = z_col[idx]
-        df = df.iloc[idx]
+        df    = df.iloc[idx]
         means = comp_means[idx] if comp_means is not None else df['mean'].values.astype(float)
-        print(f"  [filter] {n_before} → {len(idx)} boxes")
     else:
-        means = df['mean'].values.astype(float) if 'mean' in df.columns else np.zeros(n_before)
+        means    = df['mean'].values.astype(float) if 'mean' in df.columns else np.zeros(n_before)
+        rej_data = _empty
     n = len(df)
     arr = np.empty((n, 4, 3), dtype=np.float64)
     arr[:, 0] = np.column_stack([z_col, y1, x1])
@@ -496,7 +536,7 @@ def _load_tile_csv_shapes(csv_path, z_range=None, raw_vol=None, filt=None):
          'mean': float(means[i])}
         for i in range(n)
     ]
-    return list(arr), [_color(c) for c in classes], box_meta
+    return (list(arr), [_color(c) for c in classes], box_meta), rej_data
 
 
 def _load_global_csv_to_tile_shapes(csv_path, tile_name, tile_x0, tile_y0, tile_z0,
@@ -507,14 +547,15 @@ def _load_global_csv_to_tile_shapes(csv_path, tile_name, tile_x0, tile_y0, tile_
     Filters by tile_name column if present, otherwise by spatial bounding box.
     z convention: z_local = z_csv + tile_z0 - z_range[0] - 1
     raw_vol: optional float32 (Z,H,W) with 16-bit values for intensity filtering.
-    filt: optional dict — bbox_max_w, bbox_max_h, bbox_mean_pct_min, bbox_mean_min.
-    Returns (shapes, colors, box_meta) with tile-local coordinates.
+    filt: optional dict — bbox_min, bbox_max, bbox_mean_pct_min, bbox_mean_min.
+    Returns ((shapes, colors, meta), (rej_shapes, rej_colors, rej_meta)).
     """
+    _empty = ([], [], [])
     if not os.path.isfile(csv_path):
-        return [], [], []
+        return _empty, _empty
     df = pd.read_csv(csv_path)
     if df.empty:
-        return [], [], []
+        return _empty, _empty
     if 'tile_name' in df.columns:
         df = df[df['tile_name'] == tile_name]
     else:
@@ -525,14 +566,14 @@ def _load_global_csv_to_tile_shapes(csv_path, tile_name, tile_x0, tile_y0, tile_
             (df['y2'].astype(float) <  tile_y0 + canvas_h)
         ]
     if df.empty:
-        return [], [], []
+        return _empty, _empty
     z0 = z_range[0] if z_range is not None else 0
     z1 = z_range[1] if z_range is not None else float('inf')
     df = df.copy()
     df['z_local'] = df['z'].astype(float).astype(int) + tile_z0 - z0 - 1
     df = df[(df['z_local'] >= 0) & (df['z_local'] < z1 - z0)]
     if df.empty:
-        return [], [], []
+        return _empty, _empty
     n_before = len(df)
     y1 = df['y1'].values.astype(float) - tile_y0
     y2 = df['y2'].values.astype(float) - tile_y0
@@ -542,15 +583,39 @@ def _load_global_csv_to_tile_shapes(csv_path, tile_name, tile_x0, tile_y0, tile_
     if filt:
         keep, comp_means = _filter_df_by_size_and_intensity(
             x1, y1, x2, y2, z, raw_vol, filt)
+        rej_idx = np.where(~keep)[0]
+        idx     = np.where(keep)[0]
+        # Build rejected shapes
+        if len(rej_idx) > 0:
+            rx1, ry1 = x1[rej_idx], y1[rej_idx]
+            rx2, ry2 = x2[rej_idx], y2[rej_idx]
+            rz = z[rej_idx]; rn = len(rej_idx)
+            rarr = np.empty((rn, 4, 3), dtype=np.float64)
+            rarr[:, 0] = np.column_stack([rz, ry1, rx1])
+            rarr[:, 1] = np.column_stack([rz, ry1, rx2])
+            rarr[:, 2] = np.column_stack([rz, ry2, rx2])
+            rarr[:, 3] = np.column_stack([rz, ry2, rx1])
+            rdf = df.iloc[rej_idx]
+            rcls = rdf['class'].values if 'class' in rdf.columns else ['unknown'] * rn
+            rmeans = comp_means[rej_idx] if comp_means is not None else rdf['mean'].values.astype(float)
+            rej_meta = [
+                {'z': int(rz[i]), 'x1': float(rx1[i]), 'y1': float(ry1[i]),
+                 'x2': float(rx2[i]), 'y2': float(ry2[i]), 'cls': str(rcls[i]),
+                 'mean': float(rmeans[i])}
+                for i in range(rn)
+            ]
+            rej_data = (list(rarr), [_REJECTED_COLOR] * rn, rej_meta)
+        else:
+            rej_data = _empty
+        print(f"  [filter] {n_before} → {len(idx)} kept, {len(rej_idx)} rejected")
         if not keep.any():
-            return [], [], []
-        idx = np.where(keep)[0]
+            return _empty, rej_data
         x1, y1, x2, y2, z = x1[idx], y1[idx], x2[idx], y2[idx], z[idx]
-        df = df.iloc[idx]
+        df    = df.iloc[idx]
         means = comp_means[idx] if comp_means is not None else df['mean'].values.astype(float)
-        print(f"  [filter] {n_before} → {len(idx)} boxes")
     else:
-        means = df['mean'].values.astype(float) if 'mean' in df.columns else np.zeros(n_before)
+        means    = df['mean'].values.astype(float) if 'mean' in df.columns else np.zeros(n_before)
+        rej_data = _empty
     n = len(df)
     arr = np.empty((n, 4, 3), dtype=np.float64)
     arr[:, 0] = np.column_stack([z, y1, x1])
@@ -564,7 +629,7 @@ def _load_global_csv_to_tile_shapes(csv_path, tile_name, tile_x0, tile_y0, tile_
          'mean': float(means[i])}
         for i in range(n)
     ]
-    return list(arr), [_color(c) for c in classes], box_meta
+    return (list(arr), [_color(c) for c in classes], box_meta), rej_data
 
 
 # ── Coloc helpers ─────────────────────────────────────────────────────────────
@@ -970,7 +1035,7 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
     raw_vols   = {}
     for ch in routing_config:
         cid = ch['id']
-        need_vol = bool(filter_cfg.get(cid)) or show_hist
+        need_vol = bool(_get_ch_filter(filter_cfg, ch)) or show_hist
         if not need_vol:
             continue
         ch_base  = os.path.abspath(paths[ch['dir_key']])
@@ -982,7 +1047,7 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
                 rv = _shift_volume(rv, o['dx'], o['dy'], o['dz'])
         if rv is not None:
             raw_vols[cid] = rv
-            active = [k for k, v in filter_cfg.get(cid, {}).items() if v is not None]
+            active = [k for k, v in (_get_ch_filter(filter_cfg, ch) or {}).items() if v is not None]
             tag = f"— active filter: {active}" if active else "— hist only"
             print(f"[raw_vol] [{cid}] loaded {rv.shape} {tag}")
 
@@ -1005,9 +1070,10 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
         aligned_csv = os.path.join(align_dir, f"{tile_name}_{cid}_result.csv")
         if not os.path.isfile(aligned_csv) and not has_aligned:
             aligned_csv = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
-        shapes_a, colors_a, meta_a = _load_tile_csv_shapes(
+        ch_filt = _get_ch_filter(filter_cfg, ch)
+        (shapes_a, colors_a, meta_a), (rej_sa, rej_ca, _) = _load_tile_csv_shapes(
             aligned_csv, z_range,
-            raw_vol=raw_vols.get(cid), filt=filter_cfg.get(cid))
+            raw_vol=raw_vols.get(cid), filt=ch_filt)
         if shapes_a:
             layer_name_a = f"[aligned] {cid}{iou_str}"
             _add_labels_layer(
@@ -1018,11 +1084,18 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
             for m in meta_a:
                 box_registry.append({**m, 'layer_name': layer_name_a})
             print(f"[aligned] {cid}: {len(shapes_a)} boxes")
+        if rej_sa:
+            _add_labels_layer(
+                viewer, rej_sa, rej_ca, canvas_shape,
+                name=f"[aligned rejected] {cid}",
+                visible=False, opacity=0.5, outline_width=outline_width,
+            )
+            print(f"[aligned rejected] {cid}: {len(rej_sa)} boxes (hidden)")
         if show_before:
             raw_csv = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
-            shapes_r, colors_r, meta_r = _load_tile_csv_shapes(
+            (shapes_r, colors_r, meta_r), _ = _load_tile_csv_shapes(
                 raw_csv, z_range,
-                raw_vol=raw_vols.get(cid), filt=filter_cfg.get(cid))
+                raw_vol=raw_vols.get(cid), filt=ch_filt)
             if shapes_r:
                 layer_name_r = f"[raw] {cid}"
                 _add_labels_layer(
@@ -1219,7 +1292,7 @@ def _run_post(vis_cfg, config, paths, routing_config):
     raw_vols = {}
     for ch in routing_config:
         cid = ch['id']
-        need_vol = bool(filter_cfg.get(cid)) or show_hist
+        need_vol = bool(_get_ch_filter(filter_cfg, ch)) or show_hist
         if not need_vol:
             continue
         ch_base  = os.path.abspath(paths[ch['dir_key']])
@@ -1227,7 +1300,7 @@ def _run_post(vis_cfg, config, paths, routing_config):
         rv = load_raw_volume(tile_dir, z_range)
         if rv is not None:
             raw_vols[cid] = rv
-            active = [k for k, v in filter_cfg.get(cid, {}).items() if v is not None]
+            active = [k for k, v in (_get_ch_filter(filter_cfg, ch) or {}).items() if v is not None]
             tag = f"— active filter: {active}" if active else "— hist only"
             print(f"[raw_vol] [{cid}] loaded {rv.shape} {tag}")
 
@@ -1261,9 +1334,9 @@ def _run_post(vis_cfg, config, paths, routing_config):
         for ch in routing_config:
             cid = ch['id']
             csv_p = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
-            shapes, colors, meta = _load_tile_csv_shapes(
+            (shapes, colors, meta), (rej_s, rej_c, _) = _load_tile_csv_shapes(
                 csv_p, z_range,
-                raw_vol=raw_vols.get(cid), filt=filter_cfg.get(cid))
+                raw_vol=raw_vols.get(cid), filt=_get_ch_filter(filter_cfg, ch))
             if shapes:
                 layer_name_s1 = f"[s1] {cid}"
                 _add_labels_layer(
@@ -1274,16 +1347,23 @@ def _run_post(vis_cfg, config, paths, routing_config):
                 for m in meta:
                     box_registry.append({**m, 'layer_name': layer_name_s1})
                 print(f"[s1] {cid}: {len(shapes)} raw 2D boxes (hidden)")
+            if rej_s:
+                _add_labels_layer(
+                    viewer, rej_s, rej_c, canvas_shape,
+                    name=f"[s1 rejected] {cid}", visible=False,
+                    opacity=0.5, outline_width=outline_width,
+                )
+                print(f"[s1 rejected] {cid}: {len(rej_s)} boxes (hidden)")
 
     # ── [s3] Saved z-linked tracks ────────────────────────────────────────────
     if stage_cfg in ('all', 's3'):
         for ch in routing_config:
             cid    = ch['id']
             ch_csv = os.path.join(s3_dir, f"{cid}_3d_tracked.csv")
-            shapes, colors, meta = _load_global_csv_to_tile_shapes(
+            (shapes, colors, meta), (rej_s, rej_c, _) = _load_global_csv_to_tile_shapes(
                 ch_csv, tile_name, tile_x0, tile_y0, tile_z0,
                 z_range, canvas_w, canvas_h,
-                raw_vol=raw_vols.get(cid), filt=filter_cfg.get(cid))
+                raw_vol=raw_vols.get(cid), filt=_get_ch_filter(filter_cfg, ch))
             if shapes:
                 layer_name_s3 = f"[s3] {cid}"
                 _add_labels_layer(
@@ -1296,6 +1376,13 @@ def _run_post(vis_cfg, config, paths, routing_config):
                 print(f"[s3] {cid}: {len(shapes)} z-linked cells")
             else:
                 print(f"[s3] {cid}: no cells in tile/z-range  ({ch_csv})")
+            if rej_s:
+                _add_labels_layer(
+                    viewer, rej_s, rej_c, canvas_shape,
+                    name=f"[s3 rejected] {cid}", visible=False,
+                    opacity=0.5, outline_width=outline_width,
+                )
+                print(f"[s3 rejected] {cid}: {len(rej_s)} boxes (hidden)")
 
     # ── [s4] Colocalization result ────────────────────────────────────────────
     if stage_cfg in ('all', 's4'):
