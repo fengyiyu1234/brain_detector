@@ -62,8 +62,9 @@ if __name__ == '__main__':
 
     derived = {}
     derived['pATH_ALIGN_OFFSETS'] = os.path.join(base_res_path, "0_channel_alignment")
-    derived['pATH_DET_RES'] = os.path.join(base_res_path, "1_tile_2d_raw")
-    derived['pATH_GLOBAL_2D'] = os.path.join(base_res_path, "2_global_2d_raw")
+    derived['pATH_DET_RES']      = os.path.join(base_res_path, "1_tile_2d_raw")
+    derived['pATH_DET_FILTERED'] = os.path.join(base_res_path, "1_tile_2d_filtered")
+    derived['pATH_GLOBAL_2D']    = os.path.join(base_res_path, "2_global_2d_raw")
     derived['pATH_CHANNEL_3D']    = os.path.join(base_res_path, "3_channel_3d")
     derived['pATH_COLOCALIZATION'] = os.path.join(base_res_path, "4_colocalization")
     derived['pATH_REPORT'] = os.path.join(base_res_path, "5_analysis_report")
@@ -305,10 +306,73 @@ if __name__ == '__main__':
             open(align_done_flag, 'w').close()
             logging.info("✔️ [2.5] 所有 Tile 点云对齐完成。")
 
-    # 决定 Phase 3 读取哪个 CSV 根目录
-    pATH_SRC_CSV = (derived['pATH_ALIGN_OFFSETS']
-                    if pipeline_mode == 'pre_align'
-                    else derived['pATH_DET_RES'])
+    # ==========================================
+    # 阶段 2.75: Tile 级 CSV 强度/尺寸过滤
+    # 输入: 1_tile_2d_raw (post_align) 或 0_channel_alignment (pre_align)
+    # 输出: 1_tile_2d_filtered  (Stage 3 从此读取)
+    # 修改过滤参数后删除 1_tile_2d_filtered 即可重跑，无需重新检测
+    # ==========================================
+    _filter_src = (derived['pATH_ALIGN_OFFSETS']
+                   if pipeline_mode == 'pre_align'
+                   else derived['pATH_DET_RES'])
+    _filter_dst = derived['pATH_DET_FILTERED']
+
+    _tile_names_all = [os.path.split(p)[-1] for p in pATHTILE_all]
+    _filter_done = all(
+        os.path.exists(os.path.join(_filter_dst, f"{tn}_{ch['id']}_result.csv"))
+        for tn in _tile_names_all
+        for ch in routing_config
+        if os.path.exists(os.path.join(_filter_src, f"{tn}_{ch['id']}_result.csv"))
+    )
+
+    if _filter_done:
+        logging.info("✔️ Checkpoint 2.75 达成: 过滤后 tile CSV 已全部存在。")
+    else:
+        logging.info("阶段 2.75: 对 tile CSV 应用强度/尺寸过滤...")
+        _sd_dp   = dp.get('stardist', {})
+        _yolo_dp = dp.get('yolo', {})
+        _n_filtered_total = 0
+        for _tn in tqdm(_tile_names_all, desc="Filter tiles"):
+            for _ch in routing_config:
+                _ch_id   = _ch['id']
+                _in_csv  = os.path.join(_filter_src, f"{_tn}_{_ch_id}_result.csv")
+                _out_csv = os.path.join(_filter_dst, f"{_tn}_{_ch_id}_result.csv")
+                if not os.path.exists(_in_csv) or os.path.exists(_out_csv):
+                    continue
+                _model_dp = _sd_dp if _ch['model'] == 'stardist' else _yolo_dp
+                _df = pd.read_csv(_in_csv)
+                _n_before = len(_df)
+                if not _df.empty:
+                    _bbox_min      = _model_dp.get('bbox_min')
+                    _bbox_max      = _model_dp.get('bbox_max')
+                    _area_pct_min  = _model_dp.get('bbox_area_pct_min')
+                    _pct_min       = _model_dp.get('bbox_mean_pct_min')
+                    _abs_min       = (_model_dp.get('bbox_mean_min') or
+                                      _model_dp.get('nucleus_mean_min', 0)) or 0
+                    # 1. 绝对尺寸
+                    if _bbox_min is not None:
+                        _df = _df[(_df['x2'] - _df['x1'] >= _bbox_min) &
+                                  (_df['y2'] - _df['y1'] >= _bbox_min)]
+                    if _bbox_max is not None:
+                        _df = _df[(_df['x2'] - _df['x1'] <= _bbox_max) &
+                                  (_df['y2'] - _df['y1'] <= _bbox_max)]
+                    # 2. 面积百分位（在通过绝对尺寸过滤的子集上计算）
+                    if _area_pct_min is not None and not _df.empty:
+                        _areas  = (_df['x2'] - _df['x1']) * (_df['y2'] - _df['y1'])
+                        _thresh = float(_areas.quantile(_area_pct_min / 100.0))
+                        _df = _df[_areas >= _thresh]
+                    # 3. 亮度百分位（在通过面积过滤的子集上计算）
+                    if _pct_min is not None and not _df.empty:
+                        _thresh = float(_df['mean'].quantile(_pct_min / 100.0))
+                        _df = _df[_df['mean'] >= _thresh]
+                    # 4. 亮度绝对下限
+                    if _abs_min > 0:
+                        _df = _df[_df['mean'] >= _abs_min]
+                _df.to_csv(_out_csv, index=False)
+                _n_filtered_total += _n_before - len(_df)
+        logging.info(f"✔️ [2.75] Tile 过滤完成，共移除 {_n_filtered_total:,} 个 box。")
+
+    pATH_SRC_CSV = _filter_dst
 
     # ==========================================
     # 阶段 3: 线性 Checkpoint - 全局拼接与 Z-Linker共定位

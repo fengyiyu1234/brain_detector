@@ -94,48 +94,14 @@ def calculate_ioa(box_nuc, box_soma):
 
 
 
-def _write_filtered_detections(det_buf, csv_writers, dp, ch_model_map):
-    """Apply per-tile intensity (percentile or absolute) and size filters, then write CSV.
+def _write_filtered_detections(det_buf, csv_writers, dp, ch_routing_map):
+    """Write all detections to CSV without filtering.
 
-    Config keys (under detection_params):
-      yolo sub-dict:    bbox_min, bbox_max, bbox_mean_pct_min, bbox_mean_min
-      stardist sub-dict: bbox_min, bbox_max, bbox_mean_pct_min, nucleus_mean_min
-    bbox_mean_pct_min=20 keeps the top 80% brightest boxes (filters bottom 20%).
-    bbox_min/bbox_max apply to both width and height.
+    Filtering is a separate stage in run_inference.py (Stage 2.75) that reads
+    these raw CSVs and writes filtered copies to 1_tile_2d_filtered/.
+    dp and ch_routing_map are kept for API compatibility but are unused.
     """
-    sd_dp   = dp.get('stardist', {})
-    yolo_dp = dp.get('yolo', {})
     for ch_id, rows in det_buf.items():
-        if not rows:
-            continue
-        model = ch_model_map.get(ch_id, 'yolo')
-        if model == 'stardist':
-            pct_min  = sd_dp.get('bbox_mean_pct_min', None)
-            abs_min  = sd_dp.get('nucleus_mean_min', 0) or 0
-            bbox_min = sd_dp.get('bbox_min', None)
-            bbox_max = sd_dp.get('bbox_max', None)
-        else:
-            pct_min  = yolo_dp.get('bbox_mean_pct_min', None)
-            abs_min  = yolo_dp.get('bbox_mean_min', 0) or 0
-            bbox_min = yolo_dp.get('bbox_min', None)
-            bbox_max = yolo_dp.get('bbox_max', None)
-
-        # Percentile filter: computed across all detections in the tile
-        if pct_min is not None:
-            means = [r[7] for r in rows]
-            threshold = float(np.percentile(means, pct_min))
-            rows = [r for r in rows if r[7] >= threshold]
-
-        # Absolute mean floor
-        if abs_min > 0:
-            rows = [r for r in rows if r[7] >= abs_min]
-
-        # Bounding-box size range (applies to both w and h): row layout [name, x1, y1, x2, y2, ...]
-        if bbox_min is not None or bbox_max is not None:
-            rows = [r for r in rows
-                    if (bbox_min is None or (r[3] - r[1] >= bbox_min and r[4] - r[2] >= bbox_min))
-                    and (bbox_max is None or (r[3] - r[1] <= bbox_max and r[4] - r[2] <= bbox_max))]
-
         for row in rows:
             csv_writers[ch_id].writerow(row)
 
@@ -268,8 +234,8 @@ def process_single_tile(i, pATHTEST, config):
         PREFETCH_DEPTH = 8  # 预取深度：降低以减少内存峰值压力
         prefetch_futures = {}
 
-        det_buf       = {ch['id']: [] for ch in channels_to_run}
-        ch_model_map  = {ch['id']: ch['model'] for ch in channels_to_run}
+        det_buf        = {ch['id']: [] for ch in channels_to_run}
+        ch_routing_map = {ch['id']: ch for ch in channels_to_run}
 
         with ThreadPoolExecutor(max_workers=16) as downloader_pool:
 
@@ -407,7 +373,7 @@ def process_single_tile(i, pATHTEST, config):
                 pbar.update(1)
 
         # --- 3. Per-tile filter and write ---
-        _write_filtered_detections(det_buf, csv_writers, dp, ch_model_map)
+        _write_filtered_detections(det_buf, csv_writers, dp, ch_routing_map)
 
     finally:
         for f in file_handles.values():
