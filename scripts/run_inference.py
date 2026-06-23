@@ -368,6 +368,39 @@ if __name__ == '__main__':
                     # 4. 亮度绝对下限
                     if _abs_min > 0:
                         _df = _df[_df['mean'] >= _abs_min]
+                    # 5. Per-z-slice IoMin containment NMS（抑制大框套小框的重复检测）
+                    _containment_thresh = _model_dp.get('nms_containment_thresh', None)
+                    if _containment_thresh is not None and not _df.empty:
+                        _keep_mask = np.ones(len(_df), dtype=bool)
+                        _df_reset = _df.reset_index(drop=True)
+                        for _z_val in _df_reset['z'].unique():
+                            _z_mask = (_df_reset['z'] == _z_val).values
+                            _idx    = np.where(_z_mask)[0]
+                            _x1 = _df_reset['x1'].values[_idx].astype(float)
+                            _y1 = _df_reset['y1'].values[_idx].astype(float)
+                            _x2 = _df_reset['x2'].values[_idx].astype(float)
+                            _y2 = _df_reset['y2'].values[_idx].astype(float)
+                            _sc = _df_reset['score'].values[_idx].astype(float)
+                            _ar = np.maximum(0, _x2 - _x1) * np.maximum(0, _y2 - _y1)
+                            _order      = np.argsort(-_sc)
+                            _local_keep = np.ones(len(_idx), dtype=bool)
+                            for _ki in range(len(_order)):
+                                _i = _order[_ki]
+                                if not _local_keep[_i]:
+                                    continue
+                                _rest = _order[_ki + 1:]
+                                _rest = _rest[_local_keep[_rest]]
+                                if len(_rest) == 0:
+                                    continue
+                                _ix1   = np.maximum(_x1[_i], _x1[_rest])
+                                _iy1   = np.maximum(_y1[_i], _y1[_rest])
+                                _ix2   = np.minimum(_x2[_i], _x2[_rest])
+                                _iy2   = np.minimum(_y2[_i], _y2[_rest])
+                                _inter = np.maximum(0, _ix2 - _ix1) * np.maximum(0, _iy2 - _iy1)
+                                _iomin = _inter / (np.minimum(_ar[_i], _ar[_rest]) + 1e-6)
+                                _local_keep[_rest[_iomin > _containment_thresh]] = False
+                            _keep_mask[_idx[~_local_keep]] = False
+                        _df = _df[_keep_mask]
                 _df.to_csv(_out_csv, index=False)
                 _n_filtered_total += _n_before - len(_df)
         logging.info(f"✔️ [2.75] Tile 过滤完成，共移除 {_n_filtered_total:,} 个 box。")
@@ -545,8 +578,9 @@ if __name__ == '__main__':
                      f"(多阳性 {n_multi}, 单阳性 {n_single})")
 
         # Phase B: soma × TF 严格包含标注（TF框必须完全在soma框内）
-        xy_margin    = zl_tf.get('containment_xy_margin', 0)
-        z_pad_tf     = zl_tf.get('containment_z_pad', 2)
+        xy_margin          = zl_tf.get('containment_xy_margin', 0)
+        z_pad_tf           = zl_tf.get('containment_z_pad', 2)
+        max_center_dist    = zl_tf.get('max_center_dist_ratio', 0.5)
         tf_bbox_max_w = zl_tf.get('bbox_max_w', None)
         tf_bbox_max_h = zl_tf.get('bbox_max_h', None)
         for cid in tf_ch_ids:
@@ -562,7 +596,8 @@ if __name__ == '__main__':
                              f"(bbox_max_w={tf_bbox_max_w}, bbox_max_h={tf_bbox_max_h})")
             if tf_vols and merged_soma_vols:
                 merged_soma_vols = annotate_soma_with_tf_containment(
-                    merged_soma_vols, tf_vols, z_pad=z_pad_tf, xy_margin=xy_margin
+                    merged_soma_vols, tf_vols, z_pad=z_pad_tf, xy_margin=xy_margin,
+                    max_center_dist_ratio=max_center_dist
                 )
                 logging.info(f"✔️ [3B] [{cid}] TF containment 标注完成")
         n_tf_annotated = sum(

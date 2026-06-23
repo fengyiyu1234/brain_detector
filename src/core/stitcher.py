@@ -641,11 +641,14 @@ def annotate_soma_with_tf_gmm(soma_vol_list, tf_vol_list, p_thresh=0.5):
     return soma_vol_list
 
 
-def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_margin=0):
+def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_margin=0,
+                                       max_center_dist_ratio=0.5):
     """
     Annotate soma cells with TF markers using strict 3D bbox containment.
     A TF is colocalized only if its 3D bounding box is fully enclosed within
-    a soma's 3D bounding box (with optional xy_margin and z_pad tolerance).
+    a soma's 3D bounding box (with optional xy_margin and z_pad tolerance),
+    AND its centroid is within max_center_dist_ratio * soma_radius of the soma center.
+    When multiple somas contain the same TF, the closest one wins.
     """
     if not soma_vol_list or not tf_vol_list:
         return soma_vol_list
@@ -665,7 +668,6 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
         tf_pt = np.array([tf['cx'], tf['cy'], tf['cz']], dtype=float)
         tf_marker = tf['class'].split('_')[-1]
 
-        # Query candidate somas within reach — use max soma radius as search bound
         candidate_idxs = tree.query_ball_point(tf_pt, r=max_radius * 2)
 
         best_dist, best_idx = float('inf'), None
@@ -681,10 +683,14 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
                 s['z_min'] - z_pad <= tf['z_min'] and
                 tf['z_max'] <= s['z_max'] + z_pad
             )
-            if contained_xy and contained_z:
-                dist = float(np.linalg.norm(soma_arr[idx] - tf_pt))
-                if dist < best_dist:
-                    best_dist, best_idx = dist, idx
+            if not (contained_xy and contained_z):
+                continue
+            dist = float(np.linalg.norm(soma_arr[idx] - tf_pt))
+            # Hard gate: nucleus centroid must be near soma center, not just inside bbox
+            if dist > max_center_dist_ratio * soma_radii[idx]:
+                continue
+            if dist < best_dist:
+                best_dist, best_idx = dist, idx
 
         if best_idx is not None:
             soma_markers[best_idx].add(tf_marker)
@@ -841,7 +847,7 @@ def stitchDetection(detections, H=None, W=None, xsize=None, ysize=None, step=Non
     return non_max_suppression_iou(boxes, overlapThresh=0.4, sort_idx=4)
 
 
-def non_max_suppression_iou(boxes, overlapThresh=0.45, sort_idx=4):
+def non_max_suppression_iou(boxes, overlapThresh=0.45, sort_idx=4, containment_thresh=None):
     if len(boxes) == 0:
         return []
 
@@ -869,9 +875,15 @@ def non_max_suppression_iou(boxes, overlapThresh=0.45, sort_idx=4):
         w   = np.maximum(0, xx2 - xx1)
         h   = np.maximum(0, yy2 - yy1)
         inter_area = w * h
-        iou = inter_area / (area[i] + area[idxs[:last]] - inter_area + 1e-6)
+        iou        = inter_area / (area[i] + area[idxs[:last]] - inter_area + 1e-6)
+        suppress   = iou > overlapThresh
+        if containment_thresh is not None:
+            # IoMin = inter / min(area_i, area_j): equals 1.0 when the smaller box is
+            # fully inside the larger box, catching nested detections that IoU misses.
+            iomin    = inter_area / (np.minimum(area[i], area[idxs[:last]]) + 1e-6)
+            suppress = suppress | (iomin > containment_thresh)
 
-        idxs = np.delete(idxs, np.concatenate(([last], np.where(iou > overlapThresh)[0])))
+        idxs = np.delete(idxs, np.concatenate(([last], np.where(suppress)[0])))
 
     return boxes[pick]
 
