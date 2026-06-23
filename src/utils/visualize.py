@@ -271,6 +271,12 @@ def _filter_df_by_size_and_intensity(x1, y1, x2, y2, z_col, raw_vol, filt):
         keep &= (x2 - x1) <= bbox_max
         keep &= (y2 - y1) <= bbox_max
 
+    aspect_max = filt.get('bbox_max_aspect_ratio')
+    if aspect_max is not None:
+        w = x2 - x1
+        h = y2 - y1
+        keep &= np.maximum(w, h) <= aspect_max * np.maximum(np.minimum(w, h), 1e-6)
+
     area_pct_min = filt.get('bbox_area_pct_min')
     if area_pct_min is not None:
         areas = (x2 - x1) * (y2 - y1)
@@ -457,7 +463,8 @@ def _get_tile_overlap_margins(channel_dir, tile_name, canvas_w, canvas_h):
 
 # ── CSV → shapes ──────────────────────────────────────────────────────────────
 
-def _load_tile_csv_shapes(csv_path, z_range=None, raw_vol=None, filt=None):
+def _load_tile_csv_shapes(csv_path, z_range=None, raw_vol=None, filt=None,
+                           left_margin=0, top_margin=0):
     """Load a tile-local detection CSV (1-indexed z) → napari shapes.
 
     raw_vol: optional float32 (Z,H,W) with 16-bit values for intensity filtering.
@@ -523,6 +530,15 @@ def _load_tile_csv_shapes(csv_path, z_range=None, raw_vol=None, filt=None):
     else:
         means    = df['mean'].values.astype(float) if 'mean' in df.columns else np.zeros(n_before)
         rej_data = _empty
+    # Margin filter: hide boxes whose center falls in the left/top tile overlap region
+    if left_margin > 0 or top_margin > 0:
+        cx = (x1 + x2) / 2; cy = (y1 + y2) / 2
+        m_keep = (cx >= left_margin) & (cy >= top_margin)
+        x1, y1, x2, y2 = x1[m_keep], y1[m_keep], x2[m_keep], y2[m_keep]
+        z_col = z_col[m_keep]; means = means[m_keep]
+        df = df.iloc[np.where(m_keep)[0].tolist()]
+    if len(df) == 0:
+        return _empty, rej_data
     n = len(df)
     arr = np.empty((n, 4, 3), dtype=np.float64)
     arr[:, 0] = np.column_stack([z_col, y1, x1])
@@ -541,7 +557,8 @@ def _load_tile_csv_shapes(csv_path, z_range=None, raw_vol=None, filt=None):
 
 def _load_global_csv_to_tile_shapes(csv_path, tile_name, tile_x0, tile_y0, tile_z0,
                                      z_range, canvas_w, canvas_h,
-                                     raw_vol=None, filt=None):
+                                     raw_vol=None, filt=None,
+                                     left_margin=0, top_margin=0):
     """Load a global 3D CSV (absolute x,y; tile-local 1-indexed z) → tile-local shapes.
 
     Filters by tile_name column if present, otherwise by spatial bounding box.
@@ -616,6 +633,16 @@ def _load_global_csv_to_tile_shapes(csv_path, tile_name, tile_x0, tile_y0, tile_
     else:
         means    = df['mean'].values.astype(float) if 'mean' in df.columns else np.zeros(n_before)
         rej_data = _empty
+    # Margin filter: hide boxes whose center falls in the left/top tile overlap region
+    # x1/y1/x2/y2 are already tile-local (tile_x0/y0 subtracted above)
+    if left_margin > 0 or top_margin > 0:
+        cx = (x1 + x2) / 2; cy = (y1 + y2) / 2
+        m_keep = (cx >= left_margin) & (cy >= top_margin)
+        x1, y1, x2, y2 = x1[m_keep], y1[m_keep], x2[m_keep], y2[m_keep]
+        z = z[m_keep]; means = means[m_keep]
+        df = df.iloc[np.where(m_keep)[0].tolist()]
+    if len(df) == 0:
+        return _empty, rej_data
     n = len(df)
     arr = np.empty((n, 4, 3), dtype=np.float64)
     arr[:, 0] = np.column_stack([z, y1, x1])
@@ -646,7 +673,8 @@ def _auto_coloc_groups(coloc_csv, outline_width=4, dash_size=8):
 
 def _load_coloc_s4_shapes(coloc_csv, tile_name, z_range, s4_groups,
                            tile_x0=0, tile_y0=0, tile_z0=0,
-                           canvas_w=None, canvas_h=None):
+                           canvas_w=None, canvas_h=None,
+                           left_margin=0, top_margin=0):
     if not os.path.isfile(coloc_csv):
         return None
     df = pd.read_csv(coloc_csv)
@@ -712,6 +740,20 @@ def _load_coloc_s4_shapes(coloc_csv, tile_name, z_range, s4_groups,
         y2v = df_grp['y2'].values.astype(float) - tile_y0
         x1v = df_grp['x1'].values.astype(float) - tile_x0
         x2v = df_grp['x2'].values.astype(float) - tile_x0
+        # Margin filter on tile-local coordinates
+        if left_margin > 0 or top_margin > 0:
+            cx = (x1v + x2v) / 2; cy = (y1v + y2v) / 2
+            m_keep = (cx >= left_margin) & (cy >= top_margin)
+            z_col  = z_col[m_keep]
+            y1v, y2v = y1v[m_keep], y2v[m_keep]
+            x1v, x2v = x1v[m_keep], x2v[m_keep]
+            bc       = bc.iloc[np.where(m_keep)[0].tolist()]
+            df_grp   = df_grp.iloc[np.where(m_keep)[0].tolist()]
+        if len(df_grp) == 0:
+            results.append((grp, [], [], [], []))
+            continue
+        n = len(df_grp)
+        arr = np.empty((n, 4, 3), dtype=np.float64)
         arr[:, 0] = np.column_stack([z_col, y1v, x1v])
         arr[:, 1] = np.column_stack([z_col, y1v, x2v])
         arr[:, 2] = np.column_stack([z_col, y2v, x2v])
@@ -730,7 +772,8 @@ def _load_coloc_s4_shapes(coloc_csv, tile_name, z_range, s4_groups,
 
 def _add_coloc_layers(viewer, coloc_csv, tile_name, z_range,
                        tile_x0, tile_y0, tile_z0, canvas_shape,
-                       coloc_opacity, outline_width, box_registry=None):
+                       coloc_opacity, outline_width, box_registry=None,
+                       left_margin=0, top_margin=0):
     """Auto-detect all marker combinations from coloc_result.csv and add layers."""
     groups = _auto_coloc_groups(coloc_csv, outline_width=outline_width, dash_size=8)
     if groups is None:
@@ -747,6 +790,7 @@ def _add_coloc_layers(viewer, coloc_csv, tile_name, z_range,
         coloc_csv, tile_name, z_range, groups,
         tile_x0=tile_x0, tile_y0=tile_y0, tile_z0=tile_z0,
         canvas_w=canvas_w, canvas_h=canvas_h,
+        left_margin=left_margin, top_margin=top_margin,
     )
     if not grp_results:
         return
@@ -1064,6 +1108,9 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
         _plot_intensity_histograms(ch_means, tile_name=tile_name, out_dir=base_res)
 
     # ── [aligned] & [raw] boxes ───────────────────────────────────────────────
+    left_m, top_m = _get_tile_overlap_margins(anchor_dir, tile_name, canvas_w, canvas_h)
+    if left_m > 0 or top_m > 0:
+        print(f"[overlap] hiding boxes in left={left_m}px / top={top_m}px margin")
     for ch in routing_config:
         cid     = ch['id']
         iou_str = (f"  iou={offsets[cid]['iou_score']:.3f}" if cid in offsets else "")
@@ -1073,7 +1120,8 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
         ch_filt = _get_ch_filter(filter_cfg, ch)
         (shapes_a, colors_a, meta_a), (rej_sa, rej_ca, _) = _load_tile_csv_shapes(
             aligned_csv, z_range,
-            raw_vol=raw_vols.get(cid), filt=ch_filt)
+            raw_vol=raw_vols.get(cid), filt=ch_filt,
+            left_margin=left_m, top_margin=top_m)
         if shapes_a:
             layer_name_a = f"[aligned] {cid}{iou_str}"
             _add_labels_layer(
@@ -1095,7 +1143,8 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
             raw_csv = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
             (shapes_r, colors_r, meta_r), _ = _load_tile_csv_shapes(
                 raw_csv, z_range,
-                raw_vol=raw_vols.get(cid), filt=ch_filt)
+                raw_vol=raw_vols.get(cid), filt=ch_filt,
+                left_margin=left_m, top_margin=top_m)
             if shapes_r:
                 layer_name_r = f"[raw] {cid}"
                 _add_labels_layer(
@@ -1171,6 +1220,7 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
                 viewer, coloc_csv, tile_name, z_range,
                 tile_x0, tile_y0, tile_z0, canvas_shape,
                 coloc_opacity, outline_width, box_registry=box_registry,
+                left_margin=left_m, top_margin=top_m,
             )
         else:
             print("\n[coloc] coloc_result.csv not found, running in-memory...")
@@ -1206,7 +1256,6 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
                 print(f"[coloc] WARNING: in-memory coloc failed — {exc}")
 
         # ── Overlap suppression overlay ───────────────────────────────────────
-        left_m, top_m = _get_tile_overlap_margins(anchor_dir, tile_name, canvas_w, canvas_h)
         if left_m > 0 or top_m > 0:
             ovl = np.zeros((canvas_z, canvas_h, canvas_w), dtype=np.uint8)
             if left_m > 0: ovl[:, :, :left_m] = 255
@@ -1329,6 +1378,11 @@ def _run_post(vis_cfg, config, paths, routing_config):
             viewer.add_image(vol, name=f"[img] {cid}", **_ch_vis(cid))
             print(f"  → {vol.shape}")
 
+    # ── Overlap margins (hide inaccurate boxes in left/top tile boundaries) ──────
+    left_m, top_m = _get_tile_overlap_margins(anchor_dir, tile_name, canvas_w, canvas_h)
+    if left_m > 0 or top_m > 0:
+        print(f"[overlap] hiding boxes in left={left_m}px / top={top_m}px margin")
+
     # ── [s1] Raw 2D detections ────────────────────────────────────────────────
     if stage_cfg in ('all', 's1'):
         for ch in routing_config:
@@ -1336,7 +1390,8 @@ def _run_post(vis_cfg, config, paths, routing_config):
             csv_p = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
             (shapes, colors, meta), (rej_s, rej_c, _) = _load_tile_csv_shapes(
                 csv_p, z_range,
-                raw_vol=raw_vols.get(cid), filt=_get_ch_filter(filter_cfg, ch))
+                raw_vol=raw_vols.get(cid), filt=_get_ch_filter(filter_cfg, ch),
+                left_margin=left_m, top_margin=top_m)
             if shapes:
                 layer_name_s1 = f"[s1] {cid}"
                 _add_labels_layer(
@@ -1363,7 +1418,8 @@ def _run_post(vis_cfg, config, paths, routing_config):
             (shapes, colors, meta), (rej_s, rej_c, _) = _load_global_csv_to_tile_shapes(
                 ch_csv, tile_name, tile_x0, tile_y0, tile_z0,
                 z_range, canvas_w, canvas_h,
-                raw_vol=raw_vols.get(cid), filt=_get_ch_filter(filter_cfg, ch))
+                raw_vol=raw_vols.get(cid), filt=_get_ch_filter(filter_cfg, ch),
+                left_margin=left_m, top_margin=top_m)
             if shapes:
                 layer_name_s3 = f"[s3] {cid}"
                 _add_labels_layer(
@@ -1390,6 +1446,7 @@ def _run_post(vis_cfg, config, paths, routing_config):
             viewer, coloc_csv, tile_name, z_range,
             tile_x0, tile_y0, tile_z0, canvas_shape,
             coloc_opacity, outline_width, box_registry=box_registry,
+            left_margin=left_m, top_margin=top_m,
         )
 
     # ── Click-to-inspect box size ─────────────────────────────────────────────
