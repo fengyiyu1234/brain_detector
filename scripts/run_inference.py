@@ -356,6 +356,12 @@ if __name__ == '__main__':
                     if _bbox_max is not None:
                         _df = _df[(_df['x2'] - _df['x1'] <= _bbox_max) &
                                   (_df['y2'] - _df['y1'] <= _bbox_max)]
+                    # 1b. 宽高比过滤
+                    _aspect_max = _model_dp.get('bbox_max_aspect_ratio')
+                    if _aspect_max is not None and not _df.empty:
+                        _w = (_df['x2'] - _df['x1']).values
+                        _h = (_df['y2'] - _df['y1']).values
+                        _df = _df[np.maximum(_w, _h) <= _aspect_max * np.maximum(np.minimum(_w, _h), 1e-6)]
                     # 2. 面积百分位（在通过绝对尺寸过滤的子集上计算）
                     if _area_pct_min is not None and not _df.empty:
                         _areas  = (_df['x2'] - _df['x1']) * (_df['y2'] - _df['y1'])

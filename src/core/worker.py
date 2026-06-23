@@ -94,14 +94,78 @@ def calculate_ioa(box_nuc, box_soma):
 
 
 
-def _write_filtered_detections(det_buf, csv_writers, dp, ch_routing_map):
-    """Write all detections to CSV without filtering.
+def _iomin_nms_rows(rows, containment_thresh):
+    """Suppress lower-score boxes whose center is almost fully inside a higher-score box.
 
-    Filtering is a separate stage in run_inference.py (Stage 2.75) that reads
-    these raw CSVs and writes filtered copies to 1_tile_2d_filtered/.
-    dp and ch_routing_map are kept for API compatibility but are unused.
+    rows: list of [name, x1, y1, x2, y2, class_str, score, mean, z]
+    Only boxes with IoMin > containment_thresh are suppressed (IoMin = inter / min_area).
     """
+    if len(rows) < 2:
+        return rows
+
+    # group by z so we only compare detections on the same slice
+    z_to_indices = {}
+    for idx, row in enumerate(rows):
+        z = row[8]
+        z_to_indices.setdefault(z, []).append(idx)
+
+    keep_mask = [True] * len(rows)
+
+    for indices in z_to_indices.values():
+        if len(indices) < 2:
+            continue
+        z_rows = [rows[i] for i in indices]
+        n = len(z_rows)
+        x1 = np.array([r[1] for r in z_rows], dtype=np.float32)
+        y1 = np.array([r[2] for r in z_rows], dtype=np.float32)
+        x2 = np.array([r[3] for r in z_rows], dtype=np.float32)
+        y2 = np.array([r[4] for r in z_rows], dtype=np.float32)
+        scores = np.array([r[6] for r in z_rows], dtype=np.float32)
+        areas = (x2 - x1) * (y2 - y1)
+
+        order = np.argsort(-scores)  # highest score first
+        suppressed = np.zeros(n, dtype=bool)
+
+        for i in range(n):
+            ai = order[i]
+            if suppressed[ai]:
+                continue
+            for j in range(i + 1, n):
+                aj = order[j]
+                if suppressed[aj]:
+                    continue
+                ix1 = max(x1[ai], x1[aj])
+                iy1 = max(y1[ai], y1[aj])
+                ix2 = min(x2[ai], x2[aj])
+                iy2 = min(y2[ai], y2[aj])
+                inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                if inter == 0.0:
+                    continue
+                iomin = inter / (min(areas[ai], areas[aj]) + 1e-6)
+                if iomin > containment_thresh:
+                    suppressed[aj] = True  # suppress lower-score (smaller) box
+
+        for local_idx, global_idx in enumerate(indices):
+            if suppressed[local_idx]:
+                keep_mask[global_idx] = False
+
+    return [row for i, row in enumerate(rows) if keep_mask[i]]
+
+
+def _write_filtered_detections(det_buf, csv_writers, dp, ch_routing_map):
+    """Write detections to CSV, applying per-z IoMin NMS for YOLO channels if configured.
+
+    IoMin NMS removes boxes that are almost entirely contained within a higher-confidence
+    box (IoMin > nms_containment_thresh).  Stage 2.75 applies the same filter to already-
+    detected samples so both paths produce consistent output.
+    """
+    yolo_dp = dp.get('yolo', {})
+    containment_thresh = yolo_dp.get('nms_containment_thresh', None)
+
     for ch_id, rows in det_buf.items():
+        ch = ch_routing_map.get(ch_id, {})
+        if containment_thresh is not None and ch.get('model', '').lower() == 'yolo':
+            rows = _iomin_nms_rows(rows, containment_thresh)
         for row in rows:
             csv_writers[ch_id].writerow(row)
 
