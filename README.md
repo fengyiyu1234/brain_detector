@@ -1,7 +1,7 @@
 # brain_detector
 
 Light-sheet microscopy pipeline for 3D brain cell detection and multi-channel colocalization.
-Designed for 0.65 × 0.65 × 8 µm/pixel tile-based acquisitions.
+Designed for 0.65 × 0.65 × 8 µm/pixel tile-based acquisitions (TeraStitcher format).
 
 ---
 
@@ -10,31 +10,28 @@ Designed for 0.65 × 0.65 × 8 µm/pixel tile-based acquisitions.
 ```text
 brain_detector/
 ├── config/
-│   └── config.json               # Global configuration (paths, model params, pipeline mode)
+│   ├── config.json               # Main pipeline config (paths, model params, pipeline mode)
+│   └── vis/
+│       └── vis_config.json       # Visualization config (napari viewer settings)
 ├── models/
-│   ├── custom_nuclei_model       # YOLO soma detector
-│   └── nuclei_model_0515         # Cellpose TF/nucleus detector
+│   ├── train18_best_0515.pt      # YOLO soma detector
+│   └── 2D_versatile_fluo/        # StarDist TF nucleus detector
 ├── scripts/
 │   └── run_inference.py          # Main pipeline entrypoint
 ├── src/
 │   ├── config/
-│   │   └── loader.py             # JSON config loader (strips comments)
+│   │   └── loader.py             # JSON config loader (strips // comments)
 │   ├── core/
-│   │   ├── worker.py             # Per-tile parallel inference (YOLO + Cellpose)
-│   │   ├── stitcher.py           # Global 2D stitching, soma merge, 3D colocalization
-│   │   ├── z_linker.py           # Z-axis deduplication (Hungarian matching)
+│   │   ├── worker.py             # Per-tile parallel inference (YOLO + StarDist)
+│   │   ├── stitcher.py           # Global stitching, soma merge, 3D colocalization
+│   │   ├── z_linker.py           # Z-axis tracking (Hungarian matching)
 │   │   └── point_cloud_aligner.py# Pre-align mode: point-cloud-based channel alignment
 │   └── utils/
 │       ├── io.py                 # Tile listing, TeraStitcher XML parsing
 │       ├── image.py              # Normalization, patch inference
-│       ├── geometry.py           # IoU, centroid utilities
 │       ├── logger.py             # Logging setup
-│       ├── visualize.py          # Napari multi-tile result viewer (post-align)
-│       └── visualize_prealign.py # Napari single-tile alignment inspector (pre-align)
-├── requirements.txt              # Base packages (macOS + HPC shared)
-├── requirements-local.txt        # macOS visualization environment
-├── requirements-hpc.txt          # HPC Linux GPU inference environment
-├── environment.yml               # Conda environment (Python 3.10)
+│       ├── visualize.py          # Napari result viewer
+│       └── vis_stitched.py       # Stitched volume visualization helpers
 └── README.md
 ```
 
@@ -43,90 +40,81 @@ brain_detector/
 ## Pipeline Modes
 
 ### `post_align` (default)
-Runs on images already aligned by numorph + TeraStitcher. Reads per-channel aligned directories → detects → global stitching → Z-linking → colocalization.
+Runs on images already aligned by numorph + TeraStitcher. Reads per-channel aligned tile directories → detects → global stitching → Z-linking → colocalization.
 
 ### `pre_align`
-Runs on raw unaligned images. After per-tile detection, inserts a **Phase 2.5** point-cloud alignment step that computes per-tile XYZ channel offsets (replacing numorph), then continues with the same downstream pipeline.
+Runs on raw unaligned images. After per-tile detection, inserts a **Stage 2.5** point-cloud alignment step that computes per-tile XYZ channel offsets (replacing numorph), then continues with the same downstream pipeline.
 
 Two-step alignment strategy:
 ```
-Step 1a: align secondary soma channels → reference soma (RFP)
-Step 1b: align secondary TF channels  → reference TF (Sox9)
-Step 2:  align reference TF (Sox9)    → reference soma (RFP)
+Step 1a: align secondary soma channels (GFP) → reference soma (RFP)
+Step 1b: align secondary TF channels (Olig2) → reference TF (Sox9)
+Step 2:  align reference TF (Sox9)           → reference soma (RFP)
 
 Final offsets:
-  RFP:   (0, 0, 0)        ← global reference
+  RFP:   (0, 0, 0)              ← global reference
   GFP:   step-1a shift
   Sox9:  step-2 shift
-  Olig2: step-1b + step-2  ← chained
+  Olig2: step-1b shift + step-2 ← chained
 ```
 
-Z-search is soft-capped at ±5 slices (warning if exceeded) and hard-capped at ±10 (forced to 0 if exceeded).
+Z-search is soft-capped at ±5 slices (warning if exceeded) and hard-capped at ±10 (forced to 0).
 
 ---
 
-## Environment Setup
+## Pipeline Stages
 
-### macOS (visualization + development)
+| Stage | Description | Checkpoint (skip if exists) |
+|-------|-------------|----------------------------|
+| 2 | Per-tile detection (YOLO + StarDist), parallel per GPU | `1_tile_2d_raw/<tile>_<ch>_result.csv` |
+| 2.5 | Point-cloud channel alignment *(pre_align only)* | `0_channel_alignment/_align_done.flag` |
+| 2.75 | Per-tile bbox size/intensity filtering | `1_tile_2d_filtered/<tile>_<ch>_result.csv` |
+| 3 | Global stitching → Z-linking → 3D colocalization | `4_colocalization/coloc_result.csv` |
+| 4 | Per-class centroid files + summary statistics | `5_analysis_report/global_summary_statistics.csv` |
+| 5 | Colocalization permutation test | `5_analysis_report/colocalization_significance.csv` |
+
+Each stage is a **linear checkpoint**: if its output already exists, it is skipped automatically. To re-run a stage, delete its checkpoint file/folder.
+
+To re-run from Stage 3 only (e.g. after changing colocalization parameters), delete `4_colocalization/` and `5_analysis_report/`, then set `"start_from_stage": 3` in config.
+
+---
+
+## Running the Pipeline
+
 ```bash
-pip install -r requirements-local.txt
-```
+# Default config (config/config.json):
+python scripts/run_inference.py
 
-### HPC Linux (GPU inference)
-```bash
-# Check CUDA version first:
-nvcc --version    # or: nvidia-smi
-
-# CUDA 11.8:
-pip install -r requirements-hpc.txt
-
-# CUDA 12.1:
-pip install -r requirements-hpc.txt \
-    --extra-index-url https://download.pytorch.org/whl/cu121 \
-    torch==2.1.2+cu121 torchvision==0.16.2+cu121
-
-# CUDA 12.4:
-pip install -r requirements-hpc.txt \
-    --extra-index-url https://download.pytorch.org/whl/cu124 \
-    torch==2.1.2+cu124 torchvision==0.16.2+cu124
-```
-
-### Conda — macOS local
-```bash
-conda env create -f environment.yml
-conda activate brain_detector
-```
-
-### Conda — HPC Linux (CUDA)
-```bash
-# 1. Check HPC CUDA version:
-nvcc --version    # or: nvidia-smi
-
-# 2. Edit environment-hpc.yml — uncomment the block matching your CUDA version
-#    (default is CUDA 11.8; change to 12.1 or 12.4 if needed)
-
-# 3. Create the environment:
-conda env create -f environment-hpc.yml
-conda activate brain_detector
+# Custom config:
+python scripts/run_inference.py --config /path/to/config.json
 ```
 
 ---
 
 ## Configuration (`config/config.json`)
 
+> Config files support `//` line comments.
+
 ### `models`
 | Key | Description |
 |-----|-------------|
 | `yolo_path` | YOLO model weight path (relative to project root) |
-| `cellpose_path` | Cellpose model path (relative to project root) |
+| `stardist_basedir` | StarDist model root directory (relative to project root) |
+| `stardist_name` | StarDist model subdirectory name |
+
+### `model_classes`
+Maps YOLO output indices to class names. Currently `{"0": "neuron", "1": "glia"}`.
 
 ### `channels_routing`
-Array defining each channel's detection strategy:
-- `id`: channel name (e.g. `"RFP"`, `"Sox9"`)
-- `type`: `"soma"` → YOLO detection; `"tf"` → Cellpose nucleus detection
-- `model`: `"yolo"` or `"cellpose"`
-- `dir_key`: key in `paths` that points to this channel's tile directory
-- `active`: set `false` to skip a channel
+Array defining each channel's detection strategy. Order matters — the first entry is the anchor channel.
+
+| Field | Values | Description |
+|-------|--------|-------------|
+| `id` | e.g. `"RFP"` | Channel name, used as label prefix throughout |
+| `type` | `"soma"` / `"tf"` | `soma` → YOLO; `tf` → StarDist nucleus detection |
+| `model` | `"yolo"` / `"stardist"` | Inference backend |
+| `dir_key` | key in `paths` | Points to this channel's tile directory |
+| `active` | `true` / `false` | Set `false` to skip a channel entirely |
 
 ### `paths`
 | Key | Description |
@@ -134,53 +122,126 @@ Array defining each channel's detection strategy:
 | `rfp_dir`, `gfp_dir`, `sox9_dir`, `olig2_dir` | Per-channel tile root directories |
 | `pATHRESULT` | Output root directory |
 
-**HPC Linux paths**: SSH in and run `df -h | grep -i deep` to find the DeepDesign mount point, then use absolute paths (e.g. `/deepdesign/Fengyi/...`).
-
 ### `pipeline_mode`
 `"post_align"` (default) or `"pre_align"`. See [Pipeline Modes](#pipeline-modes).
 
-### `pre_align_params` (pre_align mode only)
+### `start_from_stage`
+| Value | Behavior |
+|-------|----------|
+| `1` | Full pipeline from scratch; scans tile directories over the network |
+| `2` | Skip network scan; infer tile list from existing CSVs in `1_tile_2d_raw/` |
+| `3` | Skip detection and filtering entirely; load directly from `3_channel_3d/` pkl files |
+
+Use `3` to re-run only colocalization and downstream steps without re-running detection.
+
+### `stop_after_detection`
+`true` = exit immediately after Stage 2 (tile detection). Useful to run GPU-heavy detection on HPC, then run the CPU-only stages locally.
+
+### `ENABLE_Z_LINKER`
+`true` (default) = run Z-axis tracking. `false` = output raw 2D detections only.
+
+### `pre_align_params` *(pre_align mode only)*
 | Key | Default | Description |
 |-----|---------|-------------|
 | `sample_z_center_count` | 50 | Z slices from tile center used to build alignment point cloud |
-| `xy_search_range_px` | 30 | FFT cross-correlation XY search radius (px) |
-| `z_search_range_slices` | 5 | Z brute-force search range (±slices); soft cap 5, hard cap 10 |
-| `match_distance_px` | 15 | Point-cloud IoU matching threshold (px) |
-| `tile_overlap_pct` | 15 | Tile overlap % (used for grid fallback without TeraStitcher XML) |
+| `voxel_bin_size_px` | 4 | Voxel bin size for 3D FFT alignment (px); smaller = more precise but slower |
+| `xy_search_range_px` | 30 | FFT coarse-search XY radius (px) |
+| `z_search_range_slices` | 5 | FFT coarse-search Z range (±slices); soft cap 5, hard cap 10 |
+| `xy_fine_search_px` | 8 | Fine-search XY range around FFT peak (px) |
+| `z_fine_search_slices` | 2 | Fine-search Z range around FFT peak (slices) |
+| `tile_overlap_pct` | 15 | Tile overlap % (fallback grid calculation when TeraStitcher XML is absent) |
 
 ### `z_linker`
-| Group | Key | Description |
-|-------|-----|-------------|
-| `soma` | `iou_thresh` | Minimum bbox IoU for cross-z soma matching |
-| `soma` | `min_z_layers` | Minimum z-layers to qualify as a 3D cell |
-| `soma` | `max_cell_z_span` | Maximum z-span per cell (prevents over-merging) |
-| `tf` | same keys | Same parameters tuned for smaller TF nuclei |
+Parameters are split by channel type (`soma` / `tf`):
 
-### `detection_params` (key entries)
 | Key | Description |
 |-----|-------------|
-| `conf_thresh` | YOLO detection confidence threshold |
-| `nms_iou` | NMS IoU threshold |
-| `xsize` / `ysize` / `step` | Inference patch size and sliding-window stride |
-| `tILESIZE` | TeraStitcher tile edge length (px) |
-| `sTARTID` / `eNDID` | Tile index range to process (`null` = all) |
-| `normalize_PERCENTILE_LOW/HIGH` | 16-bit → 8-bit normalization percentiles |
-| `DOWNSAMPLE` / `DOWNSAMPLE_Z_STEP` | Skip-frame mode for faster debug runs |
-| `coloc_use_centroid_box` | `true` = centroid-in-bbox colocalization; `false` = sphere-distance |
-| `soma_merge_iou_thresh` | Cross-soma-channel merge IoU threshold |
-| `n_permutations` | Permutation test iterations for colocalization significance |
+| `iou_thresh` | Minimum 2D bbox IoU for cross-z frame matching |
+| `min_z_layers` | Minimum z-layers to qualify as a 3D cell |
+| `max_cell_z_span` | Maximum z-span per cell (prevents over-merging) |
 
----
+Additional soma-only keys:
 
-## Running the Pipeline
+| Key | Description |
+|-----|-------------|
+| `iou_thresh_3d` | 3D IoU threshold for cross-channel soma matching |
+| `z_pad_3d` | Z padding (slices) applied during 3D soma matching |
+| `cross_class_iou_thresh` | neuron–glia overlap threshold; glia takes priority |
 
-```bash
-# Default (uses <project_root>/config/config.json):
-python scripts/run_inference.py
+Additional tf-only keys:
 
-# Specify a custom config (useful on HPC):
-python scripts/run_inference.py --config /path/to/config.json
-```
+| Key | Default | Description |
+|-----|---------|-------------|
+| `gmm_p_thresh` | 0.5 | GMM colocalization probability threshold *(visualization in-memory path only)* |
+| `max_center_dist_ratio` | 0.5 | Hard gate for soma–TF colocalization: the TF nucleus centroid must be within `ratio × soma_radius` of the soma centroid. Prevents edge-overlap false positives when soma bboxes are large. |
+
+### `detection_params`
+
+**Physical resolution:**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `xy_resolution_um` | 0.65 | XY pixel size (µm/pixel) |
+| `z_resolution_um` | 8 | Z slice spacing (µm) |
+
+**Detection thresholds:**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `conf_thresh` | 0.3 | YOLO confidence threshold |
+| `nms_iou` | 0.3 | NMS IoU threshold |
+
+**Inference patch:**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `xsize` / `ysize` | 512 | Inference patch width/height (px) |
+| `step` | 384 | Sliding window stride (px); overlap = xsize − step |
+| `tILESIZE` | 2048 | TeraStitcher tile edge length (px) |
+
+**Processing range:**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `sTARTID` / `eNDID` | null | Tile index range (`null` = all) |
+| `DOWNSAMPLE` | false | Skip-frame mode for fast debug runs |
+| `DOWNSAMPLE_Z_STEP` | 41 | Skip interval when `DOWNSAMPLE=true` |
+
+**Image normalization:**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `normalize_PERCENTILE_LOW` | 0.1 | Lower percentile for 16-bit → 8-bit stretch |
+| `normalize_PERCENTILE_HIGH` | 99.9 | Upper percentile |
+
+**Permutation test:**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `n_permutations` | 100 | Permutation iterations for colocalization significance |
+| `max_soma_sample` | 50000 | Max soma count sampled per permutation run |
+
+**YOLO-specific filters** (`detection_params.yolo`):
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `bbox_min` / `bbox_max` | null | Width/height absolute limits (px); `null` = no filter |
+| `bbox_area_pct_min` | 10 | Drop boxes below this area percentile (within-tile) |
+| `bbox_mean_pct_min` | null | Drop boxes below this intensity percentile |
+| `bbox_mean_min` | 0 | Absolute intensity floor (raw 16-bit value) |
+
+**StarDist-specific filters** (`detection_params.stardist`):
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `norm_low` / `norm_high` | 1 / 99.9 | Normalization percentiles for StarDist input |
+| `prob_thresh` | 0.5 | Instance probability threshold |
+| `nms_thresh` | 0.4 | NMS overlap threshold |
+| `n_tiles` | [4, 4] | Inference tiling [Y, X]; larger = lower peak VRAM |
+| `bbox_min` / `bbox_max` | 8 / 17 | Width/height limits (px) |
+| `bbox_area_pct_min` | 5 | Drop boxes below this area percentile |
+| `bbox_mean_pct_min` | null | Drop boxes below this intensity percentile |
+| `bbox_mean_min` | 0 | Absolute intensity floor |
 
 ---
 
@@ -189,41 +250,46 @@ python scripts/run_inference.py --config /path/to/config.json
 ```text
 pATHRESULT/
 ├── 0_channel_alignment/         # [pre_align only] per-tile offset JSONs + aligned CSVs
-├── 1_tile_2d_raw/               # Per-tile 2D detection CSVs (one per channel)
-├── 2_global_2d_raw/             # Globally stitched 2D detections
-├── 3_channel_3d/                # Per-channel Z-linked 3D cell volumes
-├── 4_colocalization/            # Soma–TF colocalization results
-│   ├── global_bboxes.csv        # All 3D soma cells with colocalized TF labels
-│   ├── coloc_result.csv         # Colocalization counts and permutation test p-values
-│   └── global_summary_statistics.csv
-└── 5_analysis_report/           # Run metadata and timing logs
+│   └── _align_done.flag         # checkpoint: alignment complete
+├── 1_tile_2d_raw/               # Per-tile 2D detection CSVs (one file per tile×channel)
+├── 1_tile_2d_filtered/          # Same CSVs after size/intensity filtering (Stage 2.75 output)
+├── 2_global_2d_raw/             # Globally stitched 2D detections (one CSV per channel)
+├── 3_channel_3d/                # Per-channel Z-linked 3D cells
+│   ├── <ch>_3d_tracked.csv      # Summary (center_z bbox per cell)
+│   └── <ch>_3d_tracked.pkl      # Full volumetric vol_list
+├── 4_colocalization/            # Colocalization results
+│   ├── coloc_result.csv         # All 3D soma cells with colocalized TF class labels
+│   └── <class>.csv              # Per-class split of coloc_result.csv
+└── 5_analysis_report/
+    ├── global_summary_statistics.csv
+    ├── colocalization_significance.csv   # Permutation test p-values per TF marker
+    └── cell_centroids/
+        └── <class>_centroids.csv         # Physical centroids (µm) per cell class
 ```
 
-**Colocalization class labels** follow the pattern `neuron_RFP_Sox9_Olig2` for cells positive in multiple channels (each TF channel is annotated independently via its own GMM).
+**Class label convention**: `{soma_type}_{channel}_{TF}`, e.g. `neuron_RFP_Sox9` for an RFP+ neuron colocalized with Sox9. Multi-positive soma channels and TF markers are joined with `_` in sorted order.
 
 ---
 
 ## Visualization
 
-### Post-align results viewer
 ```bash
-python src/utils/visualize.py                      # interactive tile selection
-python src/utils/visualize.py --tiles 0 1 4        # select tiles by index
-python src/utils/visualize.py --list-tiles
-python src/utils/visualize.py --no-images          # bounding boxes only
-python src/utils/visualize.py --stage s4           # colocalization layer only
-python src/utils/visualize.py --config /path/to/config.json
+python src/utils/visualize.py
+python src/utils/visualize.py --config config/vis/vis_config.json
 ```
 
-Napari layers: `[img]` raw tile images · `[s1]` 2D raw detections · `[s3]` 3D Z-linked cells · `[s4]` colocalized final result.
+Edit `config/vis/vis_config.json` to select mode, tile, Z range, and which napari layers to show. The viewer supports two modes:
 
-### Pre-align alignment inspector
-```bash
-python src/utils/visualize_prealign.py --tile 423800_302400
-python src/utils/visualize_prealign.py --tile 423800_302400 --z-range 400 450
-python src/utils/visualize_prealign.py --tile 423800_302400 --no-images
-python src/utils/visualize_prealign.py --tile 423800_302400 --show-before
-python src/utils/visualize_prealign.py --list-tiles
-```
+- **`post`**: loads saved results from `3_channel_3d/` and `4_colocalization/`. Layers: `[s1]` raw 2D · `[s3]` Z-linked · `[s4]` colocalization.
+- **`prealign`**: runs Z-linking and colocalization in memory for a single tile; useful for parameter QC without re-running the full pipeline.
 
-Napari layers: `[img]` raw channel images · `[aligned]` post-alignment detections · `[raw]` pre-alignment detections (hidden by default). Console prints per-channel shift and IoU score.
+Key `vis_config.json` settings:
+
+| Key | Description |
+|-----|-------------|
+| `mode` | `"post"` or `"prealign"` |
+| `tile` | Tile directory name; `null` = interactive selection |
+| `z_range` | `[start, end]` absolute slice indices; `null` = auto-center |
+| `stage` | `"all"` / `"s1"` / `"s3"` / `"s4"` — which result layers to load |
+| `show_coloc` | Show colocalization layer *(prealign mode)* |
+| `filter` | Per-type bbox size/intensity filters applied at display time only |
