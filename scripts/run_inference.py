@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-#python scripts/run_inference.py --config config/config_IMARIS_post.json
+#python scripts/run_inference.py --config config/config.json
 import argparse
 import os
 import sys
@@ -346,6 +346,7 @@ if __name__ == '__main__':
                     _bbox_min      = _model_dp.get('bbox_min')
                     _bbox_max      = _model_dp.get('bbox_max')
                     _area_pct_min  = _model_dp.get('bbox_area_pct_min')
+                    _area_pct_max  = _model_dp.get('bbox_area_pct_max')
                     _pct_min       = _model_dp.get('bbox_mean_pct_min')
                     _abs_min       = (_model_dp.get('bbox_mean_min') or
                                       _model_dp.get('nucleus_mean_min', 0)) or 0
@@ -367,6 +368,11 @@ if __name__ == '__main__':
                         _areas  = (_df['x2'] - _df['x1']) * (_df['y2'] - _df['y1'])
                         _thresh = float(_areas.quantile(_area_pct_min / 100.0))
                         _df = _df[_areas >= _thresh]
+                    # 2b. 面积百分位上限（过滤掉面积最大的框）
+                    if _area_pct_max is not None and not _df.empty:
+                        _areas  = (_df['x2'] - _df['x1']) * (_df['y2'] - _df['y1'])
+                        _thresh = float(_areas.quantile(_area_pct_max / 100.0))
+                        _df = _df[_areas <= _thresh]
                     # 3. 亮度百分位（在通过面积过滤的子集上计算）
                     if _pct_min is not None and not _df.empty:
                         _thresh = float(_df['mean'].quantile(_pct_min / 100.0))
@@ -468,7 +474,8 @@ if __name__ == '__main__':
                                 stitched_predictions = combine_predictions(
                                     stitched_predictions, csv.reader(tile_file), None, z_start, Z,
                                     dir_dict[dir_name], disp_mat_fin, (H, W),
-                                    metadata_registry, tile_name, tILESIZE=tile_size
+                                    metadata_registry, tile_name, tILESIZE=tile_size,
+                                    cross_tile_iomin_thresh=dp.get('cross_tile_iomin_thresh', 0.5)
                                 )
                     for layer in stitched_predictions:
                         for group in layer:

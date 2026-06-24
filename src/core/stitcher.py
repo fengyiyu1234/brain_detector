@@ -888,7 +888,7 @@ def non_max_suppression_iou(boxes, overlapThresh=0.45, sort_idx=4, containment_t
     return boxes[pick]
 
 
-def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, disp_mat, size, metadata_registry, tile_name, tILESIZE=2048, file_z0=None):
+def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, disp_mat, size, metadata_registry, tile_name, tILESIZE=2048, file_z0=None, cross_tile_iomin_thresh=0.5):
     row, col = pos
     ABS_X, ABS_Y, ABS_Z = disp_mat[pos]
     H, W = size
@@ -911,13 +911,49 @@ def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, d
         score = float(score); mean = float(mean)
         if z - 1 in range(z0, z1):
             x1 += ABS_X; x2 += ABS_X; y1 += ABS_Y; y2 += ABS_Y; z = z - z0
+            cell_type_index = 0 if 'glia' in class_name.lower() else 1
+            new_box = np.array([[x1, y1, x2, y2, score, mean, class_name, z]], dtype=object)
+
             if not mask[int((y1 + y2) // 2), int((x1 + x2) // 2)] > 0:
-                cell_type_index = 0 if 'glia' in class_name.lower() else 1
-                new_box = np.array([[x1, y1, x2, y2, score, mean, class_name, z]], dtype=object)
+                # 非重叠区：直接写入
                 all_predictions[z - 1][cell_type_index] = np.concatenate(
                     (all_predictions[z - 1][cell_type_index], new_box)
                 )
-                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                metadata_registry.append([cx, cy, z, tile_name, slice_name])
+                metadata_registry.append([(x1 + x2) / 2, (y1 + y2) / 2, z, tile_name, slice_name])
+            else:
+                # 重叠区：与已有框做 IoMin 匹配，命中则 union 合并，否则新增
+                existing = all_predictions[z - 1][cell_type_index]
+                if len(existing) == 0:
+                    all_predictions[z - 1][cell_type_index] = np.concatenate((existing, new_box))
+                    metadata_registry.append([(x1 + x2) / 2, (y1 + y2) / 2, z, tile_name, slice_name])
+                else:
+                    ex1 = existing[:, 0].astype(float)
+                    ey1 = existing[:, 1].astype(float)
+                    ex2 = existing[:, 2].astype(float)
+                    ey2 = existing[:, 3].astype(float)
+                    inter = (np.maximum(0, np.minimum(x2, ex2) - np.maximum(x1, ex1)) *
+                             np.maximum(0, np.minimum(y2, ey2) - np.maximum(y1, ey1)))
+                    new_area = (x2 - x1) * (y2 - y1)
+                    e_areas  = (ex2 - ex1) * (ey2 - ey1)
+                    iomin    = inter / (np.minimum(new_area, e_areas) + 1e-6)
+                    best     = int(np.argmax(iomin))
+                    if iomin[best] > cross_tile_iomin_thresh:
+                        # Union 合并：取两框外包络，原地替换
+                        existing[best] = np.array([
+                            min(x1, float(ex1[best])),
+                            min(y1, float(ey1[best])),
+                            max(x2, float(ex2[best])),
+                            max(y2, float(ey2[best])),
+                            max(score, float(existing[best, 4])),
+                            existing[best, 5],
+                            existing[best, 6],
+                            existing[best, 7],
+                        ], dtype=object)
+                    else:
+                        # 无匹配：当前 tile 检测到了邻 tile 遗漏的细胞，新增
+                        all_predictions[z - 1][cell_type_index] = np.concatenate(
+                            (existing, new_box)
+                        )
+                        metadata_registry.append([(x1 + x2) / 2, (y1 + y2) / 2, z, tile_name, slice_name])
 
     return all_predictions
