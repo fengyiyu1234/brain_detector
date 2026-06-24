@@ -216,6 +216,59 @@ def _compute_box_means_from_csv(csv_path, z_range, raw_vol):
     return means
 
 
+def _compute_box_areas_from_csv(csv_path, z_range):
+    """Compute 2D box area (w*h px²) for every box in csv (no filtering)."""
+    if not os.path.isfile(csv_path):
+        return np.array([], dtype=np.float32)
+    df = pd.read_csv(csv_path,
+                     names=['slice_name', 'x1', 'y1', 'x2', 'y2', 'class', 'score', 'mean', 'z'],
+                     skiprows=1)
+    if df.empty:
+        return np.array([], dtype=np.float32)
+    df['z'] = df['z'].astype(float).astype(int) - 1
+    if z_range is not None:
+        df = df[(df['z'] >= z_range[0]) & (df['z'] < z_range[1])]
+    if df.empty:
+        return np.array([], dtype=np.float32)
+    w = df['x2'].values.astype(float) - df['x1'].values.astype(float)
+    h = df['y2'].values.astype(float) - df['y1'].values.astype(float)
+    return (w * h).astype(np.float32)
+
+
+def _plot_box_area_histograms(ch_areas_dict, tile_name='', out_dir=None):
+    """Save per-channel box area histograms as PNG to out_dir."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    channels = [cid for cid, a in ch_areas_dict.items() if len(a) > 0]
+    if not channels:
+        print("[area_hist] No area data to plot.")
+        return
+    n_ch = len(channels)
+    fig, axes = plt.subplots(1, n_ch, figsize=(6 * n_ch, 4), squeeze=False)
+    fig.suptitle(f"Box area distribution  —  {tile_name}")
+    pct_marks  = [10, 50, 90]
+    pct_colors = ['orange', 'steelblue', 'red']
+    for ax, cid in zip(axes[0], channels):
+        areas = ch_areas_dict[cid]
+        ax.hist(areas, bins=120, color='steelblue', alpha=0.75, log=True)
+        for pct, col in zip(pct_marks, pct_colors):
+            v = float(np.percentile(areas, pct))
+            ax.axvline(v, color=col, linestyle='--', linewidth=1.2,
+                       label=f'p{pct} = {v:.0f}')
+        ax.set_title(f"{cid}  (n={len(areas):,})")
+        ax.set_xlabel('Box area (px²)')
+        ax.set_ylabel('Box count (log scale)')
+        ax.legend(fontsize=8)
+    plt.tight_layout()
+    save_dir = out_dir or '.'
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir, f"box_area_hist_{tile_name}.png")
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"[area_hist] Saved → {out_path}")
+
+
 def _plot_intensity_histograms(ch_means_dict, tile_name='', out_dir=None):
     """Save per-channel box intensity histograms as PNG to out_dir."""
     import matplotlib
@@ -1107,6 +1160,20 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
             print(f"[hist] {cid}: {len(ch_means[cid]):,} boxes")
         _plot_intensity_histograms(ch_means, tile_name=tile_name, out_dir=base_res)
 
+    # ── Box area histogram ────────────────────────────────────────────────────
+    show_box_area_hist = vis_cfg.get('show_box_area_hist', False)
+    if show_box_area_hist:
+        ch_areas = {}
+        for ch in routing_config:
+            cid = ch['id']
+            aligned_csv = os.path.join(align_dir, f"{tile_name}_{cid}_result.csv")
+            if not os.path.isfile(aligned_csv) and not has_aligned:
+                aligned_csv = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
+            print(f"[area_hist] Computing box areas for {cid} ...")
+            ch_areas[cid] = _compute_box_areas_from_csv(aligned_csv, z_range)
+            print(f"[area_hist] {cid}: {len(ch_areas[cid]):,} boxes")
+        _plot_box_area_histograms(ch_areas, tile_name=tile_name, out_dir=base_res)
+
     # ── [aligned] & [raw] boxes ───────────────────────────────────────────────
     left_m, top_m = _get_tile_overlap_margins(anchor_dir, tile_name, canvas_w, canvas_h)
     if left_m > 0 or top_m > 0:
@@ -1362,6 +1429,18 @@ def _run_post(vis_cfg, config, paths, routing_config):
             ch_means[cid] = _compute_box_means_from_csv(csv_p, z_range, rv)
             print(f"[hist] {cid}: {len(ch_means[cid]):,} boxes")
         _plot_intensity_histograms(ch_means, tile_name=tile_name, out_dir=base_res)
+
+    # ── Box area histogram ────────────────────────────────────────────────────
+    show_box_area_hist = vis_cfg.get('show_box_area_hist', False)
+    if show_box_area_hist:
+        ch_areas = {}
+        for ch in routing_config:
+            cid = ch['id']
+            csv_p = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
+            print(f"[area_hist] Computing box areas for {cid} ...")
+            ch_areas[cid] = _compute_box_areas_from_csv(csv_p, z_range)
+            print(f"[area_hist] {cid}: {len(ch_areas[cid]):,} boxes")
+        _plot_box_area_histograms(ch_areas, tile_name=tile_name, out_dir=base_res)
 
     # ── Image layers (raw, no shift) ──────────────────────────────────────────
     if not no_images:
