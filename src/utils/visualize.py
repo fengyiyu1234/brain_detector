@@ -22,8 +22,10 @@ Usage
 """
 
 import argparse
+import datetime
 import json
 import os
+import pickle
 import sys
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -514,6 +516,28 @@ def _get_tile_overlap_margins(channel_dir, tile_name, canvas_w, canvas_h):
         return 0, 0
 
 
+def _add_margin_overlay(viewer, canvas_shape, left_m, top_m):
+    """Add a semi-transparent red overlay covering the excluded left/top margin region."""
+    if left_m <= 0 and top_m <= 0:
+        return
+    Z, H, W = canvas_shape
+    mask = np.zeros((H, W), dtype=np.uint8)
+    if left_m > 0:
+        mask[:, :int(left_m)] = 1
+    if top_m > 0:
+        mask[:int(top_m), :] = 1
+    # broadcast_to avoids copying the full Z×H×W volume in memory
+    vol = np.broadcast_to(mask[np.newaxis], (Z, H, W))
+    viewer.add_image(
+        vol,
+        name='[overlap] excluded margin',
+        colormap='red',
+        blending='additive',
+        opacity=0.35,
+        visible=True,
+    )
+
+
 # ── CSV → shapes ──────────────────────────────────────────────────────────────
 
 def _load_tile_csv_shapes(csv_path, z_range=None, raw_vol=None, filt=None,
@@ -855,7 +879,7 @@ def _add_coloc_layers(viewer, coloc_csv, tile_name, z_range,
                 viewer, shapes_c, colors_c, canvas_shape,
                 dash_sizes=dash_c,
                 name=layer_name,
-                visible=True, opacity=coloc_opacity,
+                visible=False, opacity=coloc_opacity,
                 outline_width=grp.get('outline_width', outline_width),
             )
             if box_registry is not None:
@@ -867,6 +891,357 @@ def _add_coloc_layers(viewer, coloc_csv, tile_name, z_range,
             any_shown = True
     if not any_shown:
         print("[coloc] no cells in z-range for any group")
+
+
+# ── Colocalization debug trace helpers ────────────────────────────────────────
+
+def _build_merged_soma_vols(per_ch_vol_lists, soma_ch_ids, tf_ch_ids, zl_soma_cfg):
+    """Replicate Phase A of run_inference: merge soma channels by 3D IoU.
+    Returns (merged_soma_list, tf_vols_by_ch_dict).
+    """
+    import copy
+    iou_thresh_3d = zl_soma_cfg.get('iou_thresh_3d', 0.15)
+    z_pad_3d      = zl_soma_cfg.get('z_pad_3d', 2)
+    cross_iou     = zl_soma_cfg.get('cross_class_iou_thresh', 0.5)
+    first_id      = soma_ch_ids[0] if soma_ch_ids else ''
+    merged = [dict(copy.copy(c), _soma_cid=first_id, _soma_peers=[])
+              for c in per_ch_vol_lists.get(first_id, [])]
+    for cid_b in soma_ch_ids[1:]:
+        cells_b = [copy.copy(c) for c in per_ch_vol_lists.get(cid_b, [])]
+        matched_pairs, _, unmatched_b = match_soma_3d_iou(
+            merged, cells_b, iou_thresh=iou_thresh_3d, z_pad=z_pad_3d)
+        for a_cell, b_cell in matched_pairs:
+            a_cell['class'] = _merge_class(a_cell['class'], b_cell['class'])
+            a_cell['_soma_peers'].append((cid_b, b_cell))
+        merged = merged + [dict(c, _soma_cid=cid_b, _soma_peers=[]) for c in unmatched_b]
+    merged = suppress_cross_class_overlap(merged, iou_thresh=cross_iou, z_pad=z_pad_3d)
+    tf_vols_by_ch = {cid: per_ch_vol_lists.get(cid, []) for cid in tf_ch_ids}
+    return merged, tf_vols_by_ch
+
+
+def _trace_coloc_for_soma(soma_idx, soma_vol_list, tf_vol_list,
+                           z_pad=2, xy_margin=0, max_center_dist_ratio=0.5):
+    """Mirror annotate_soma_with_tf_containment for one soma and return per-TF breakdown.
+
+    Categories in returned dict:
+      matched     — TF assigned to this soma
+      stolen      — TF passed all checks here but a closer soma won
+      failed_xy   — TF bbox not fully inside soma XY bbox (records per-side overhang)
+      failed_z    — TF z-span outside soma z-span (records margin on each side)
+      failed_dist — TF bbox contained but centroid > max_center_dist_ratio * radius
+      out_of_range — count of TF cells outside the global search sphere (max_radius*2)
+    """
+    from scipy.spatial import cKDTree
+
+    soma       = soma_vol_list[soma_idx]
+    soma_arr   = np.array([[s['cx'], s['cy'], s['cz']] for s in soma_vol_list], dtype=float)
+    soma_radii = np.maximum(1.0, np.array([
+        np.sqrt((s['x2_3d'] - s['x1_3d'])**2 + (s['y2_3d'] - s['y1_3d'])**2) / 2
+        for s in soma_vol_list], dtype=float))
+    max_radius = float(soma_radii.max())
+    soma_r     = float(soma_radii[soma_idx])
+    soma_ctr   = soma_arr[soma_idx]
+    tree       = cKDTree(soma_arr)
+
+    res = dict(soma=soma, soma_radius=soma_r, max_radius=max_radius,
+               matched=[], stolen=[], failed_xy=[], failed_z=[], failed_dist=[],
+               out_of_range=0)
+
+    # single-layer soma: don't pad z (would give false containment across adjacent slices)
+    eff_z_pad = z_pad if soma['z_max'] > soma['z_min'] else 0
+
+    for tf in tf_vol_list:
+        tf_pt  = np.array([tf['cx'], tf['cy'], tf['cz']], dtype=float)
+        d_this = float(np.linalg.norm(soma_ctr - tf_pt))
+
+        if d_this > max_radius * 2:
+            res['out_of_range'] += 1
+            continue
+
+        xy_ok = (soma['x1_3d'] - xy_margin <= tf['x1_3d'] and
+                 tf['x2_3d']  <= soma['x2_3d'] + xy_margin and
+                 soma['y1_3d'] - xy_margin <= tf['y1_3d'] and
+                 tf['y2_3d']  <= soma['y2_3d'] + xy_margin)
+        z_ok  = (soma['z_min'] - eff_z_pad <= tf['z_min'] and
+                 tf['z_max']  <= soma['z_max'] + eff_z_pad)
+
+        if not xy_ok:
+            res['failed_xy'].append({
+                'tf': tf, 'dist': d_this, 'z_ok': z_ok,
+                'dx_left':  (soma['x1_3d'] - xy_margin) - tf['x1_3d'],
+                'dx_right': tf['x2_3d'] - (soma['x2_3d'] + xy_margin),
+                'dy_top':   (soma['y1_3d'] - xy_margin) - tf['y1_3d'],
+                'dy_bot':   tf['y2_3d'] - (soma['y2_3d'] + xy_margin),
+            })
+            continue
+
+        if not z_ok:
+            res['failed_z'].append({
+                'tf': tf, 'dist': d_this,
+                'dz_min': (soma['z_min'] - eff_z_pad) - tf['z_min'],
+                'dz_max': tf['z_max'] - (soma['z_max'] + eff_z_pad),
+            })
+            continue
+
+        gate = max_center_dist_ratio * soma_r
+        if d_this > gate:
+            res['failed_dist'].append({'tf': tf, 'dist': d_this, 'gate': gate})
+            continue
+
+        # Passed all checks — find the globally closest winning soma for this TF
+        best_d, best_s = float('inf'), None
+        for s_idx in tree.query_ball_point(tf_pt, r=max_radius * 2):
+            s2 = soma_vol_list[s_idx]
+            s2_z_pad = z_pad if s2['z_max'] > s2['z_min'] else 0
+            if not (s2['x1_3d'] - xy_margin <= tf['x1_3d'] and
+                    tf['x2_3d'] <= s2['x2_3d'] + xy_margin and
+                    s2['y1_3d'] - xy_margin <= tf['y1_3d'] and
+                    tf['y2_3d'] <= s2['y2_3d'] + xy_margin and
+                    s2['z_min'] - s2_z_pad <= tf['z_min'] and
+                    tf['z_max'] <= s2['z_max'] + s2_z_pad):
+                continue
+            d = float(np.linalg.norm(soma_arr[s_idx] - tf_pt))
+            if d > max_center_dist_ratio * soma_radii[s_idx]:
+                continue
+            if d < best_d:
+                best_d, best_s = d, s_idx
+
+        if best_s == soma_idx:
+            res['matched'].append({'tf': tf, 'dist': d_this})
+        else:
+            res['stolen'].append({
+                'tf': tf, 'dist': d_this,
+                'winner': soma_vol_list[best_s] if best_s is not None else None,
+                'winner_dist': best_d,
+            })
+    return res
+
+
+def _print_coloc_trace(res, coloc_params):
+    soma = res['soma']
+    sep  = '═' * 72
+    print(f'\n{sep}')
+    print(f"COLOC TRACE  —  soma class={soma['class']}")
+    print(f"  bbox    x=[{soma['x1_3d']:.0f},{soma['x2_3d']:.0f}]  "
+          f"y=[{soma['y1_3d']:.0f},{soma['y2_3d']:.0f}]  "
+          f"z=[{soma['z_min']},{soma['z_max']}]")
+    print(f"  center  ({soma['cx']:.1f}, {soma['cy']:.1f}, {soma['cz']:.1f})  "
+          f"radius≈{res['soma_radius']:.1f}px  "
+          f"search_r={res['max_radius']*2:.1f}px")
+    print(f"  params  z_pad={coloc_params['z_pad']}  "
+          f"xy_margin={coloc_params['xy_margin']}  "
+          f"max_center_dist_ratio={coloc_params['max_center_dist_ratio']}")
+
+    n_cand = (len(res['matched']) + len(res['stolen']) +
+              len(res['failed_xy']) + len(res['failed_z']) + len(res['failed_dist']))
+    print(f"\n  TF pool: {n_cand + res['out_of_range']} total  "
+          f"→  {n_cand} within search radius  "
+          f"({res['out_of_range']} out_of_range)")
+
+    if res['matched']:
+        print(f"\n  ✓ MATCHED ({len(res['matched'])} TF):")
+        for it in res['matched']:
+            tf = it['tf']
+            print(f"      {tf['class']}  dist={it['dist']:.1f}px  "
+                  f"z=[{tf['z_min']},{tf['z_max']}]  "
+                  f"x=[{tf['x1_3d']:.0f},{tf['x2_3d']:.0f}]  "
+                  f"y=[{tf['y1_3d']:.0f},{tf['y2_3d']:.0f}]")
+    else:
+        print(f"\n  ✗ NO MATCH — soma carries no TF annotation from this channel")
+
+    def _show(items, limit, header, detail_fn):
+        if not items:
+            return
+        print(f"\n  {header} ({len(items)}):")
+        for it in sorted(items, key=lambda x: x['dist'])[:limit]:
+            print(f"      {detail_fn(it)}")
+        if len(items) > limit:
+            print(f"      … and {len(items)-limit} more")
+
+    _show(res['stolen'], 8,
+          '⚠  STOLEN — passed checks but closer soma won',
+          lambda it: (
+              f"{it['tf']['class']}  dist_here={it['dist']:.1f}px  "
+              f"winner_dist={it['winner_dist']:.1f}px"
+              + (f"  winner={it['winner']['class']}"
+                 f" @({it['winner']['cx']:.0f},{it['winner']['cy']:.0f},{it['winner']['cz']:.0f})"
+                 if it['winner'] else '')))
+
+    _show(res['failed_dist'], 5,
+          '✗  FAILED center-dist gate (bbox contained but centroid too far)',
+          lambda it: (
+              f"{it['tf']['class']}  dist={it['dist']:.1f}px  gate={it['gate']:.1f}px  "
+              f"z=[{it['tf']['z_min']},{it['tf']['z_max']}]  "
+              f"x=[{it['tf']['x1_3d']:.0f},{it['tf']['x2_3d']:.0f}]  "
+              f"y=[{it['tf']['y1_3d']:.0f},{it['tf']['y2_3d']:.0f}]"))
+
+    _show(res['failed_z'], 5,
+          '✗  FAILED Z containment',
+          lambda it: (
+              f"{it['tf']['class']}  dist={it['dist']:.1f}px  "
+              f"tf_z=[{it['tf']['z_min']},{it['tf']['z_max']}]  "
+              f"soma_z=[{res['soma']['z_min']},{res['soma']['z_max']}]"
+              + (f"  starts {it['dz_min']:.0f}sl early" if it['dz_min'] > 0 else '')
+              + (f"  ends {it['dz_max']:.0f}sl late"   if it['dz_max'] > 0 else '')))
+
+    _show(res['failed_xy'], 5,
+          '✗  FAILED XY containment',
+          lambda it: (
+              f"{it['tf']['class']}  dist={it['dist']:.1f}px  "
+              f"[Z{'✓' if it['z_ok'] else '✗'}]  overhang px: "
+              + str({k: f"{v:.0f}" for k, v in [
+                  ('L', it['dx_left']),  ('R', it['dx_right']),
+                  ('T', it['dy_top']),   ('B', it['dy_bot'])] if v > 0})))
+
+    print(f'{sep}\n')
+
+
+def _print_coloc_all_channels(res, soma_ch_ids, per_ch_vols):
+    """Print _print_s3_cell_info for the soma channel(s) and each matched TF."""
+    soma = res['soma']
+    # Primary soma channel (stored directly in the merged soma entry)
+    _print_s3_cell_info(soma, soma.get('_soma_cid', soma_ch_ids[0] if soma_ch_ids else '?'))
+    # Peer soma channels matched via IoU (e.g. GFP matched to RFP)
+    for peer_cid, peer_cell in soma.get('_soma_peers', []):
+        _print_s3_cell_info(peer_cell, peer_cid)
+    # Matched TF channels (e.g. Sox9 contained within soma)
+    for it in res.get('matched', []):
+        tf = it['tf']
+        _print_s3_cell_info(tf, tf.get('_cid', tf.get('class', '?')))
+
+
+def _find_soma_idx_for_box(box, z_range, soma_vol_list):
+    """Match a box_registry entry (tile-local coords) to the nearest soma in vol_list."""
+    if not soma_vol_list:
+        return None
+    z0  = z_range[0] if z_range else 0
+    cx  = (box['x1'] + box['x2']) / 2
+    cy  = (box['y1'] + box['y2']) / 2
+    z_a = box['z'] + z0
+    best_idx, best_d = None, float('inf')
+    for idx, soma in enumerate(soma_vol_list):
+        if abs(soma['cz'] - z_a) > 3:
+            continue
+        d = np.sqrt((soma['cx'] - cx) ** 2 + (soma['cy'] - cy) ** 2)
+        if d < best_d:
+            best_d, best_idx = d, idx
+    return best_idx if best_d < 60 else None
+
+
+def _find_vollist_entry_for_box(box, z_range, per_ch_vol_lists, layer_name):
+    """Match a box_registry entry from a [s3]/[zlinked] layer to its vol_list dict.
+    Returns (cell_dict, cid) or (None, None).
+    """
+    cid = None
+    for prefix in ('[s3]', '[zlinked]'):
+        if layer_name.startswith(prefix):
+            cid = layer_name[len(prefix):].strip()
+            break
+    if cid is None:
+        return None, None
+    vols = per_ch_vol_lists.get(cid, [])
+    if not vols:
+        return None, None
+    z0  = z_range[0] if z_range else 0
+    cx  = (box['x1'] + box['x2']) / 2
+    cy  = (box['y1'] + box['y2']) / 2
+    z_a = box['z'] + z0
+    best_entry, best_d = None, float('inf')
+    for entry in vols:
+        if abs(entry['cz'] - z_a) > 3:
+            continue
+        d = np.sqrt((entry['cx'] - cx) ** 2 + (entry['cy'] - cy) ** 2)
+        if d < best_d:
+            best_d, best_entry = d, entry
+    return (best_entry, cid) if best_d < 60 else (None, None)
+
+
+def _print_s3_cell_info(cell, cid):
+    """Print all vol_list fields for a z-linked cell to terminal."""
+    pz  = cell.get('per_z_boxes', {})
+    sep = '─' * 64
+    print(f'\n{sep}')
+    print(f"S3 CELL INFO  —  channel={cid}  class={cell['class']}")
+    print(f"  center    ({cell['cx']:.1f}, {cell['cy']:.1f}, {cell['cz']:.1f})")
+    print(f"  3D bbox   x=[{cell['x1_3d']:.0f},{cell['x2_3d']:.0f}]  "
+          f"y=[{cell['y1_3d']:.0f},{cell['y2_3d']:.0f}]  "
+          f"z=[{cell['z_min']},{cell['z_max']}]")
+    n_layers = cell['z_max'] - cell['z_min'] + 1
+    print(f"  z-span    {n_layers} layers  ({len(pz)} detections)")
+    score_str = f"{cell['score']:.3f}" if cell.get('score') is not None else '?'
+    mean_str  = f"{cell['mean']:.1f}"  if cell.get('mean')  is not None else '?'
+    print(f"  score={score_str}  mean={mean_str}")
+    if pz:
+        print(f"  per-z boxes  (abs_z : [x1, y1, x2, y2]  w  h):")
+        for z_abs in sorted(pz.keys()):
+            b = pz[z_abs]
+            print(f"    z={z_abs:5d}  [{b[0]:.0f},{b[1]:.0f},{b[2]:.0f},{b[3]:.0f}]"
+                  f"  w={b[2]-b[0]:.0f}  h={b[3]-b[1]:.0f}")
+    print(f'{sep}\n')
+
+
+def _append_false_negative(ann_path, tile_name, tile_path, z_abs, x, y):
+    """Append one false-negative annotation to ann_path (CSV), creating header if new."""
+    exists = os.path.isfile(ann_path)
+    with open(ann_path, 'a', encoding='utf-8', newline='') as f:
+        if not exists:
+            f.write("tile_name,tile_path,z,x,y,timestamp\n")
+        ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        f.write(f"{tile_name},{tile_path},{z_abs},{x:.0f},{y:.0f},{ts}\n")
+
+
+def _build_s3_span_shapes(cell, z_range, canvas_shape):
+    """Build one yellow rectangle per z from cell['per_z_boxes'] for _add_labels_layer."""
+    pz  = cell.get('per_z_boxes', {})
+    z0  = z_range[0] if z_range else 0
+    Z   = canvas_shape[0]
+    shapes, colors = [], []
+    for z_abs in sorted(pz.keys()):
+        z_l = z_abs - z0
+        if z_l < 0 or z_l >= Z:
+            continue
+        b = pz[z_abs]
+        x1, y1, x2, y2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+        shapes.append(np.array(
+            [[z_l, y1, x1], [z_l, y1, x2], [z_l, y2, x2], [z_l, y2, x1]],
+            dtype=np.float64))
+        colors.append([1.0, 1.0, 0.0, 1.0])
+    return shapes, colors
+
+
+def _load_s3_pkl_as_tile_local(pkl_path, tile_x0, tile_y0, tile_z0=0):
+    """Load a _3d_tracked.pkl and convert global → tile-local coordinates.
+
+    The pipeline stores global x/y (stitching adds ABS_X/ABS_Y) and global z
+    (= local_z - tile_z0, 1-indexed for the reference tile).  Passing tile_z0
+    (= z_start - ABS_Z for this tile, from _get_tile_offset) converts the z values
+    back to 0-indexed tile-local, matching _run_zlink_for_csv output so that
+    _find_vollist_entry_for_box / _build_s3_span_shapes work correctly.
+    Returns None if the pkl doesn't exist.
+    """
+    if not os.path.isfile(pkl_path):
+        return None
+    with open(pkl_path, 'rb') as pf:
+        raw_vols = pickle.load(pf)
+    tile_vols = []
+    for c in raw_vols:
+        tc = dict(c)
+        tc['cx']    = c['cx']    - tile_x0
+        tc['cy']    = c['cy']    - tile_y0
+        tc['x1_3d'] = c['x1_3d'] - tile_x0
+        tc['x2_3d'] = c['x2_3d'] - tile_x0
+        tc['y1_3d'] = c['y1_3d'] - tile_y0
+        tc['y2_3d'] = c['y2_3d'] - tile_y0
+        tc['cz']    = int(c['cz'])    - 1 + tile_z0   # global_z → 0-indexed local
+        tc['z_min'] = int(c['z_min']) - 1 + tile_z0
+        tc['z_max'] = int(c['z_max']) - 1 + tile_z0
+        pzb = {}
+        for z_k, bv in c.get('per_z_boxes', {}).items():
+            pzb[int(z_k) - 1 + tile_z0] = [bv[0] - tile_x0, bv[1] - tile_y0,
+                                             bv[2] - tile_x0, bv[3] - tile_y0]
+        tc['per_z_boxes'] = pzb
+        tile_vols.append(tc)
+    return tile_vols
 
 
 # ── Prealign-specific helpers ─────────────────────────────────────────────────
@@ -894,7 +1269,8 @@ def load_offsets(align_dir, tile_name):
         return json.load(f)
 
 
-def _run_zlink_for_csv(csv_path, z_range, iou_thresh, min_z_layers, max_cell_z_span):
+def _run_zlink_for_csv(csv_path, z_range, iou_thresh, min_z_layers, max_cell_z_span,
+                       max_z_gap=0):
     if not os.path.isfile(csv_path):
         return []
     df = pd.read_csv(
@@ -915,6 +1291,7 @@ def _run_zlink_for_csv(csv_path, z_range, iou_thresh, min_z_layers, max_cell_z_s
         iou_thresh=iou_thresh,
         min_z_layers=min_z_layers,
         max_cell_z_span=max_cell_z_span,
+        max_z_gap=max_z_gap,
     )
     return vol_list
 
@@ -1098,10 +1475,29 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
                 iou_thresh=zl_p.get('iou_thresh', 0.35),
                 min_z_layers=zl_p.get('min_z_layers', 1),
                 max_cell_z_span=zl_p.get('max_cell_z_span', 5),
+                max_z_gap=zl_p.get('max_z_gap', 0),
             )
             per_ch_vol_lists[cid] = vol_list
             print(f"  [{cid}] z-linked: {len(vol_list)} cells")
         print()
+
+    # ── Build merged soma/TF vol lists for Shift+click coloc trace ────────────
+    _debug_soma_vols = []
+    _debug_all_tf    = []
+    _debug_cp        = {}
+    if per_ch_vol_lists:
+        _debug_soma_vols, _debug_tf_dict = _build_merged_soma_vols(
+            per_ch_vol_lists, soma_ch_ids, tf_ch_ids, zl_soma)
+        _debug_all_tf = [dict(c, _cid=_tf_cid)
+                         for _tf_cid, _vols in _debug_tf_dict.items()
+                         for c in _vols]
+        _debug_cp = {
+            'z_pad':                 zl_tf.get('containment_z_pad', 2),
+            'xy_margin':             zl_tf.get('containment_xy_margin', 0),
+            'max_center_dist_ratio': zl_tf.get('max_center_dist_ratio', 0.5),
+        }
+        print(f"[trace] Shift+click any [coloc] box to trace.  "
+              f"({len(_debug_soma_vols)} soma, {len(_debug_all_tf)} TF)")
 
     # ── Image layers ──────────────────────────────────────────────────────────
     if not no_images:
@@ -1178,6 +1574,7 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
     left_m, top_m = _get_tile_overlap_margins(anchor_dir, tile_name, canvas_w, canvas_h)
     if left_m > 0 or top_m > 0:
         print(f"[overlap] hiding boxes in left={left_m}px / top={top_m}px margin")
+    _add_margin_overlay(viewer, canvas_shape, left_m, top_m)
     for ch in routing_config:
         cid     = ch['id']
         iou_str = (f"  iou={offsets[cid]['iou_score']:.3f}" if cid in offsets else "")
@@ -1194,7 +1591,7 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
             _add_labels_layer(
                 viewer, shapes_a, colors_a, canvas_shape,
                 name=layer_name_a,
-                visible=True, opacity=aligned_opacity, outline_width=outline_width,
+                visible=False, opacity=aligned_opacity, outline_width=outline_width,
             )
             for m in meta_a:
                 box_registry.append({**m, 'layer_name': layer_name_a})
@@ -1233,7 +1630,7 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
                 layer_name_z = f"[zlinked] {cid}"
                 _add_labels_layer(
                     viewer, shapes_z, colors_z, canvas_shape,
-                    name=layer_name_z, visible=True,
+                    name=layer_name_z, visible=False,
                     opacity=zlinked_opacity, outline_width=outline_width,
                 )
                 for m in meta_z:
@@ -1263,6 +1660,7 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
                     iou_thresh=zl_p.get('iou_thresh', 0.35),
                     min_z_layers=1,
                     max_cell_z_span=zl_p.get('max_cell_z_span', 5),
+                    max_z_gap=zl_p.get('max_z_gap', 0),
                 )
                 centers_r, sizes_r = _vol_list_to_points(vol_list_r, z_range)
                 if centers_r is not None:
@@ -1311,7 +1709,7 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
                                 viewer, shapes_c, colors_c, canvas_shape,
                                 dash_sizes=dash_c,
                                 name=layer_name_c,
-                                visible=True, opacity=coloc_opacity,
+                                visible=False, opacity=coloc_opacity,
                                 outline_width=grp.get('outline_width', outline_width),
                             )
                             for m in meta_c:
@@ -1332,19 +1730,58 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
                 colormap='cyan', opacity=0.25, blending='additive', visible=True,
             )
 
-    # ── Click-to-inspect box size ─────────────────────────────────────────────
-    print(f"\n[info] Click on any detection box to see its width/height in the status bar.")
+    # ── Click-to-inspect  /  Shift+click traces  /  Ctrl+click FN annotation ────
+    fn_ann_path = r'Y:\Fengyi\detection_training\false_negatives.csv'
+    print(f"\n[info] Click any detection box → dimensions in status bar.")
+    print(f"[info] Shift+click [coloc]   box → TF colocalization trace in terminal.")
+    print(f"[info] Shift+click [zlinked] box → per-z span highlighted in yellow + info.")
+    print(f"[info] Ctrl+click  anywhere  → mark false-negative position → {fn_ann_path}")
     print(f"[info] {len(box_registry)} boxes indexed across all layers.")
+
+    @viewer.bind_key('Shift')
+    def _shift_hint(v):
+        v.status = "⇧ Shift held — click a [zlinked] or [coloc] box to trace"
+        yield
+        v.status = ""
+
+    @viewer.bind_key('Control')
+    def _ctrl_hint(v):
+        v.status = "⌃ Ctrl held — click anywhere to mark a false-negative position"
+        yield
+        v.status = ""
 
     def _on_click(viewer, event):
         if event.type != 'mouse_press':
             return
+        try:
+            mods = [str(m).lower() for m in event.modifiers]
+            is_shift = any('shift' in m for m in mods)
+            is_ctrl  = any('ctrl' in m or 'control' in m for m in mods)
+        except Exception:
+            is_shift = is_ctrl = False
         pos = viewer.cursor.position
         if len(pos) < 3:
             return
         z_cur = int(round(pos[0]))
         y_cur = float(pos[1])
         x_cur = float(pos[2])
+
+        if is_ctrl:
+            z_abs = z_cur + z_range[0]
+            _append_false_negative(fn_ann_path, tile_name, tile_path, z_abs, x_cur, y_cur)
+            hits = [b for b in box_registry
+                    if b['z'] == z_cur
+                    and b['x1'] <= x_cur <= b['x2']
+                    and b['y1'] <= y_cur <= b['y2']]
+            box_note = ""
+            if hits:
+                best_h = min(hits, key=lambda b: (b['x2']-b['x1'])*(b['y2']-b['y1']))
+                box_note = f"  (inside [{best_h['layer_name']}] {best_h['cls']})"
+            print(f"[fn] {tile_name}  z={z_abs}  x={x_cur:.0f}  y={y_cur:.0f}{box_note}")
+            viewer.status = (f"⌃ FN marked: z={z_abs} x={x_cur:.0f} y={y_cur:.0f}{box_note}"
+                             f"  → {os.path.basename(fn_ann_path)}")
+            return
+
         hits = [
             b for b in box_registry
             if b['z'] == z_cur
@@ -1352,14 +1789,66 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
             and b['y1'] <= y_cur <= b['y2']
         ]
         if hits:
-            best = min(hits, key=lambda b: (b['x2'] - b['x1']) * (b['y2'] - b['y1']))
+            candidates = hits
+            active_layer = viewer.layers.selection.active
+            if active_layer is not None:
+                active_hits = [b for b in candidates if b.get('layer_name') == active_layer.name]
+                if active_hits:
+                    candidates = active_hits
+            best = min(candidates, key=lambda b: (b['x2'] - b['x1']) * (b['y2'] - b['y1']))
             w = best['x2'] - best['x1']
             h = best['y2'] - best['y1']
+            lname = best.get('layer_name', '')
             mean_str = f"  mean={best['mean']:.0f}" if best.get('mean', 0) != 0 else ""
-            viewer.status = (f"[{best['layer_name']}] {best['cls']}  "
-                             f"w={w:.0f}px  h={h:.0f}px  z={best['z']}{mean_str}")
+            if not is_shift:
+                viewer.status = (f"[{lname}] {best['cls']}  "
+                                 f"w={w:.0f}px  h={h:.0f}px  z={best['z']}{mean_str}")
+            elif lname.startswith('[coloc]'):
+                if _debug_soma_vols:
+                    soma_idx = _find_soma_idx_for_box(best, z_range, _debug_soma_vols)
+                    if soma_idx is not None:
+                        res = _trace_coloc_for_soma(
+                            soma_idx, _debug_soma_vols, _debug_all_tf, **_debug_cp)
+                        _print_coloc_trace(res, _debug_cp)
+                        _print_coloc_all_channels(res, soma_ch_ids, per_ch_vol_lists)
+                        viewer.status = f"⇧ coloc trace for soma #{soma_idx} → see terminal"
+                    else:
+                        cx = (best['x1'] + best['x2']) / 2
+                        cy = (best['y1'] + best['y2']) / 2
+                        print(f"[trace] no soma matched — box cx={cx:.0f} cy={cy:.0f} z={best['z']}")
+                        viewer.status = f"⇧ [coloc] no soma matched at cx={cx:.0f} cy={cy:.0f} z={best['z']}"
+                else:
+                    print("[trace] vol_lists not built — enable show_coloc/show_zlinked/spheres")
+                    viewer.status = "⇧ [coloc] vol_lists not available — see terminal"
+            elif lname.startswith(('[s3]', '[zlinked]')):
+                for lyr in list(viewer.layers):
+                    if lyr.name == '[debug] s3 span':
+                        viewer.layers.remove(lyr)
+                cell, cid = _find_vollist_entry_for_box(
+                    best, z_range, per_ch_vol_lists, lname)
+                if cell is not None:
+                    _print_s3_cell_info(cell, cid)
+                    sh, co = _build_s3_span_shapes(cell, z_range, canvas_shape)
+                    if sh:
+                        _add_labels_layer(viewer, sh, co, canvas_shape,
+                                          name='[debug] s3 span', visible=True,
+                                          opacity=0.9, outline_width=2)
+                    viewer.status = (f"⇧ [{cid}] s3 info → terminal  "
+                                     f"cz={cell['cz']}  z=[{cell['z_min']}-{cell['z_max']}]")
+                else:
+                    cx = (best['x1'] + best['x2']) / 2
+                    cy = (best['y1'] + best['y2']) / 2
+                    print(f"[trace] no vol_list match for s3 box "
+                          f"cx={cx:.0f} cy={cy:.0f} z={best['z']}")
+                    viewer.status = (f"⇧ no match in vol_list for {lname}  "
+                                     f"cx={cx:.0f} cy={cy:.0f} z={best['z']} — see terminal")
+            else:
+                viewer.status = f"⇧ {lname} is not traceable — use [zlinked] or [coloc]"
         else:
-            viewer.status = f"(no box at z={z_cur} x={x_cur:.0f} y={y_cur:.0f})"
+            if is_shift:
+                viewer.status = f"⇧ Shift+click: no box at z={z_cur} x={x_cur:.0f} y={y_cur:.0f}"
+            else:
+                viewer.status = f"(no box at z={z_cur} x={x_cur:.0f} y={y_cur:.0f})"
 
     viewer.mouse_drag_callbacks.append(_on_click)
 
@@ -1370,15 +1859,19 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
 # ── Mode: post (single tile) ──────────────────────────────────────────────────
 
 def _run_post(vis_cfg, config, paths, routing_config):
-    pa_cfg = config.get('pre_align_params', {})
+    pa_cfg  = config.get('pre_align_params', {})
+    zl_cfg  = config.get('z_linker', {})
+    zl_soma = zl_cfg.get('soma', {})
+    zl_tf   = zl_cfg.get('tf',   {})
 
     no_images     = vis_cfg.get('no_images', False)
     stage_cfg     = vis_cfg.get('stage', 'all')
     outline_width = vis_cfg.get('outline_width', 2)
     coloc_opacity = vis_cfg.get('coloc_opacity', 0.9)
 
-    base_res  = paths['pATHRESULT']
-    raw_dir   = os.path.join(base_res, '1_tile_2d_raw')
+    base_res     = paths['pATHRESULT']
+    raw_dir      = os.path.join(base_res, '1_tile_2d_raw')
+    filtered_dir = os.path.join(base_res, '1_tile_2d_filtered')
     s3_dir    = os.path.join(base_res, '3_channel_3d')
     coloc_csv = os.path.join(base_res, '4_colocalization', 'coloc_result.csv')
 
@@ -1461,12 +1954,16 @@ def _run_post(vis_cfg, config, paths, routing_config):
     left_m, top_m = _get_tile_overlap_margins(anchor_dir, tile_name, canvas_w, canvas_h)
     if left_m > 0 or top_m > 0:
         print(f"[overlap] hiding boxes in left={left_m}px / top={top_m}px margin")
+    _add_margin_overlay(viewer, canvas_shape, left_m, top_m)
 
-    # ── [s1] Raw 2D detections ────────────────────────────────────────────────
+    # ── [s1] 2D detections (filtered if 1_tile_2d_filtered exists, else raw) ──
     if stage_cfg in ('all', 's1'):
         for ch in routing_config:
             cid = ch['id']
-            csv_p = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
+            _filtered_csv = os.path.join(filtered_dir, f"{tile_name}_{cid}_result.csv")
+            _raw_csv      = os.path.join(raw_dir,      f"{tile_name}_{cid}_result.csv")
+            csv_p   = _filtered_csv if os.path.exists(_filtered_csv) else _raw_csv
+            s1_src  = "filtered" if os.path.exists(_filtered_csv) else "raw"
             (shapes, colors, meta), (rej_s, rej_c, _) = _load_tile_csv_shapes(
                 csv_p, z_range,
                 raw_vol=raw_vols.get(cid), filt=_get_ch_filter(filter_cfg, ch),
@@ -1480,7 +1977,7 @@ def _run_post(vis_cfg, config, paths, routing_config):
                 )
                 for m in meta:
                     box_registry.append({**m, 'layer_name': layer_name_s1})
-                print(f"[s1] {cid}: {len(shapes)} raw 2D boxes (hidden)")
+                print(f"[s1] {cid}: {len(shapes)} 2D boxes ({s1_src}) (hidden)")
             if rej_s:
                 _add_labels_layer(
                     viewer, rej_s, rej_c, canvas_shape,
@@ -1503,7 +2000,7 @@ def _run_post(vis_cfg, config, paths, routing_config):
                 layer_name_s3 = f"[s3] {cid}"
                 _add_labels_layer(
                     viewer, shapes, colors, canvas_shape,
-                    name=layer_name_s3, visible=True,
+                    name=layer_name_s3, visible=False,
                     opacity=0.8, outline_width=outline_width,
                 )
                 for m in meta:
@@ -1528,19 +2025,97 @@ def _run_post(vis_cfg, config, paths, routing_config):
             left_margin=left_m, top_margin=top_m,
         )
 
-    # ── Click-to-inspect box size ─────────────────────────────────────────────
-    print(f"\n[info] Click on any detection box to see its width/height in the status bar.")
+    # ── Build merged soma/TF vol lists for Shift+click coloc trace ──────────────
+    soma_ch_ids_p = [ch['id'] for ch in routing_config if ch.get('type', 'soma') == 'soma']
+    tf_ch_ids_p   = [ch['id'] for ch in routing_config if ch.get('type') == 'tf']
+    print("[trace] Building vol_lists for Shift+click coloc trace...")
+    _per_ch_vols = {}
+    for ch in routing_config:
+        cid   = ch['id']
+        ctype = ch.get('type', 'soma')
+        pkl_p = os.path.join(s3_dir, f"{cid}_3d_tracked.pkl")
+        vols  = _load_s3_pkl_as_tile_local(pkl_p, tile_x0, tile_y0, tile_z0)
+        if vols is not None:
+            print(f"[trace] {cid}: loaded {len(vols)} cells from pkl")
+            _per_ch_vols[cid] = vols
+        else:
+            filt_csv = os.path.join(filtered_dir, f"{tile_name}_{cid}_result.csv")
+            raw_csv  = os.path.join(raw_dir,      f"{tile_name}_{cid}_result.csv")
+            csv_p = filt_csv if os.path.isfile(filt_csv) else raw_csv
+            zl_p  = zl_soma if ctype == 'soma' else zl_tf
+            print(f"[trace] {cid}: pkl not found, falling back to CSV re-z-link")
+            _per_ch_vols[cid] = _run_zlink_for_csv(
+                csv_p, z_range,
+                iou_thresh=zl_p.get('iou_thresh', 0.35),
+                min_z_layers=zl_p.get('min_z_layers', 1),
+                max_cell_z_span=zl_p.get('max_cell_z_span', 5),
+                max_z_gap=zl_p.get('max_z_gap', 0),
+            )
+    _debug_soma_vols, _debug_tf_dict = _build_merged_soma_vols(
+        _per_ch_vols, soma_ch_ids_p, tf_ch_ids_p, zl_soma)
+    _debug_all_tf = [dict(c, _cid=_tf_cid)
+                     for _tf_cid, _vols in _debug_tf_dict.items()
+                     for c in _vols]
+    _debug_cp = {
+        'z_pad':                 zl_tf.get('containment_z_pad', 2),
+        'xy_margin':             zl_tf.get('containment_xy_margin', 0),
+        'max_center_dist_ratio': zl_tf.get('max_center_dist_ratio', 0.5),
+    }
+    print(f"[trace] Shift+click any [coloc] box to trace.  "
+          f"({len(_debug_soma_vols)} soma, {len(_debug_all_tf)} TF)")
+
+    # ── Click-to-inspect  /  Shift+click traces  /  Ctrl+click FN annotation ────
+    fn_ann_path = r'Y:\Fengyi\detection_training\false_negatives.csv'
+    print(f"\n[info] Click any detection box → dimensions in status bar.")
+    print(f"[info] Shift+click [coloc] box → TF colocalization trace in terminal.")
+    print(f"[info] Shift+click [s3]    box → per-z span highlighted in yellow + info.")
+    print(f"[info] Ctrl+click  anywhere  → mark false-negative position → {fn_ann_path}")
     print(f"[info] {len(box_registry)} boxes indexed across all layers.")
+
+    @viewer.bind_key('Shift')
+    def _shift_hint(v):
+        v.status = "⇧ Shift held — click a [s3] or [coloc] box to trace"
+        yield
+        v.status = ""
+
+    @viewer.bind_key('Control')
+    def _ctrl_hint(v):
+        v.status = "⌃ Ctrl held — click anywhere to mark a false-negative position"
+        yield
+        v.status = ""
 
     def _on_click(viewer, event):
         if event.type != 'mouse_press':
             return
+        try:
+            mods = [str(m).lower() for m in event.modifiers]
+            is_shift = any('shift' in m for m in mods)
+            is_ctrl  = any('ctrl' in m or 'control' in m for m in mods)
+        except Exception:
+            is_shift = is_ctrl = False
         pos = viewer.cursor.position
         if len(pos) < 3:
             return
         z_cur = int(round(pos[0]))
         y_cur = float(pos[1])
         x_cur = float(pos[2])
+
+        if is_ctrl:
+            z_abs = z_cur + z_range[0]
+            _append_false_negative(fn_ann_path, tile_name, tile_path, z_abs, x_cur, y_cur)
+            hits = [b for b in box_registry
+                    if b['z'] == z_cur
+                    and b['x1'] <= x_cur <= b['x2']
+                    and b['y1'] <= y_cur <= b['y2']]
+            box_note = ""
+            if hits:
+                best_h = min(hits, key=lambda b: (b['x2']-b['x1'])*(b['y2']-b['y1']))
+                box_note = f"  (inside [{best_h['layer_name']}] {best_h['cls']})"
+            print(f"[fn] {tile_name}  z={z_abs}  x={x_cur:.0f}  y={y_cur:.0f}{box_note}")
+            viewer.status = (f"⌃ FN marked: z={z_abs} x={x_cur:.0f} y={y_cur:.0f}{box_note}"
+                             f"  → {os.path.basename(fn_ann_path)}")
+            return
+
         hits = [
             b for b in box_registry
             if b['z'] == z_cur
@@ -1548,14 +2123,71 @@ def _run_post(vis_cfg, config, paths, routing_config):
             and b['y1'] <= y_cur <= b['y2']
         ]
         if hits:
-            best = min(hits, key=lambda b: (b['x2'] - b['x1']) * (b['y2'] - b['y1']))
+            if is_shift:
+                trace_hits = [b for b in hits
+                              if b.get('layer_name', '').startswith(('[s3]', '[zlinked]', '[coloc]'))]
+                candidates = trace_hits if trace_hits else hits
+            else:
+                candidates = hits
+            active_layer = viewer.layers.selection.active
+            if active_layer is not None:
+                active_hits = [b for b in candidates if b.get('layer_name') == active_layer.name]
+                if active_hits:
+                    candidates = active_hits
+            best = min(candidates, key=lambda b: (b['x2'] - b['x1']) * (b['y2'] - b['y1']))
             w = best['x2'] - best['x1']
             h = best['y2'] - best['y1']
+            lname = best.get('layer_name', '')
             mean_str = f"  mean={best['mean']:.0f}" if best.get('mean', 0) != 0 else ""
-            viewer.status = (f"[{best['layer_name']}] {best['cls']}  "
-                             f"w={w:.0f}px  h={h:.0f}px  z={best['z']}{mean_str}")
+            if not is_shift:
+                viewer.status = (f"[{lname}] {best['cls']}  "
+                                 f"w={w:.0f}px  h={h:.0f}px  z={best['z']}{mean_str}")
+            elif lname.startswith('[coloc]'):
+                if _debug_soma_vols:
+                    soma_idx = _find_soma_idx_for_box(best, z_range, _debug_soma_vols)
+                    if soma_idx is not None:
+                        res = _trace_coloc_for_soma(
+                            soma_idx, _debug_soma_vols, _debug_all_tf, **_debug_cp)
+                        _print_coloc_trace(res, _debug_cp)
+                        _print_coloc_all_channels(res, soma_ch_ids_p, _per_ch_vols)
+                        viewer.status = f"⇧ coloc trace for soma #{soma_idx} → see terminal"
+                    else:
+                        cx = (best['x1'] + best['x2']) / 2
+                        cy = (best['y1'] + best['y2']) / 2
+                        print(f"[trace] no soma matched — box cx={cx:.0f} cy={cy:.0f} z={best['z']}")
+                        viewer.status = f"⇧ [coloc] no soma matched at cx={cx:.0f} cy={cy:.0f} z={best['z']}"
+                else:
+                    print("[trace] vol_lists not available")
+                    viewer.status = "⇧ [coloc] vol_lists not available — see terminal"
+            elif lname.startswith(('[s3]', '[zlinked]')):
+                for lyr in list(viewer.layers):
+                    if lyr.name == '[debug] s3 span':
+                        viewer.layers.remove(lyr)
+                cell, cid = _find_vollist_entry_for_box(
+                    best, z_range, _per_ch_vols, lname)
+                if cell is not None:
+                    _print_s3_cell_info(cell, cid)
+                    sh, co = _build_s3_span_shapes(cell, z_range, canvas_shape)
+                    if sh:
+                        _add_labels_layer(viewer, sh, co, canvas_shape,
+                                          name='[debug] s3 span', visible=True,
+                                          opacity=0.9, outline_width=2)
+                    viewer.status = (f"⇧ [{cid}] s3 info → terminal  "
+                                     f"cz={cell['cz']}  z=[{cell['z_min']}-{cell['z_max']}]")
+                else:
+                    cx = (best['x1'] + best['x2']) / 2
+                    cy = (best['y1'] + best['y2']) / 2
+                    print(f"[trace] no vol_list match for s3 box "
+                          f"cx={cx:.0f} cy={cy:.0f} z={best['z']}")
+                    viewer.status = (f"⇧ no match in vol_list for {lname}  "
+                                     f"cx={cx:.0f} cy={cy:.0f} z={best['z']} — see terminal")
+            else:
+                viewer.status = f"⇧ {lname} is not traceable — only [s3], [zlinked], [coloc] are traceable"
         else:
-            viewer.status = f"(no box at z={z_cur} x={x_cur:.0f} y={y_cur:.0f})"
+            if is_shift:
+                viewer.status = f"⇧ Shift+click: no box at z={z_cur} x={x_cur:.0f} y={y_cur:.0f}"
+            else:
+                viewer.status = f"(no box at z={z_cur} x={x_cur:.0f} y={y_cur:.0f})"
 
     viewer.mouse_drag_callbacks.append(_on_click)
 
