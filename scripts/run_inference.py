@@ -15,6 +15,9 @@ import numpy as np
 import torch
 from tqdm import tqdm
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 from src.config.loader import load_config
 from src.utils.logger import setup_logging
@@ -68,7 +71,8 @@ if __name__ == '__main__':
     derived['pATH_CHANNEL_3D']    = os.path.join(base_res_path, "3_channel_3d")
     derived['pATH_COLOCALIZATION'] = os.path.join(base_res_path, "4_colocalization")
     derived['pATH_REPORT'] = os.path.join(base_res_path, "5_analysis_report")
-    derived['pATH_CENTROIDS'] = os.path.join(derived['pATH_REPORT'], "cell_centroids")
+    derived['pATH_CENTROIDS']   = os.path.join(derived['pATH_REPORT'], "cell_centroids")
+    derived['pATH_HISTOGRAMS']  = os.path.join(base_res_path, "1_tile_2d_histograms")
 
     # 将构建好的字典挂载回 config，供 worker.py 及后续流程使用
     config['derived_paths'] = derived
@@ -265,6 +269,7 @@ if __name__ == '__main__':
                         iou_thresh=zl_params.get('iou_thresh', 0.35),
                         min_z_layers=zl_params.get('min_z_layers', 1),
                         max_cell_z_span=zl_params.get('max_cell_z_span', 5),
+                        max_z_gap=zl_params.get('max_z_gap', 0),
                     )
                     per_ch_vol_lists[cid] = vol_list
                     if vol_list:
@@ -310,12 +315,15 @@ if __name__ == '__main__':
     # 阶段 2.75: Tile 级 CSV 强度/尺寸过滤
     # 输入: 1_tile_2d_raw (post_align) 或 0_channel_alignment (pre_align)
     # 输出: 1_tile_2d_filtered  (Stage 3 从此读取)
+    # stage_2_75_enabled=true : 应用过滤（适合旧的未过滤 1_tile_2d_raw）
+    # stage_2_75_enabled=false: 直接透传（检测阶段已过滤时跳过重复处理）
     # 修改过滤参数后删除 1_tile_2d_filtered 即可重跑，无需重新检测
     # ==========================================
     _filter_src = (derived['pATH_ALIGN_OFFSETS']
                    if pipeline_mode == 'pre_align'
                    else derived['pATH_DET_RES'])
     _filter_dst = derived['pATH_DET_FILTERED']
+    _stage_2_75_enabled = config.get('stage_2_75_enabled', True)
 
     _tile_names_all = [os.path.split(p)[-1] for p in pATHTILE_all]
     _filter_done = all(
@@ -327,6 +335,17 @@ if __name__ == '__main__':
 
     if _filter_done:
         logging.info("✔️ Checkpoint 2.75 达成: 过滤后 tile CSV 已全部存在。")
+    elif not _stage_2_75_enabled:
+        import shutil
+        logging.info("阶段 2.75: stage_2_75_enabled=false，直接透传 raw CSV → filtered（跳过过滤）...")
+        for _tn in tqdm(_tile_names_all, desc="Passthrough tiles"):
+            for _ch in routing_config:
+                _ch_id  = _ch['id']
+                _in_csv = os.path.join(_filter_src, f"{_tn}_{_ch_id}_result.csv")
+                _out_csv = os.path.join(_filter_dst, f"{_tn}_{_ch_id}_result.csv")
+                if os.path.exists(_in_csv) and not os.path.exists(_out_csv):
+                    shutil.copy2(_in_csv, _out_csv)
+        logging.info("✔️ [2.75] 透传完成。")
     else:
         logging.info("阶段 2.75: 对 tile CSV 应用强度/尺寸过滤...")
         _sd_dp   = dp.get('stardist', {})
@@ -420,6 +439,47 @@ if __name__ == '__main__':
     pATH_SRC_CSV = _filter_dst
 
     # ==========================================
+    # 阶段 2.8: 生成过滤前 Raw 2D 直方图（强度 & 面积）
+    # 输入: _filter_src (raw CSV)
+    # 输出: 1_tile_2d_histograms/{tile}_{ch}_hist.png
+    # 删除输出目录可强制重建；不影响过滤及后续流程
+    # ==========================================
+    _hist_dir  = derived['pATH_HISTOGRAMS']
+    _hist_todo = [
+        (_tn, _ch)
+        for _tn in _tile_names_all
+        for _ch in routing_config
+        if _ch.get('active', True)
+        and os.path.exists(os.path.join(_filter_src, f"{_tn}_{_ch['id']}_result.csv"))
+        and not os.path.exists(os.path.join(_hist_dir, f"{_tn}_{_ch['id']}_hist.png"))
+    ]
+    if not _hist_todo:
+        logging.info("✔️ Checkpoint 2.8 达成: raw 直方图已全部存在。")
+    else:
+        logging.info(f"阶段 2.8: 生成 {len(_hist_todo)} 个 raw 2D 直方图 ...")
+        for _tn, _ch in tqdm(_hist_todo, desc="Raw histograms"):
+            _ch_id    = _ch['id']
+            _csv_path = os.path.join(_filter_src, f"{_tn}_{_ch_id}_result.csv")
+            _df_raw   = pd.read_csv(_csv_path)
+            if _df_raw.empty:
+                continue
+            _areas = ((_df_raw['x2'] - _df_raw['x1']) * (_df_raw['y2'] - _df_raw['y1'])).values
+            _means = _df_raw['mean'].values
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+            axes[0].hist(_means, bins=50, color='steelblue', edgecolor='none')
+            axes[0].set_title(f'Intensity (mean)  |  {_tn} / {_ch_id}  |  n={len(_means):,}')
+            axes[0].set_xlabel('mean pixel value')
+            axes[0].set_ylabel('count')
+            axes[1].hist(_areas, bins=50, color='salmon', edgecolor='none')
+            axes[1].set_title(f'Area (px²)  |  {_tn} / {_ch_id}  |  n={len(_areas):,}')
+            axes[1].set_xlabel('area (px²)')
+            axes[1].set_ylabel('count')
+            fig.tight_layout()
+            fig.savefig(os.path.join(_hist_dir, f"{_tn}_{_ch_id}_hist.png"), dpi=100)
+            plt.close(fig)
+        logging.info(f"✔️ [2.8] 直方图输出至: {_hist_dir}")
+
+    # ==========================================
     # 阶段 3: 线性 Checkpoint - 全局拼接与 Z-Linker共定位
     # ==========================================
     bbox_path = os.path.join(derived['pATH_COLOCALIZATION'], "coloc_result.csv")
@@ -475,7 +535,6 @@ if __name__ == '__main__':
                                     stitched_predictions, csv.reader(tile_file), None, z_start, Z,
                                     dir_dict[dir_name], disp_mat_fin, (H, W),
                                     metadata_registry, tile_name, tILESIZE=tile_size,
-                                    cross_tile_iomin_thresh=dp.get('cross_tile_iomin_thresh', 0.5)
                                 )
                     for layer in stitched_predictions:
                         for group in layer:
@@ -542,6 +601,7 @@ if __name__ == '__main__':
                     iou_thresh=zl_soma.get('iou_thresh', 0.35),
                     min_z_layers=zl_soma.get('min_z_layers', 1),
                     max_cell_z_span=zl_soma.get('max_cell_z_span', 5),
+                    max_z_gap=zl_soma.get('max_z_gap', 0),
                 )
                 soma_vol_by_ch[cid] = vol_list
                 out_3d = os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.csv")
@@ -559,6 +619,7 @@ if __name__ == '__main__':
                     iou_thresh=zl_tf.get('iou_thresh', 0.25),
                     min_z_layers=zl_tf.get('min_z_layers', 1),
                     max_cell_z_span=zl_tf.get('max_cell_z_span', 3),
+                    max_z_gap=zl_tf.get('max_z_gap', 0),
                 )
                 tf_vol_by_ch[cid] = vol_list
                 out_3d = os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.csv")

@@ -152,19 +152,70 @@ def _iomin_nms_rows(rows, containment_thresh):
     return [row for i, row in enumerate(rows) if keep_mask[i]]
 
 
-def _write_filtered_detections(det_buf, csv_writers, dp, ch_routing_map):
-    """Write detections to CSV, applying per-z IoMin NMS for YOLO channels if configured.
+def _apply_bbox_filters(rows, model_dp):
+    """Apply size/intensity filters to detection rows at write time.
 
-    IoMin NMS removes boxes that are almost entirely contained within a higher-confidence
-    box (IoMin > nms_containment_thresh).  Stage 2.75 applies the same filter to already-
-    detected samples so both paths produce consistent output.
+    rows: list of [name, x1, y1, x2, y2, class, score, mean, z]
+    Filters applied in order: bbox_min/max → aspect_ratio → area_pct → mean_pct → mean_min.
+    Percentile filters are computed over the full tile (all z-slices) so thresholds match
+    what Stage 2.75 would produce.
+    """
+    if not rows or not model_dp:
+        return rows
+    r = np.array(rows, dtype=object)
+    x1 = r[:, 1].astype(float); y1 = r[:, 2].astype(float)
+    x2 = r[:, 3].astype(float); y2 = r[:, 4].astype(float)
+    mean_vals = r[:, 7].astype(float)
+    w = x2 - x1; h = y2 - y1
+    mask = np.ones(len(r), dtype=bool)
+
+    bbox_min = model_dp.get('bbox_min')
+    if bbox_min is not None:
+        mask &= (w >= bbox_min) & (h >= bbox_min)
+    bbox_max = model_dp.get('bbox_max')
+    if bbox_max is not None:
+        mask &= (w <= bbox_max) & (h <= bbox_max)
+    aspect_max = model_dp.get('bbox_max_aspect_ratio')
+    if aspect_max is not None:
+        mask &= np.maximum(w, h) <= aspect_max * np.maximum(np.minimum(w, h), 1e-6)
+
+    areas = w * h
+    area_pct_min = model_dp.get('bbox_area_pct_min')
+    if area_pct_min is not None and mask.any():
+        thresh = float(np.percentile(areas[mask], area_pct_min))
+        mask &= areas >= thresh
+    area_pct_max = model_dp.get('bbox_area_pct_max')
+    if area_pct_max is not None and mask.any():
+        thresh = float(np.percentile(areas[mask], area_pct_max))
+        mask &= areas <= thresh
+    mean_pct_min = model_dp.get('bbox_mean_pct_min')
+    if mean_pct_min is not None and mask.any():
+        thresh = float(np.percentile(mean_vals[mask], mean_pct_min))
+        mask &= mean_vals >= thresh
+    mean_min = model_dp.get('bbox_mean_min') or 0
+    if mean_min > 0:
+        mask &= mean_vals >= mean_min
+
+    return [rows[i] for i in range(len(rows)) if mask[i]]
+
+
+def _write_filtered_detections(det_buf, csv_writers, dp, ch_routing_map):
+    """Write detections to CSV, applying bbox/intensity filters and per-z IoMin NMS.
+
+    Filters (bbox_min/max, aspect_ratio, area_pct, mean_pct, mean_min) are applied here
+    so 1_tile_2d_raw already contains clean boxes.  Stage 2.75 can then be disabled
+    (stage_2_75_enabled=false) to skip redundant re-filtering.
     """
     yolo_dp = dp.get('yolo', {})
+    sd_dp   = dp.get('stardist', {})
     containment_thresh = yolo_dp.get('nms_containment_thresh', None)
 
     for ch_id, rows in det_buf.items():
-        ch = ch_routing_map.get(ch_id, {})
-        if containment_thresh is not None and ch.get('model', '').lower() == 'yolo':
+        ch    = ch_routing_map.get(ch_id, {})
+        model = ch.get('model', '').lower()
+        model_dp = sd_dp if model == 'stardist' else yolo_dp
+        rows = _apply_bbox_filters(rows, model_dp)
+        if containment_thresh is not None and model == 'yolo':
             rows = _iomin_nms_rows(rows, containment_thresh)
         for row in rows:
             csv_writers[ch_id].writerow(row)

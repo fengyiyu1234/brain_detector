@@ -679,9 +679,10 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
                 s['y1_3d'] - xy_margin <= tf['y1_3d'] and
                 tf['y2_3d'] <= s['y2_3d'] + xy_margin
             )
+            eff_z_pad = z_pad if s['z_max'] > s['z_min'] else 0
             contained_z = (
-                s['z_min'] - z_pad <= tf['z_min'] and
-                tf['z_max'] <= s['z_max'] + z_pad
+                s['z_min'] - eff_z_pad <= tf['z_min'] and
+                tf['z_max'] <= s['z_max'] + eff_z_pad
             )
             if not (contained_xy and contained_z):
                 continue
@@ -888,7 +889,7 @@ def non_max_suppression_iou(boxes, overlapThresh=0.45, sort_idx=4, containment_t
     return boxes[pick]
 
 
-def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, disp_mat, size, metadata_registry, tile_name, tILESIZE=2048, file_z0=None, cross_tile_iomin_thresh=0.5):
+def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, disp_mat, size, metadata_registry, tile_name, tILESIZE=2048, file_z0=None):
     row, col = pos
     ABS_X, ABS_Y, ABS_Z = disp_mat[pos]
     H, W = size
@@ -920,40 +921,6 @@ def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, d
                     (all_predictions[z - 1][cell_type_index], new_box)
                 )
                 metadata_registry.append([(x1 + x2) / 2, (y1 + y2) / 2, z, tile_name, slice_name])
-            else:
-                # 重叠区：与已有框做 IoMin 匹配，命中则 union 合并，否则新增
-                existing = all_predictions[z - 1][cell_type_index]
-                if len(existing) == 0:
-                    all_predictions[z - 1][cell_type_index] = np.concatenate((existing, new_box))
-                    metadata_registry.append([(x1 + x2) / 2, (y1 + y2) / 2, z, tile_name, slice_name])
-                else:
-                    ex1 = existing[:, 0].astype(float)
-                    ey1 = existing[:, 1].astype(float)
-                    ex2 = existing[:, 2].astype(float)
-                    ey2 = existing[:, 3].astype(float)
-                    inter = (np.maximum(0, np.minimum(x2, ex2) - np.maximum(x1, ex1)) *
-                             np.maximum(0, np.minimum(y2, ey2) - np.maximum(y1, ey1)))
-                    new_area = (x2 - x1) * (y2 - y1)
-                    e_areas  = (ex2 - ex1) * (ey2 - ey1)
-                    iomin    = inter / (np.minimum(new_area, e_areas) + 1e-6)
-                    best     = int(np.argmax(iomin))
-                    if iomin[best] > cross_tile_iomin_thresh:
-                        # Union 合并：取两框外包络，原地替换
-                        existing[best] = np.array([
-                            min(x1, float(ex1[best])),
-                            min(y1, float(ey1[best])),
-                            max(x2, float(ex2[best])),
-                            max(y2, float(ey2[best])),
-                            max(score, float(existing[best, 4])),
-                            existing[best, 5],
-                            existing[best, 6],
-                            existing[best, 7],
-                        ], dtype=object)
-                    else:
-                        # 无匹配：当前 tile 检测到了邻 tile 遗漏的细胞，新增
-                        all_predictions[z - 1][cell_type_index] = np.concatenate(
-                            (existing, new_box)
-                        )
-                        metadata_registry.append([(x1 + x2) / 2, (y1 + y2) / 2, z, tile_name, slice_name])
+            # 重叠区：丢弃（保留左/上方 tile 的结果，右/下方 tile 的重叠区检测一律舍弃）
 
     return all_predictions

@@ -25,7 +25,7 @@ dependencies:
   # ── PyTorch — installed via conda (CUDA build from pytorch channel) ──
   - pytorch>=2.6
   - torchvision
-  - pytorch-cuda=12.6
+  - pytorch-cuda=12.4
 
   # ── pip-only packages ───────────────────────────────────────
   - pip
@@ -33,10 +33,12 @@ dependencies:
     # OpenCV (headless is lighter; replace with opencv-python if you need GUI)
     - opencv-python-headless>=4.8
 
-    # TensorFlow GPU on Windows via DirectML (no CUDA version conflict)
-    - tensorflow-directml
+    - tensorflow
 
     # Detection models
     - ultralytics>=8.0       # YOLOv8/v9 (YOLO class)
     - cellpose>=2.2          # nucleus segmentation
     - stardist>=0.8.0        # pretrained nucleus segmentation (TF backend)
+    - csbdeep>=0.7.0         # StarDist image normalization
+    - scikit-image>=0.21     # regionprops for StarDist post-processing
+    - matplotlib>=3.7        # visualization and histogram generation

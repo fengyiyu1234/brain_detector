@@ -26,7 +26,8 @@ def parse_class_string(cls_str):
     return base_type, markers
 
 
-def run_z_linker(full_stack_matrix, iou_thresh=0.45, min_z_layers=2, max_cell_z_span=5):
+def run_z_linker(full_stack_matrix, iou_thresh=0.45, min_z_layers=2,
+                 max_cell_z_span=5, max_z_gap=0):
     """
     Returns (summary_array, volumetric_list).
       summary_array:    np.ndarray (N, 8) — one row per cell, center_z, for visualization CSV
@@ -49,7 +50,8 @@ def run_z_linker(full_stack_matrix, iou_thresh=0.45, min_z_layers=2, max_cell_z_
         curr_detections = z_groups[z]
 
         for track in active_tracks:
-            if z - track['first_z'] >= max_cell_z_span:
+            if (z - track['first_z'] >= max_cell_z_span or
+                    z - track['last_z'] > max_z_gap):
                 track['active'] = False
 
         matched_det_indices = set()
