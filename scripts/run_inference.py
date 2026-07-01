@@ -241,6 +241,8 @@ if __name__ == '__main__':
             pa_fine_z        = pre_align_cfg.get('z_fine_search_slices', 2)
             pa_xy_res        = dp.get('xy_resolution_um', 0.65)
             pa_z_res         = dp.get('z_resolution_um', 8.0)
+            pa_max_center_dist_ratio = zl_tf.get('max_center_dist_ratio', 0.3)
+            pa_containment_z_pad     = zl_tf.get('containment_z_pad', 0)
 
             for tile_path in tqdm(pATHTILE, desc="Pre-Align Tiles"):
                 tile_name = os.path.split(tile_path)[-1]
@@ -293,6 +295,8 @@ if __name__ == '__main__':
                     z_range_slices=pa_z_range,
                     fine_xy_px=pa_fine_xy,
                     fine_z_slices=pa_fine_z,
+                    max_center_dist_ratio=pa_max_center_dist_ratio,
+                    containment_z_pad=pa_containment_z_pad,
                 )
 
                 # 4. 保存偏移 JSON
@@ -630,14 +634,16 @@ if __name__ == '__main__':
 
         # ====== 3. 3D Colocalization ======
         # Phase A: soma × soma 3D IoU（逐对匹配，依次合并到主列表）
-        iou_thresh_3d = zl_soma.get('iou_thresh_3d', 0.15)
-        z_pad_3d      = zl_soma.get('z_pad_3d', 2)
+        iou_thresh_3d   = zl_soma.get('iou_thresh_3d', 0.15)
+        iomin_thresh_3d = zl_soma.get('iomin_thresh_3d', 0.5)
+        z_pad_3d        = zl_soma.get('z_pad_3d', 2)
 
         merged_soma_vols = list(soma_vol_by_ch.get(soma_ch_ids[0], [])) if soma_ch_ids else []
         for cid_b in soma_ch_ids[1:]:
             cells_b = soma_vol_by_ch.get(cid_b, [])
             matched_pairs, unmatched_a, unmatched_b = match_soma_3d_iou(
-                merged_soma_vols, cells_b, iou_thresh=iou_thresh_3d, z_pad=z_pad_3d
+                merged_soma_vols, cells_b,
+                iou_thresh=iou_thresh_3d, iomin_thresh=iomin_thresh_3d, z_pad=z_pad_3d
             )
             for a_cell, b_cell in matched_pairs:
                 a_cell['class'] = _merge_class(a_cell['class'], b_cell['class'])

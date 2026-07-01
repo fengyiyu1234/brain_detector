@@ -1160,34 +1160,69 @@ def _print_s3_cell_info(cell, cid):
     """Print all vol_list fields for a z-linked cell to terminal."""
     pz  = cell.get('per_z_boxes', {})
     sep = '─' * 64
+    # Tile offsets present when cell was loaded via _load_s3_pkl_as_tile_local
+    tx0 = cell.get('_tile_x0')
+    ty0 = cell.get('_tile_y0')
+    tz0 = cell.get('_tile_z0')
+    has_offsets = tx0 is not None
+
     print(f'\n{sep}')
     print(f"S3 CELL INFO  —  channel={cid}  class={cell['class']}")
-    print(f"  center    ({cell['cx']:.1f}, {cell['cy']:.1f}, {cell['cz']:.1f})")
-    print(f"  3D bbox   x=[{cell['x1_3d']:.0f},{cell['x2_3d']:.0f}]  "
+    print(f"  center (local)   ({cell['cx']:.1f}, {cell['cy']:.1f}, {cell['cz']:.1f})")
+    if has_offsets:
+        gcx = cell['cx'] + tx0
+        gcy = cell['cy'] + ty0
+        gcz = cell['cz'] + 1 - tz0
+        print(f"  center (global)  ({gcx:.1f}, {gcy:.1f}, {gcz:.1f})")
+    print(f"  3D bbox (local)  x=[{cell['x1_3d']:.0f},{cell['x2_3d']:.0f}]  "
           f"y=[{cell['y1_3d']:.0f},{cell['y2_3d']:.0f}]  "
           f"z=[{cell['z_min']},{cell['z_max']}]")
+    if has_offsets:
+        gx1 = cell['x1_3d'] + tx0;  gx2 = cell['x2_3d'] + tx0
+        gy1 = cell['y1_3d'] + ty0;  gy2 = cell['y2_3d'] + ty0
+        gz1 = cell['z_min'] + 1 - tz0;  gz2 = cell['z_max'] + 1 - tz0
+        print(f"  3D bbox (global) x=[{gx1:.0f},{gx2:.0f}]  "
+              f"y=[{gy1:.0f},{gy2:.0f}]  z=[{gz1},{gz2}]")
     n_layers = cell['z_max'] - cell['z_min'] + 1
     print(f"  z-span    {n_layers} layers  ({len(pz)} detections)")
     score_str = f"{cell['score']:.3f}" if cell.get('score') is not None else '?'
     mean_str  = f"{cell['mean']:.1f}"  if cell.get('mean')  is not None else '?'
     print(f"  score={score_str}  mean={mean_str}")
     if pz:
-        print(f"  per-z boxes  (abs_z : [x1, y1, x2, y2]  w  h):")
-        for z_abs in sorted(pz.keys()):
-            b = pz[z_abs]
-            print(f"    z={z_abs:5d}  [{b[0]:.0f},{b[1]:.0f},{b[2]:.0f},{b[3]:.0f}]"
+        hdr = "local_z" if not has_offsets else "local_z (global_z)"
+        print(f"  per-z boxes  ({hdr} : [x1, y1, x2, y2]  w  h):")
+        for z_loc in sorted(pz.keys()):
+            b = pz[z_loc]
+            if has_offsets:
+                g_z = z_loc + 1 - tz0
+                z_label = f"{z_loc:5d} ({g_z:5d})"
+            else:
+                z_label = f"{z_loc:5d}"
+            print(f"    z={z_label}  [{b[0]:.0f},{b[1]:.0f},{b[2]:.0f},{b[3]:.0f}]"
                   f"  w={b[2]-b[0]:.0f}  h={b[3]-b[1]:.0f}")
     print(f'{sep}\n')
 
 
-def _append_false_negative(ann_path, tile_name, tile_path, z_abs, x, y):
+def _append_false_negative(ann_path, tile_name, tile_path, z_abs, x, y, channel=''):
     """Append one false-negative annotation to ann_path (CSV), creating header if new."""
     exists = os.path.isfile(ann_path)
     with open(ann_path, 'a', encoding='utf-8', newline='') as f:
         if not exists:
-            f.write("tile_name,tile_path,z,x,y,timestamp\n")
+            f.write("tile_name,tile_path,z,x,y,channel,timestamp\n")
         ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        f.write(f"{tile_name},{tile_path},{z_abs},{x:.0f},{y:.0f},{ts}\n")
+        f.write(f"{tile_name},{tile_path},{z_abs},{x:.0f},{y:.0f},{channel},{ts}\n")
+
+
+def _active_image_channel(viewer):
+    """Return the channel id of the active [img] layer, or '' if none is active."""
+    active = viewer.layers.selection.active
+    if active is not None and active.name.startswith('[img] '):
+        return active.name[len('[img] '):]
+    img_visible = [l for l in viewer.layers
+                   if l.name.startswith('[img] ') and l.visible]
+    if len(img_visible) == 1:
+        return img_visible[0].name[len('[img] '):]
+    return ''
 
 
 def _build_s3_span_shapes(cell, z_range, canvas_shape):
@@ -1240,6 +1275,10 @@ def _load_s3_pkl_as_tile_local(pkl_path, tile_x0, tile_y0, tile_z0=0):
             pzb[int(z_k) - 1 + tile_z0] = [bv[0] - tile_x0, bv[1] - tile_y0,
                                              bv[2] - tile_x0, bv[3] - tile_y0]
         tc['per_z_boxes'] = pzb
+        # Store tile offsets so _print_s3_cell_info can reconstruct global coords
+        tc['_tile_x0'] = tile_x0
+        tc['_tile_y0'] = tile_y0
+        tc['_tile_z0'] = tile_z0
         tile_vols.append(tc)
     return tile_vols
 
@@ -1731,11 +1770,14 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
             )
 
     # ── Click-to-inspect  /  Shift+click traces  /  Ctrl+click FN annotation ────
-    fn_ann_path = r'Y:\Fengyi\detection_training\false_negatives.csv'
+    fn_ann_path = vis_cfg.get('fn_ann_path') or None
     print(f"\n[info] Click any detection box → dimensions in status bar.")
     print(f"[info] Shift+click [coloc]   box → TF colocalization trace in terminal.")
     print(f"[info] Shift+click [zlinked] box → per-z span highlighted in yellow + info.")
-    print(f"[info] Ctrl+click  anywhere  → mark false-negative position → {fn_ann_path}")
+    if fn_ann_path:
+        print(f"[info] Ctrl+click  anywhere  → mark false-negative position → {fn_ann_path}")
+    else:
+        print(f"[info] Ctrl+click  disabled  (set 'fn_ann_path' in vis_config.json to enable)")
     print(f"[info] {len(box_registry)} boxes indexed across all layers.")
 
     @viewer.bind_key('Shift')
@@ -1767,8 +1809,13 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
         x_cur = float(pos[2])
 
         if is_ctrl:
+            if not fn_ann_path:
+                viewer.status = "⌃ Ctrl+click disabled — set 'fn_ann_path' in vis_config.json"
+                return
             z_abs = z_cur + z_range[0]
-            _append_false_negative(fn_ann_path, tile_name, tile_path, z_abs, x_cur, y_cur)
+            ch_tag = _active_image_channel(viewer)
+            _append_false_negative(fn_ann_path, tile_name, tile_path, z_abs, x_cur, y_cur,
+                                   channel=ch_tag)
             hits = [b for b in box_registry
                     if b['z'] == z_cur
                     and b['x1'] <= x_cur <= b['x2']
@@ -1777,9 +1824,10 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
             if hits:
                 best_h = min(hits, key=lambda b: (b['x2']-b['x1'])*(b['y2']-b['y1']))
                 box_note = f"  (inside [{best_h['layer_name']}] {best_h['cls']})"
-            print(f"[fn] {tile_name}  z={z_abs}  x={x_cur:.0f}  y={y_cur:.0f}{box_note}")
-            viewer.status = (f"⌃ FN marked: z={z_abs} x={x_cur:.0f} y={y_cur:.0f}{box_note}"
-                             f"  → {os.path.basename(fn_ann_path)}")
+            ch_note = f"  ch={ch_tag}" if ch_tag else ""
+            print(f"[fn] {tile_name}  z={z_abs}  x={x_cur:.0f}  y={y_cur:.0f}{ch_note}{box_note}")
+            viewer.status = (f"⌃ FN marked: z={z_abs} x={x_cur:.0f} y={y_cur:.0f}"
+                             f"{ch_note}{box_note}  → {os.path.basename(fn_ann_path)}")
             return
 
         hits = [
@@ -2065,11 +2113,14 @@ def _run_post(vis_cfg, config, paths, routing_config):
           f"({len(_debug_soma_vols)} soma, {len(_debug_all_tf)} TF)")
 
     # ── Click-to-inspect  /  Shift+click traces  /  Ctrl+click FN annotation ────
-    fn_ann_path = r'Y:\Fengyi\detection_training\false_negatives.csv'
+    fn_ann_path = vis_cfg.get('fn_ann_path') or None
     print(f"\n[info] Click any detection box → dimensions in status bar.")
     print(f"[info] Shift+click [coloc] box → TF colocalization trace in terminal.")
     print(f"[info] Shift+click [s3]    box → per-z span highlighted in yellow + info.")
-    print(f"[info] Ctrl+click  anywhere  → mark false-negative position → {fn_ann_path}")
+    if fn_ann_path:
+        print(f"[info] Ctrl+click  anywhere  → mark false-negative position → {fn_ann_path}")
+    else:
+        print(f"[info] Ctrl+click  disabled  (set 'fn_ann_path' in vis_config.json to enable)")
     print(f"[info] {len(box_registry)} boxes indexed across all layers.")
 
     @viewer.bind_key('Shift')
@@ -2101,8 +2152,13 @@ def _run_post(vis_cfg, config, paths, routing_config):
         x_cur = float(pos[2])
 
         if is_ctrl:
+            if not fn_ann_path:
+                viewer.status = "⌃ Ctrl+click disabled — set 'fn_ann_path' in vis_config.json"
+                return
             z_abs = z_cur + z_range[0]
-            _append_false_negative(fn_ann_path, tile_name, tile_path, z_abs, x_cur, y_cur)
+            ch_tag = _active_image_channel(viewer)
+            _append_false_negative(fn_ann_path, tile_name, tile_path, z_abs, x_cur, y_cur,
+                                   channel=ch_tag)
             hits = [b for b in box_registry
                     if b['z'] == z_cur
                     and b['x1'] <= x_cur <= b['x2']
@@ -2111,9 +2167,10 @@ def _run_post(vis_cfg, config, paths, routing_config):
             if hits:
                 best_h = min(hits, key=lambda b: (b['x2']-b['x1'])*(b['y2']-b['y1']))
                 box_note = f"  (inside [{best_h['layer_name']}] {best_h['cls']})"
-            print(f"[fn] {tile_name}  z={z_abs}  x={x_cur:.0f}  y={y_cur:.0f}{box_note}")
-            viewer.status = (f"⌃ FN marked: z={z_abs} x={x_cur:.0f} y={y_cur:.0f}{box_note}"
-                             f"  → {os.path.basename(fn_ann_path)}")
+            ch_note = f"  ch={ch_tag}" if ch_tag else ""
+            print(f"[fn] {tile_name}  z={z_abs}  x={x_cur:.0f}  y={y_cur:.0f}{ch_note}{box_note}")
+            viewer.status = (f"⌃ FN marked: z={z_abs} x={x_cur:.0f} y={y_cur:.0f}"
+                             f"{ch_note}{box_note}  → {os.path.basename(fn_ann_path)}")
             return
 
         hits = [

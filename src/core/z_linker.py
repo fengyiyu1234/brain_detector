@@ -51,7 +51,7 @@ def run_z_linker(full_stack_matrix, iou_thresh=0.45, min_z_layers=2,
 
         for track in active_tracks:
             if (z - track['first_z'] >= max_cell_z_span or
-                    z - track['last_z'] > max_z_gap):
+                    z - track['last_z'] - 1 > max_z_gap):
                 track['active'] = False
 
         matched_det_indices = set()
