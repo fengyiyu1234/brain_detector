@@ -8,10 +8,12 @@ Workflow per tile:
   3. _voxelize_to_grid()        – rasterize 3D boxes into a binary occupancy grid
   4. _fft_3d_shifts()           – 3D FFT cross-correlation → coarse (dx, dy, dz)
   5. _voxel_iou()               – voxel-level IoU at a given bin shift
-  6. find_shift()               – coarse FFT + fine voxel-IoU search
-  7. compute_tile_channel_shifts() – two-step alignment strategy
-  8. apply_shift_to_csv()       – applies (dx, dy, dz) to a detection CSV
-  9. save_tile_offsets()        – writes per-tile offset JSON for traceability
+  6. find_shift()               – coarse FFT + fine voxel-IoU search (intra-soma / intra-TF)
+  7. _containment_score()       – soma-TF containment count at a given pixel shift
+  8. find_shift_containment()   – coarse FFT + fine containment search (soma↔TF cross-group)
+  9. compute_tile_channel_shifts() – two-step alignment strategy
+  10. apply_shift_to_csv()       – applies (dx, dy, dz) to a detection CSV
+  11. save_tile_offsets()        – writes per-tile offset JSON for traceability
 
 Two-step alignment strategy:
   Step 1a  intra-soma  : align each extra soma channel → reference soma channel
@@ -22,6 +24,15 @@ Two-step alignment strategy:
     soma-N   : intra-soma shift
     ref-TF   : cross-group shift
     TF-N     : intra-TF shift + cross-group shift
+
+Step 2 uses containment-based scoring (find_shift_containment) rather than
+voxel-IoU: TF nucleus boxes (e.g. Sox9, ~8-17px) are much smaller than soma
+boxes (whole-cell YOLO boxes), so shifting the TF box by a few pixels inside
+a soma box barely changes bbox overlap area — the voxel-IoU landscape is
+nearly flat in XY and its argmax is noisy. Containment (same strict 3D bbox
+containment + centroid-distance gate used downstream for colocalization,
+see stitcher.annotate_soma_with_tf_containment) is pixel-sensitive instead,
+since a nucleus centroid crossing the gate radius flips the match on/off.
 """
 
 import os
@@ -29,6 +40,7 @@ import json
 import warnings
 import numpy as np
 import pandas as pd
+from scipy.spatial import cKDTree
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -303,14 +315,217 @@ def find_shift(cells_ref, cells_tgt, z_lo, z_hi,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 7.  Two-step per-tile alignment orchestration
+# 7.  Soma-TF containment score at a given pixel/slice shift
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _cell_arrays(cells):
+    """Vectorize a list of vol_list cell dicts into centroid + bbox numpy arrays."""
+    centroids = np.array([[c.get('cx', 0), c.get('cy', 0), c.get('cz', 0)] for c in cells],
+                         dtype=float)
+    x1 = np.array([c.get('x1_3d', 0) for c in cells], dtype=float)
+    y1 = np.array([c.get('y1_3d', 0) for c in cells], dtype=float)
+    x2 = np.array([c.get('x2_3d', 0) for c in cells], dtype=float)
+    y2 = np.array([c.get('y2_3d', 0) for c in cells], dtype=float)
+    z1 = np.array([c.get('z_min', 0) for c in cells], dtype=float)
+    z2 = np.array([c.get('z_max', 0) for c in cells], dtype=float)
+    return centroids, x1, y1, x2, y2, z1, z2
+
+
+def _prepare_soma_containment_index(soma_cells):
+    """
+    Precompute the soma centroid/bbox arrays, bounding-sphere radii and
+    cKDTree used by _containment_score(). Call once per
+    find_shift_containment() invocation and reuse across all candidate shifts.
+    """
+    centroids, x1, y1, x2, y2, z1, z2 = _cell_arrays(soma_cells)
+    radii = np.maximum(np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) / 2, 1.0)
+    max_radius = float(radii.max())
+    tree = cKDTree(centroids)
+    return dict(centroids=centroids, x1=x1, y1=y1, x2=x2, y2=y2, z1=z1, z2=z2,
+                radii=radii, max_radius=max_radius, tree=tree)
+
+
+def _containment_score(soma_idx, tf_arrays, dx, dy, dz,
+                       max_center_dist_ratio, xy_margin, z_pad):
+    """
+    Score how well TF cells satisfy strict 3D bbox containment inside a soma
+    cell after shifting TF coordinates by (dx, dy, dz). Vectorized batch
+    query (cKDTree.query_ball_point with workers=-1) + NumPy masking,
+    mirroring stitcher.match_soma_3d_iou's approach.
+
+    Mirrors stitcher.annotate_soma_with_tf_containment(): XY/Z bbox
+    containment (with xy_margin / z_pad tolerance) AND centroid distance
+    <= max_center_dist_ratio * soma_radius.
+
+    Returns (count, margin_sum):
+      count      : number of TF cells matched to some soma (primary score).
+      margin_sum : sum, over matched TF cells, of the *closest* match's
+                   (gate_radius - dist) margin. Many nearby shifts can tie
+                   on count when TF nuclei sit well inside the gate radius,
+                   so margin_sum breaks ties toward the shift that centers
+                   nuclei most tightly on their matched soma, rather than
+                   an arbitrary edge of the tied plateau.
+
+    soma_idx  : dict from _prepare_soma_containment_index(), precomputed once.
+    tf_arrays : tuple from _cell_arrays(tf_cells), precomputed once.
+    """
+    tf_centroids, t_x1, t_y1, t_x2, t_y2, t_z1, t_z2 = tf_arrays
+    n_tf = len(tf_centroids)
+    if n_tf == 0:
+        return 0, 0.0
+
+    shift = np.array([dx, dy, dz], dtype=float)
+    tf_pts = tf_centroids + shift
+
+    candidate_lists = soma_idx['tree'].query_ball_point(
+        tf_pts, r=soma_idx['max_radius'] * 2, workers=-1
+    )
+    counts = np.array([len(c) for c in candidate_lists], dtype=np.int64)
+    if counts.sum() == 0:
+        return 0, 0.0
+
+    i_arr = np.repeat(np.arange(n_tf, dtype=np.int64), counts)
+    j_arr = np.concatenate([np.asarray(c, dtype=np.int64) for c in candidate_lists if len(c) > 0])
+
+    tf_x1c, tf_x2c = t_x1[i_arr] + dx, t_x2[i_arr] + dx
+    tf_y1c, tf_y2c = t_y1[i_arr] + dy, t_y2[i_arr] + dy
+    tf_z1c, tf_z2c = t_z1[i_arr] + dz, t_z2[i_arr] + dz
+
+    s_x1, s_y1, s_x2, s_y2 = soma_idx['x1'][j_arr], soma_idx['y1'][j_arr], soma_idx['x2'][j_arr], soma_idx['y2'][j_arr]
+    s_z1, s_z2 = soma_idx['z1'][j_arr], soma_idx['z2'][j_arr]
+
+    contained_xy = ((s_x1 - xy_margin <= tf_x1c) & (tf_x2c <= s_x2 + xy_margin) &
+                    (s_y1 - xy_margin <= tf_y1c) & (tf_y2c <= s_y2 + xy_margin))
+    eff_z_pad = np.where(s_z2 > s_z1, z_pad, 0)
+    contained_z = (s_z1 - eff_z_pad <= tf_z1c) & (tf_z2c <= s_z2 + eff_z_pad)
+    ok = contained_xy & contained_z
+    if not ok.any():
+        return 0, 0.0
+
+    dists = np.linalg.norm(soma_idx['centroids'][j_arr] - tf_pts[i_arr], axis=1)
+    gate_radius = max_center_dist_ratio * soma_idx['radii'][j_arr]
+    gate_ok = dists <= gate_radius
+    matched = ok & gate_ok
+    if not matched.any():
+        return 0, 0.0
+
+    m_i = i_arr[matched]
+    m_margin = gate_radius[matched] - dists[matched]
+
+    order = np.argsort(m_i)
+    m_i_sorted, m_margin_sorted = m_i[order], m_margin[order]
+    unique_i, start_idx = np.unique(m_i_sorted, return_index=True)
+    best_margin_per_tf = np.maximum.reduceat(m_margin_sorted, start_idx)
+
+    return int(unique_i.size), float(best_margin_per_tf.sum())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7b.  Full find_shift_containment: voxelize → 3D FFT → fine containment search
+# ──────────────────────────────────────────────────────────────────────────────
+
+def find_shift_containment(cells_ref_soma, cells_tf, z_lo, z_hi,
+                           bin_size=4, xy_res_um=0.65, z_res_um=8.0,
+                           xy_range_px=30, z_range_slices=5,
+                           fine_xy_px=8, fine_z_slices=2,
+                           max_center_dist_ratio=0.3, xy_margin=0, z_pad=0):
+    """
+    Find (dx, dy, dz) that maximises soma-TF containment count (see module
+    docstring for why this replaces voxel-IoU for the soma<->TF cross-group
+    alignment step).
+
+    Strategy:
+      1. Coarse: same 3D-FFT cross-correlation as find_shift() (unchanged),
+         to get near the true peak even for large shifts.
+      2. Fine: instead of voxel-IoU, score each candidate pixel/slice shift
+         by how many TF cells satisfy strict containment inside a soma cell
+         (same test as stitcher.annotate_soma_with_tf_containment).
+
+    Parameters
+    ----------
+    cells_ref_soma, cells_tf : list of vol_list cell dicts
+    z_lo, z_hi                : float  alignment z-window (slice indices)
+    bin_size                  : int    XY voxel size in pixels (FFT stage only)
+    xy_res_um, z_res_um       : float  physical resolution for isotropic z expansion
+    xy_range_px               : int    FFT search radius in XY (pixels)
+    z_range_slices            : int    FFT search radius in Z (slices)
+    fine_xy_px                : int    fine search +/-radius in XY around FFT peak (pixels)
+    fine_z_slices              : int    fine search +/-radius in Z around FFT peak (slices)
+    max_center_dist_ratio     : float  centroid gate, see stitcher.annotate_soma_with_tf_containment
+    xy_margin, z_pad          : containment tolerance, see stitcher.annotate_soma_with_tf_containment
+
+    Returns
+    -------
+    (dx, dy, dz, score)  in pixel / pixel / slice / [0, 1] (score = matched fraction of TF cells)
+    """
+    if not cells_ref_soma or not cells_tf:
+        return 0, 0, 0, 0.0
+
+    all_cells = cells_ref_soma + cells_tf
+    x_min = min(c.get('x1_3d', c.get('cx', 0)) for c in all_cells)
+    x_max = max(c.get('x2_3d', c.get('cx', 0)) for c in all_cells)
+    y_min = min(c.get('y1_3d', c.get('cy', 0)) for c in all_cells)
+    y_max = max(c.get('y2_3d', c.get('cy', 0)) for c in all_cells)
+
+    pad = xy_range_px + fine_xy_px
+    x_min -= pad;  x_max += pad
+    y_min -= pad;  y_max += pad
+
+    grid_ref = _voxelize_to_grid(cells_ref_soma, z_lo, z_hi,
+                                  x_min, x_max, y_min, y_max,
+                                  bin_size, xy_res_um, z_res_um)
+    grid_tgt = _voxelize_to_grid(cells_tf, z_lo, z_hi,
+                                  x_min, x_max, y_min, y_max,
+                                  bin_size, xy_res_um, z_res_um)
+
+    if grid_ref.sum() == 0 or grid_tgt.sum() == 0:
+        return 0, 0, 0, 0.0
+
+    # Coarse: 3D FFT (identical to find_shift)
+    dx_fft, dy_fft, dz_fft = _fft_3d_shifts(
+        grid_ref, grid_tgt, xy_range_px, z_range_slices, bin_size
+    )
+
+    # Fine search in pixel/slice space around FFT peak, scored by containment
+    soma_idx  = _prepare_soma_containment_index(cells_ref_soma)
+    tf_arrays = _cell_arrays(cells_tf)
+
+    # (count, margin_sum) compared lexicographically: count is the primary
+    # objective, margin_sum breaks ties toward the best-centered shift when
+    # several nearby candidates all achieve the same containment count.
+    best_score = (-1, -1.0)
+    best_dx, best_dy, best_dz = dx_fft, dy_fft, dz_fft
+
+    for ddx in range(-fine_xy_px, fine_xy_px + 1):
+        for ddy in range(-fine_xy_px, fine_xy_px + 1):
+            for ddz in range(-fine_z_slices, fine_z_slices + 1):
+                dx_c = dx_fft + ddx
+                dy_c = dy_fft + ddy
+                dz_c = dz_fft + ddz
+                score = _containment_score(
+                    soma_idx, tf_arrays, dx_c, dy_c, dz_c,
+                    max_center_dist_ratio, xy_margin, z_pad
+                )
+                if score > best_score:
+                    best_score = score
+                    best_dx, best_dy, best_dz = dx_c, dy_c, dz_c
+
+    best_count = best_score[0]
+    return (int(best_dx), int(best_dy), int(best_dz),
+            float(best_count) / max(1, len(cells_tf)))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8.  Two-step per-tile alignment orchestration
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
                                 z_center, z_half_window,
                                 bin_size=4, xy_res_um=0.65, z_res_um=8.0,
                                 xy_range_px=30, z_range_slices=5,
-                                fine_xy_px=8, fine_z_slices=2):
+                                fine_xy_px=8, fine_z_slices=2,
+                                max_center_dist_ratio=0.3, xy_margin=0,
+                                containment_z_pad=0):
     """
     Compute final (dx, dy, dz) per channel for one tile using two-step strategy.
 
@@ -328,11 +543,17 @@ def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
     z_range_slices   : int   FFT search radius in Z (slices)
     fine_xy_px       : int   fine search ±radius in XY (pixels)
     fine_z_slices    : int   fine search ±radius in Z (slices)
+    max_center_dist_ratio : float centroid gate for Step 2 containment search,
+                             see stitcher.annotate_soma_with_tf_containment
+    xy_margin, containment_z_pad : containment tolerance for Step 2, see
+                             stitcher.annotate_soma_with_tf_containment
 
     Returns
     -------
     shifts : dict  ch_id → (dx, dy, dz)
-    scores : dict  ch_id → voxel IoU score at optimal shift
+    scores : dict  ch_id → alignment score at optimal shift (voxel IoU for
+             intra-soma/intra-TF steps, matched-fraction for the soma↔TF
+             cross-group step)
     """
     z_lo = z_center - z_half_window
     z_hi = z_center + z_half_window
@@ -373,8 +594,14 @@ def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
             shifts[cid] = (dx, dy, dz)
             scores[cid] = sc
 
-        # Step 2: cross-group alignment (ref TF → ref soma)
-        cx, cy, cz, sc_cross = find_shift(boxes_ref_soma, boxes_ref_tf, **align_kwargs)
+        # Step 2: cross-group alignment (ref TF → ref soma), scored by
+        # soma-TF containment instead of voxel-IoU (see module docstring)
+        cx, cy, cz, sc_cross = find_shift_containment(
+            boxes_ref_soma, boxes_ref_tf,
+            max_center_dist_ratio=max_center_dist_ratio,
+            xy_margin=xy_margin, z_pad=containment_z_pad,
+            **align_kwargs
+        )
         shifts[ref_tf] = (cx, cy, cz)
         scores[ref_tf] = sc_cross
 

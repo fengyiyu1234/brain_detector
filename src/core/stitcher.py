@@ -338,12 +338,19 @@ def _iou_matrix_2d(rows_a, rows_b):
     return inter / (area_a[:, None] + area_b[None, :] - inter + 1e-8)
 
 
+_CELL_TYPE_PRIORITY = {'glia': 1, 'neuron': 0}
+
+
 def _merge_class(cls_a, cls_b):
     """Merge two class strings, combining markers: 'neuron_RFP' + 'neuron_GFP' → 'neuron_GFP_RFP'.
+    Glia takes priority over neuron when base types differ.
     If cls_b has no underscore (e.g. 'Sox9'), the whole string is treated as a bare marker."""
     parts_a = str(cls_a).split('_')
     parts_b = str(cls_b).split('_')
-    base = parts_a[0]
+    base_a, base_b = parts_a[0], parts_b[0]
+    pri_a = _CELL_TYPE_PRIORITY.get(base_a, -1)
+    pri_b = _CELL_TYPE_PRIORITY.get(base_b, -1)
+    base = base_a if pri_a >= pri_b else base_b
     markers_a = set(parts_a[1:])
     markers_b = set(parts_b[1:]) if len(parts_b) > 1 else set(parts_b)
     markers = sorted(markers_a | markers_b)
@@ -470,7 +477,8 @@ def _cells_to_arrays(cells, z_pad=0):
 def _iou_3d_batch(x1a, y1a, x2a, y2a, z1a, z2a,
                    x1b, y1b, x2b, y2b, z1b, z2b,
                    i_arr, j_arr, z_pad):
-    """Vectorized 3D IoU for candidate pairs given by index arrays i_arr, j_arr."""
+    """Vectorized 3D IoU and IoMin for candidate pairs given by index arrays i_arr, j_arr.
+    Returns (iou_vals, iomin_vals) where iomin = intersection / min(vol_a, vol_b)."""
     ix = np.maximum(0.0, np.minimum(x2a[i_arr], x2b[j_arr]) - np.maximum(x1a[i_arr], x1b[j_arr]))
     iy = np.maximum(0.0, np.minimum(y2a[i_arr], y2b[j_arr]) - np.maximum(y1a[i_arr], y1b[j_arr]))
     iz = np.maximum(0.0,
@@ -478,10 +486,12 @@ def _iou_3d_batch(x1a, y1a, x2a, y2a, z1a, z2a,
     inter = ix * iy * iz
     va = (x2a[i_arr] - x1a[i_arr]) * (y2a[i_arr] - y1a[i_arr]) * (z2a[i_arr] - z1a[i_arr] + 1 + 2 * z_pad)
     vb = (x2b[j_arr] - x1b[j_arr]) * (y2b[j_arr] - y1b[j_arr]) * (z2b[j_arr] - z1b[j_arr] + 1 + 2 * z_pad)
-    return inter / (va + vb - inter + 1e-8)
+    iou   = inter / (va + vb - inter + 1e-8)
+    iomin = inter / (np.minimum(va, vb) + 1e-8)
+    return iou, iomin
 
 
-def match_soma_3d_iou(cells_a, cells_b, iou_thresh=0.15, z_pad=0):
+def match_soma_3d_iou(cells_a, cells_b, iou_thresh=0.15, iomin_thresh=0.5, z_pad=0):
     """
     Match two lists of volumetric soma cells using 3D IoU (greedy matching).
     Vectorized: batch cKDTree query (workers=-1) + NumPy IoU, ~50-200x faster than
@@ -518,12 +528,13 @@ def match_soma_3d_iou(cells_a, cells_b, iou_thresh=0.15, z_pad=0):
     if len(i_arr) == 0:
         return [], list(cells_a), list(cells_b)
 
-    # Vectorized 3D IoU for all remaining candidates
-    iou_vals = _iou_3d_batch(x1a, y1a, x2a, y2a, z1a, z2a,
-                              x1b, y1b, x2b, y2b, z1b, z2b,
-                              i_arr, j_arr, z_pad)
+    # Vectorized 3D IoU + IoMin for all remaining candidates
+    iou_vals, iomin_vals = _iou_3d_batch(x1a, y1a, x2a, y2a, z1a, z2a,
+                                          x1b, y1b, x2b, y2b, z1b, z2b,
+                                          i_arr, j_arr, z_pad)
 
-    keep = iou_vals >= iou_thresh
+    # Match on standard IoU OR containment (IoMin): handles size-asymmetric pairs
+    keep = (iou_vals >= iou_thresh) | (iomin_vals >= iomin_thresh)
     i_arr, j_arr, iou_vals = i_arr[keep], j_arr[keep], iou_vals[keep]
 
     # Greedy matching: highest IoU first
@@ -572,9 +583,9 @@ def suppress_cross_class_overlap(cells, iou_thresh=0.5, z_pad=2):
         i_arr, j_arr = i_arr[sphere_ok], j_arr[sphere_ok]
 
         if len(i_arr) > 0:
-            iou_vals = _iou_3d_batch(x1n, y1n, x2n, y2n, z1n, z2n,
-                                      x1g, y1g, x2g, y2g, z1g, z2g,
-                                      i_arr, j_arr, z_pad)
+            iou_vals, _ = _iou_3d_batch(x1n, y1n, x2n, y2n, z1n, z2n,
+                                         x1g, y1g, x2g, y2g, z1g, z2g,
+                                         i_arr, j_arr, z_pad)
             suppressed = set(i_arr[iou_vals > iou_thresh].tolist())
 
     surviving = [nn for i, nn in enumerate(neurons) if i not in suppressed]
