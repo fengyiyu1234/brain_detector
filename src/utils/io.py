@@ -31,8 +31,46 @@ def loadTeraxml(fxml, tile_size=2048):
     H = y_max-y_min+tILESIZE
     Z = n_slices-z_max+z_min
     z_start = z_max
-    disp_mat_fin = disp_mat_fin - [x_min,y_min,0] 
+    disp_mat_fin = disp_mat_fin - [x_min,y_min,0]
     return dir_dict, H, W, Z, z_start, disp_mat_fin
+
+def compute_grid_fallback_offsets(tile_paths, tile_size, overlap_pct):
+    """Parse '<row>_<col>'-style tile directory names into a grid and derive
+    per-tile global pixel offsets, used when no TeraStitcher XML exists
+    (pre_align mode fallback). Mirrors loadTeraxml's grid outputs:
+      dir_dict: tile_name -> (grid_row, grid_col)
+      disp_mat_fin: ndarray (n_row, n_col, 3) of [ABS_X, ABS_Y, ABS_Z=0]
+    """
+    overlap = overlap_pct / 100.0
+    step_px = int(tile_size * (1.0 - overlap))
+    dir_dict = {}
+    raw_entries = []
+    for tile_path in sorted(tile_paths):
+        tile_name = os.path.split(tile_path)[-1]
+        parts = tile_name.split('_')
+        try:
+            raw_row = int(parts[0]) if len(parts) >= 2 else 0
+            raw_col = int(parts[1]) if len(parts) >= 2 else 0
+        except ValueError:
+            raw_row, raw_col = 0, 0
+        raw_entries.append((tile_name, raw_row, raw_col))
+    if raw_entries:
+        sorted_rows = sorted(set(r for _, r, _ in raw_entries))
+        sorted_cols = sorted(set(c for _, _, c in raw_entries))
+        row_idx = {v: i for i, v in enumerate(sorted_rows)}
+        col_idx = {v: i for i, v in enumerate(sorted_cols)}
+        n_row, n_col = len(sorted_rows), len(sorted_cols)
+        use_raw_offset = (sorted_rows[-1] > step_px or sorted_cols[-1] > step_px)
+        disp_mat_fin = np.zeros((n_row, n_col, 3), dtype=int)
+        for tile_name, raw_row, raw_col in raw_entries:
+            gi, gj = row_idx[raw_row], col_idx[raw_col]
+            dir_dict[tile_name] = (gi, gj)
+            ax = raw_col if use_raw_offset else gj * step_px
+            ay = raw_row if use_raw_offset else gi * step_px
+            disp_mat_fin[gi, gj] = [ax, ay, 0]
+    else:
+        disp_mat_fin = np.zeros((1, 1, 3), dtype=int)
+    return dir_dict, disp_mat_fin
 
 def listFile(path, ext):
     filename_list, filepath_list = [], []
@@ -55,7 +93,9 @@ def listTile(path):
 def listTile_from_local_csvs(det_res_path, anchor_ch_id, anchor_dir):
     """Fast alternative to listTile() when tile detection is already done.
     Scans local 1_tile_2d_raw/ for *_{anchor_ch_id}_result.csv files,
-    extracts tile names, and reconstructs full paths under anchor_dir."""
+    extracts tile names, and reconstructs full paths by walking anchor_dir
+    and matching on leaf-directory basename (handles both flat and nested
+    tile directory layouts)."""
     suffix = f"_{anchor_ch_id}_result.csv"
     names = []
     if os.path.isdir(det_res_path):
@@ -65,7 +105,19 @@ def listTile_from_local_csvs(det_res_path, anchor_ch_id, anchor_dir):
                 if tile_name:
                     names.append(tile_name)
     dirnames = sorted(names)
-    pATHTILE_all = [os.path.join(anchor_dir, name) for name in dirnames]
+
+    path_by_basename = {}
+    for r, d, f in os.walk(anchor_dir):
+        if not d:
+            path_by_basename[os.path.basename(r)] = r
+
+    missing = [name for name in dirnames if name not in path_by_basename]
+    if missing:
+        raise FileNotFoundError(
+            f"❌ 在 {anchor_dir} 下找不到以下 Tile 对应的叶子目录: {missing[:5]}"
+            + (" ..." if len(missing) > 5 else "")
+        )
+    pATHTILE_all = [path_by_basename[name] for name in dirnames]
     return dirnames, pATHTILE_all
 
 def load_cached_detections(csv_path):

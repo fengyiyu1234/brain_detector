@@ -2,7 +2,7 @@
 """
 Brain-detector unified single-tile visualizer.
 
-Reads config/vis/vis_config.json and launches napari in one of two modes:
+Reads config/vis_config.json and launches napari in one of two modes:
 
   mode: "prealign"
     Pre-alignment QC for one tile.  Images are shifted by channel-alignment
@@ -18,7 +18,7 @@ Reads config/vis/vis_config.json and launches napari in one of two modes:
 Usage
 -----
   python src/utils/visualize.py
-  python src/utils/visualize.py --config config/vis/vis_config.json
+  python src/utils/visualize.py --config config/vis_config.json
 """
 
 import argparse
@@ -38,12 +38,13 @@ import cv2
 import numpy as np
 import pandas as pd
 import napari
+from qtpy.QtWidgets import QWidget, QGridLayout, QLabel, QSpinBox
 
 from src.config.loader import load_config
-from src.utils.io import listTile
+from src.utils.io import listTile, compute_grid_fallback_offsets
 from src.core.z_linker import run_z_linker
 from src.core.stitcher import (
-    match_soma_3d_iou, annotate_soma_with_tf_gmm,
+    match_soma_3d_iou, annotate_soma_with_tf_containment,
     suppress_cross_class_overlap, _merge_class,
 )
 
@@ -149,24 +150,31 @@ def _read_tiff(fpath):
     return img[:, :, 0].astype(np.float32) if img.ndim == 3 else img.astype(np.float32)
 
 
-def load_volume(tile_dir, z_range=None):
+def load_volume(tile_dir, z_range=None, contrast_pct=(0.1, 99.9)):
+    """Load a tile volume preserving original 16-bit intensity values (no normalization).
+
+    Returns (vol, contrast_limits): vol is float32 with raw 16-bit values; contrast_limits
+    is an (lo, hi) tuple from contrast_pct percentiles on a subsample, meant to be passed
+    straight to napari's contrast_limits so the slider reads real 16-bit intensities instead
+    of a normalized 0-1 range.
+    """
     if not os.path.isdir(tile_dir):
-        return None
+        return None, None
     files = sorted(f for f in os.listdir(tile_dir)
                    if f.lower().endswith(('.tif', '.tiff')))
     if z_range:
         files = files[z_range[0]:z_range[1]]
     if not files:
-        return None
+        return None, None
     with ThreadPoolExecutor() as ex:
         slices = list(ex.map(_read_tiff, [os.path.join(tile_dir, f) for f in files]))
     slices = [s for s in slices if s is not None]
     if not slices:
-        return None
+        return None, None
     vol = np.stack(slices)
     sample = vol[::2, ::4, ::4]
-    lo, hi = np.percentile(sample, 0.1), np.percentile(sample, 99.9)
-    return np.clip((vol - lo) / (hi - lo + 1e-6), 0.0, 1.0).astype(np.float32)
+    lo, hi = np.percentile(sample, contrast_pct[0]), np.percentile(sample, contrast_pct[1])
+    return vol, (float(lo), float(hi))
 
 
 def load_raw_volume(tile_dir, z_range=None):
@@ -418,6 +426,52 @@ def _add_labels_layer(viewer, shapes, colors, canvas_shape,
 
 # ── Tile selection & Z-range ──────────────────────────────────────────────────
 
+def _get_tile_grid_from_names(tile_paths):
+    """Derive a (row, col) grid position for each tile from its directory name.
+
+    Tile leaf directories are named "<V>_<H>[...]" where V/H are the microscope's
+    absolute XY stage coordinates (io.listTile's two-level raw layout: an outer
+    dir named V containing leaves V_H). Ranking the unique V/H values gives a
+    compact 0-based grid position — no TeraStitcher XML required.
+    Returns {tile_name: (row, col)}, or None if names don't follow this pattern.
+    """
+    raw = []
+    for p in tile_paths:
+        name = os.path.basename(p)
+        parts = name.split('_')
+        if len(parts) < 2:
+            return None
+        try:
+            v, h = int(parts[0]), int(parts[1])
+        except ValueError:
+            return None
+        raw.append((name, v, h))
+    rows = sorted({v for _, v, _ in raw})
+    cols = sorted({h for _, _, h in raw})
+    row_idx = {v: i for i, v in enumerate(rows)}
+    col_idx = {h: i for i, h in enumerate(cols)}
+    return {name: (row_idx[v], col_idx[h]) for name, v, h in raw}
+
+
+def _print_tile_grid(grid, name_to_idx):
+    """Print tiles laid out by (row, col) so spatial neighbors are visually obvious."""
+    pos_to_name = {pos: name for name, pos in grid.items()}
+    rows = sorted({r for r, _ in grid.values()})
+    cols = sorted({c for _, c in grid.values()})
+    idx_w = max(3, len(str(len(name_to_idx) - 1)))
+    row_w = max(3, len(str(max(rows))))
+    print(f"\nTile grid layout ({len(rows)} rows x {len(cols)} cols, {len(name_to_idx)} tiles):")
+    print(" " * (row_w + 1) + " ".join(f"{c:>{idx_w}d}" for c in cols) + "   <- col")
+    for r in rows:
+        cells = []
+        for c in cols:
+            name = pos_to_name.get((r, c))
+            idx = name_to_idx.get(name) if name is not None else None
+            cells.append(f"{idx:>{idx_w}d}" if idx is not None else "-" * idx_w)
+        print(f"{r:>{row_w}d} " + " ".join(cells))
+    print("^ row")
+
+
 def _select_tile(vis_cfg, tile_paths):
     tile_arg = vis_cfg.get('tile', None)
     if tile_arg is not None:
@@ -425,6 +479,12 @@ def _select_tile(vis_cfg, tile_paths):
         if tile_path is None:
             sys.exit(f"Tile '{tile_arg}' not found.")
         return tile_path, tile_arg
+
+    name_to_idx = {os.path.basename(p): i for i, p in enumerate(tile_paths)}
+    grid = _get_tile_grid_from_names(tile_paths)
+    if grid:
+        _print_tile_grid(grid, name_to_idx)
+
     print(f"\nAvailable tiles ({len(tile_paths)}):")
     for i, p in enumerate(tile_paths):
         print(f"  [{i:3d}] {os.path.basename(p)}")
@@ -469,24 +529,50 @@ def _canvas_shape_from_tile(tile_path, z_range):
 
 # ── XML helpers ───────────────────────────────────────────────────────────────
 
-def _get_tile_offset(channel_dir, tile_name):
-    """Return (tile_x0, tile_y0, tile_z0) from xml_merging.xml for coordinate conversion."""
-    xml_path = os.path.join(channel_dir, 'xml_merging.xml')
-    if not os.path.isfile(xml_path):
-        return 0, 0, 0
-    try:
-        root   = ET.parse(xml_path).getroot()
-        stacks = list(root.find('STACKS'))
-        z_start = max(int(s.get('ABS_D', 0)) for s in stacks)
-        x_min   = min(int(s.get('ABS_H', 0)) for s in stacks)
-        y_min   = min(int(s.get('ABS_V', 0)) for s in stacks)
-        for stack in stacks:
-            if os.path.basename(stack.get('DIR_NAME', '')) == tile_name:
-                return (int(stack.get('ABS_H', 0)) - x_min,
-                        int(stack.get('ABS_V', 0)) - y_min,
-                        z_start - int(stack.get('ABS_D', 0)))
-    except Exception:
-        pass
+def _get_tile_offset(channel_dir, tile_name, base_res=None, tile_paths=None):
+    """Return (tile_x0, tile_y0, tile_z0) for coordinate conversion.
+
+    Resolution order:
+      1. xml_merging.xml / xml_import.xml (real TeraStitcher inter-tile offsets)
+      2. grid fallback, replicating run_inference.py's pre_align behavior when
+         no TeraStitcher XML exists — reads tile_size/overlap_pct from the run's
+         own runtime_config.json (under base_res) so this always matches whatever
+         offset was actually baked into coloc_result.csv / 3d_tracked.csv.
+      3. (0, 0, 0)
+    """
+    for xml_name in ('xml_merging.xml', 'xml_import.xml'):
+        xml_path = os.path.join(channel_dir, xml_name)
+        if not os.path.isfile(xml_path):
+            continue
+        try:
+            root   = ET.parse(xml_path).getroot()
+            stacks = list(root.find('STACKS'))
+            z_start = max(int(s.get('ABS_D', 0)) for s in stacks)
+            x_min   = min(int(s.get('ABS_H', 0)) for s in stacks)
+            y_min   = min(int(s.get('ABS_V', 0)) for s in stacks)
+            for stack in stacks:
+                if os.path.basename(stack.get('DIR_NAME', '')) == tile_name:
+                    return (int(stack.get('ABS_H', 0)) - x_min,
+                            int(stack.get('ABS_V', 0)) - y_min,
+                            z_start - int(stack.get('ABS_D', 0)))
+        except Exception:
+            pass
+
+    if base_res and tile_paths:
+        try:
+            with open(os.path.join(base_res, 'runtime_config.json'), encoding='utf-8') as f:
+                runtime_cfg = json.load(f)
+            if runtime_cfg.get('pipeline_mode') == 'pre_align':
+                tile_size   = runtime_cfg.get('detection_params', {}).get('tILESIZE', 2048)
+                overlap_pct = runtime_cfg.get('pre_align_params', {}).get('tile_overlap_pct', 15)
+                dir_dict, disp_mat_fin = compute_grid_fallback_offsets(tile_paths, tile_size, overlap_pct)
+                if tile_name in dir_dict:
+                    gi, gj = dir_dict[tile_name]
+                    ax, ay, az = disp_mat_fin[gi, gj]
+                    return int(ax), int(ay), int(az)
+        except Exception:
+            pass
+
     return 0, 0, 0
 
 
@@ -536,6 +622,85 @@ def _add_margin_overlay(viewer, canvas_shape, left_m, top_m):
         opacity=0.35,
         visible=True,
     )
+
+
+# ── Contrast control panel ─────────────────────────────────────────────────────
+
+def _add_contrast_panel(viewer, image_layers):
+    """Dock a small panel with min/max intensity spin boxes, one row per channel.
+
+    image_layers: list of (cid, layer) tuples for the channel image layers
+    (not overlays). Two-way synced with each layer's contrast_limits:
+    editing a spin box updates the layer live; dragging napari's own
+    slider updates the spin boxes back. A per-row guard flag prevents
+    feedback loops in both directions.
+    """
+    if not image_layers:
+        return
+
+    panel  = QWidget()
+    layout = QGridLayout()
+    panel.setLayout(layout)
+    layout.addWidget(QLabel("channel"), 0, 0)
+    layout.addWidget(QLabel("min"),     0, 1)
+    layout.addWidget(QLabel("max"),     0, 2)
+
+    for row, (cid, layer) in enumerate(image_layers, start=1):
+        layout.addWidget(QLabel(cid), row, 0)
+
+        min_box, max_box = QSpinBox(), QSpinBox()
+        min_box.setRange(0, 65535)
+        max_box.setRange(0, 65535)
+        lo, hi = layer.contrast_limits
+        min_box.setValue(int(round(lo)))
+        max_box.setValue(int(round(hi)))
+        layout.addWidget(min_box, row, 1)
+        layout.addWidget(max_box, row, 2)
+
+        guard = [False]  # True while this row is applying a programmatic update
+
+        def _commit(role, layer=layer, min_box=min_box, max_box=max_box, guard=guard):
+            if guard[0]:
+                return
+            lo_v, hi_v = min_box.value(), max_box.value()
+            if lo_v >= hi_v:
+                # clamp instead of letting layer.contrast_limits raise ValueError
+                if role == 'min':
+                    hi_v = lo_v + 1
+                    if hi_v > 65535:
+                        hi_v, lo_v = 65535, 65534
+                else:
+                    lo_v = hi_v - 1
+                    if lo_v < 0:
+                        lo_v, hi_v = 0, 1
+                guard[0] = True
+                try:
+                    min_box.setValue(lo_v)
+                    max_box.setValue(hi_v)
+                finally:
+                    guard[0] = False
+            guard[0] = True
+            try:
+                layer.contrast_limits = (float(lo_v), float(hi_v))
+            finally:
+                guard[0] = False
+
+        def _sync_from_layer(event=None, layer=layer, min_box=min_box, max_box=max_box, guard=guard):
+            if guard[0]:
+                return
+            lo_v, hi_v = layer.contrast_limits
+            guard[0] = True
+            try:
+                min_box.setValue(int(round(lo_v)))
+                max_box.setValue(int(round(hi_v)))
+            finally:
+                guard[0] = False
+
+        min_box.valueChanged.connect(lambda _v, c=_commit: c('min'))
+        max_box.valueChanged.connect(lambda _v, c=_commit: c('max'))
+        layer.events.contrast_limits.connect(_sync_from_layer)
+
+    viewer.window.add_dock_widget(panel, area='right', name='Contrast (manual)')
 
 
 # ── CSV → shapes ──────────────────────────────────────────────────────────────
@@ -947,8 +1112,13 @@ def _trace_coloc_for_soma(soma_idx, soma_vol_list, tf_vol_list,
                matched=[], stolen=[], failed_xy=[], failed_z=[], failed_dist=[],
                out_of_range=0)
 
-    # single-layer soma: don't pad z (would give false containment across adjacent slices)
-    eff_z_pad = z_pad if soma['z_max'] > soma['z_min'] else 0
+    def _z_contained(s_z_min, s_z_max, tf_z_min, tf_z_max):
+        # z_pad slices of tolerance on exactly one side only, never both at once
+        # (padding both sides simultaneously lets a truncated box balloon into
+        # an oversized capture window) — applies the same way to single- and
+        # multi-layer soma boxes.
+        return ((tf_z_min >= s_z_min - z_pad and tf_z_max <= s_z_max) or
+                (tf_z_min >= s_z_min          and tf_z_max <= s_z_max + z_pad))
 
     for tf in tf_vol_list:
         tf_pt  = np.array([tf['cx'], tf['cy'], tf['cz']], dtype=float)
@@ -962,8 +1132,7 @@ def _trace_coloc_for_soma(soma_idx, soma_vol_list, tf_vol_list,
                  tf['x2_3d']  <= soma['x2_3d'] + xy_margin and
                  soma['y1_3d'] - xy_margin <= tf['y1_3d'] and
                  tf['y2_3d']  <= soma['y2_3d'] + xy_margin)
-        z_ok  = (soma['z_min'] - eff_z_pad <= tf['z_min'] and
-                 tf['z_max']  <= soma['z_max'] + eff_z_pad)
+        z_ok  = _z_contained(soma['z_min'], soma['z_max'], tf['z_min'], tf['z_max'])
 
         if not xy_ok:
             res['failed_xy'].append({
@@ -976,10 +1145,12 @@ def _trace_coloc_for_soma(soma_idx, soma_vol_list, tf_vol_list,
             continue
 
         if not z_ok:
+            # margin for reporting only — actual rule above is one-sided (OR), so
+            # these two values are each that option's shortfall, not simultaneous
             res['failed_z'].append({
                 'tf': tf, 'dist': d_this,
-                'dz_min': (soma['z_min'] - eff_z_pad) - tf['z_min'],
-                'dz_max': tf['z_max'] - (soma['z_max'] + eff_z_pad),
+                'dz_min': (soma['z_min'] - z_pad) - tf['z_min'],
+                'dz_max': tf['z_max'] - (soma['z_max'] + z_pad),
             })
             continue
 
@@ -992,13 +1163,11 @@ def _trace_coloc_for_soma(soma_idx, soma_vol_list, tf_vol_list,
         best_d, best_s = float('inf'), None
         for s_idx in tree.query_ball_point(tf_pt, r=max_radius * 2):
             s2 = soma_vol_list[s_idx]
-            s2_z_pad = z_pad if s2['z_max'] > s2['z_min'] else 0
             if not (s2['x1_3d'] - xy_margin <= tf['x1_3d'] and
                     tf['x2_3d'] <= s2['x2_3d'] + xy_margin and
                     s2['y1_3d'] - xy_margin <= tf['y1_3d'] and
                     tf['y2_3d'] <= s2['y2_3d'] + xy_margin and
-                    s2['z_min'] - s2_z_pad <= tf['z_min'] and
-                    tf['z_max'] <= s2['z_max'] + s2_z_pad):
+                    _z_contained(s2['z_min'], s2['z_max'], tf['z_min'], tf['z_max'])):
                 continue
             d = float(np.linalg.norm(soma_arr[s_idx] - tf_pt))
             if d > max_center_dist_ratio * soma_radii[s_idx]:
@@ -1309,7 +1478,10 @@ def load_offsets(align_dir, tile_name):
 
 
 def _run_zlink_for_csv(csv_path, z_range, iou_thresh, min_z_layers, max_cell_z_span,
-                       max_z_gap=0):
+                       max_z_gap=0, ch_id=None):
+    """ch_id: if given, tagged onto each row's class ("neuron" -> "neuron_RFP"), mirroring
+    run_inference.py's channel tagging so cross-channel class strings carry markers that
+    _merge_class / annotate_soma_with_tf_containment / _auto_groups_from_classes expect."""
     if not os.path.isfile(csv_path):
         return []
     df = pd.read_csv(
@@ -1324,6 +1496,8 @@ def _run_zlink_for_csv(csv_path, z_range, iou_thresh, min_z_layers, max_cell_z_s
         df = df[(df['z'] >= z_range[0]) & (df['z'] < z_range[1])]
     if df.empty:
         return []
+    if ch_id is not None:
+        df['class'] = df['class'].astype(str) + '_' + ch_id
     matrix = df[['x1', 'y1', 'x2', 'y2', 'score', 'mean', 'class', 'z']].values
     _, vol_list = run_z_linker(
         matrix,
@@ -1420,7 +1594,9 @@ def _run_tile_colocalization(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
     iou_thresh_3d = zl_soma_cfg.get('iou_thresh_3d', 0.15)
     z_pad_3d      = zl_soma_cfg.get('z_pad_3d', 2)
     cross_iou     = zl_soma_cfg.get('cross_class_iou_thresh', 0.5)
-    p_thresh      = zl_tf_cfg.get('gmm_p_thresh', 0.5)
+    xy_margin       = zl_tf_cfg.get('containment_xy_margin', 0)
+    z_pad_tf        = zl_tf_cfg.get('containment_z_pad', 2)
+    max_center_dist = zl_tf_cfg.get('max_center_dist_ratio', 0.5)
     if not soma_ch_ids:
         return []
     merged = [copy.copy(c) for c in per_ch_vol_lists.get(soma_ch_ids[0], [])]
@@ -1435,20 +1611,23 @@ def _run_tile_colocalization(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
     for cid in tf_ch_ids:
         tf_vols = per_ch_vol_lists.get(cid, [])
         if tf_vols and merged:
-            merged = annotate_soma_with_tf_gmm(merged, tf_vols, p_thresh=p_thresh)
+            merged = annotate_soma_with_tf_containment(
+                merged, tf_vols, z_pad=z_pad_tf, xy_margin=xy_margin,
+                max_center_dist_ratio=max_center_dist)
     return merged
 
 
 # ── Mode: prealign ────────────────────────────────────────────────────────────
 
-def _run_prealign(vis_cfg, config, paths, routing_config):
-    pa_cfg  = config.get('pre_align_params', {})
-    zl_cfg  = config.get('z_linker', {})
+def _run_prealign(vis_cfg, paths, routing_config):
+    pa_cfg  = vis_cfg.get('pre_align_params', {})
+    zl_cfg  = vis_cfg.get('z_linker', {})
     zl_soma = zl_cfg.get('soma', {})
     zl_tf   = zl_cfg.get('tf',   {})
     soma_ch_ids = [ch['id'] for ch in routing_config if ch.get('type', 'soma') == 'soma']
     tf_ch_ids   = [ch['id'] for ch in routing_config if ch.get('type') == 'tf']
 
+    contrast_pct = tuple(vis_cfg.get('contrast_pct', [0.1, 99.9]))
     no_images    = vis_cfg.get('no_images',     False)
     show_before  = vis_cfg.get('show_before',   False)
     show_spheres = vis_cfg.get('spheres',       False)
@@ -1515,6 +1694,7 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
                 min_z_layers=zl_p.get('min_z_layers', 1),
                 max_cell_z_span=zl_p.get('max_cell_z_span', 5),
                 max_z_gap=zl_p.get('max_z_gap', 0),
+                ch_id=cid,
             )
             per_ch_vol_lists[cid] = vol_list
             print(f"  [{cid}] z-linked: {len(vol_list)} cells")
@@ -1540,12 +1720,13 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
 
     # ── Image layers ──────────────────────────────────────────────────────────
     if not no_images:
+        img_layers = []
         for ch in routing_config:
             cid      = ch['id']
             ch_base  = os.path.abspath(paths[ch['dir_key']])
             tile_dir = os.path.join(ch_base, os.path.relpath(tile_path, anchor_dir))
             print(f"[img] Loading {cid}  ({tile_dir}) ...")
-            vol = load_volume(tile_dir, z_range=z_range)
+            vol, climits = load_volume(tile_dir, z_range=z_range, contrast_pct=contrast_pct)
             if vol is None:
                 print("  → not found, skipping")
                 continue
@@ -1556,8 +1737,12 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
                 if dx != 0 or dy != 0 or dz != 0:
                     vol = _shift_volume(vol, dx, dy, dz)
                     print(f"  → shifted ({dx:+d}, {dy:+d}, {dz:+d})")
-            viewer.add_image(vol, name=f"[img] {cid}", **_ch_vis(cid))
-            print(f"  → {vol.shape}")
+            img_layer = viewer.add_image(vol, name=f"[img] {cid}", contrast_limits=climits,
+                                          **_ch_vis(cid))
+            img_layer.contrast_limits_range = (0, 65535)
+            img_layers.append((cid, img_layer))
+            print(f"  → {vol.shape}  contrast_limits={climits}")
+        _add_contrast_panel(viewer, img_layers)
 
     box_registry = []  # {z, x1, y1, x2, y2, cls, layer_name} — populated below
 
@@ -1700,6 +1885,7 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
                     min_z_layers=1,
                     max_cell_z_span=zl_p.get('max_cell_z_span', 5),
                     max_z_gap=zl_p.get('max_z_gap', 0),
+                    ch_id=cid,
                 )
                 centers_r, sizes_r = _vol_list_to_points(vol_list_r, z_range)
                 if centers_r is not None:
@@ -1716,7 +1902,7 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
     # ── [coloc] ───────────────────────────────────────────────────────────────
     if show_coloc:
         coloc_csv = os.path.join(base_res, '4_colocalization', 'coloc_result.csv')
-        tile_x0, tile_y0, tile_z0 = _get_tile_offset(anchor_dir, tile_name)
+        tile_x0, tile_y0, tile_z0 = _get_tile_offset(anchor_dir, tile_name, base_res=base_res, tile_paths=tile_paths)
         print(f"  [coloc] tile offset: x0={tile_x0}, y0={tile_y0}, z0={tile_z0}")
 
         if os.path.isfile(coloc_csv):
@@ -1740,6 +1926,10 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
                         [c.get('class', '') for c in coloc_vols],
                         outline_width=outline_width,
                     )
+                    if not groups:
+                        print("[coloc] no marker combinations found (no soma cell "
+                              "carries >=2 markers — check channel routing / z_linker.tf config)")
+                    any_shown = False
                     for grp, shapes_c, colors_c, dash_c, meta_c in _vol_list_to_s4_shapes(
                             coloc_vols, z_range, groups):
                         if shapes_c:
@@ -1756,6 +1946,12 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
                             n_solid = sum(1 for d in dash_c if d == 0)
                             print(f"[coloc] {grp['name']}: {len(shapes_c)} boxes "
                                   f"({n_solid} neuron, {len(dash_c) - n_solid} glia)")
+                            any_shown = True
+                    if groups and not any_shown:
+                        print("[coloc] no cells in z-range for any group")
+                else:
+                    print("[coloc] no soma cells produced by in-memory merge — "
+                          "check soma channel routing/config")
             except Exception as exc:
                 print(f"[coloc] WARNING: in-memory coloc failed — {exc}")
 
@@ -1906,13 +2102,14 @@ def _run_prealign(vis_cfg, config, paths, routing_config):
 
 # ── Mode: post (single tile) ──────────────────────────────────────────────────
 
-def _run_post(vis_cfg, config, paths, routing_config):
-    pa_cfg  = config.get('pre_align_params', {})
-    zl_cfg  = config.get('z_linker', {})
+def _run_post(vis_cfg, paths, routing_config):
+    pa_cfg  = vis_cfg.get('pre_align_params', {})
+    zl_cfg  = vis_cfg.get('z_linker', {})
     zl_soma = zl_cfg.get('soma', {})
     zl_tf   = zl_cfg.get('tf',   {})
 
     no_images     = vis_cfg.get('no_images', False)
+    contrast_pct  = tuple(vis_cfg.get('contrast_pct', [0.1, 99.9]))
     stage_cfg     = vis_cfg.get('stage', 'all')
     outline_width = vis_cfg.get('outline_width', 2)
     coloc_opacity = vis_cfg.get('coloc_opacity', 0.9)
@@ -1936,7 +2133,7 @@ def _run_post(vis_cfg, config, paths, routing_config):
     print(f"Z-range: {z_range[0]} – {z_range[1]} ({z_range[1] - z_range[0]} slices)\n")
 
     # Tile global offset (needed for s3 and coloc coordinate conversion)
-    tile_x0, tile_y0, tile_z0 = _get_tile_offset(anchor_dir, tile_name)
+    tile_x0, tile_y0, tile_z0 = _get_tile_offset(anchor_dir, tile_name, base_res=base_res, tile_paths=tile_paths)
     print(f"Tile global offset: x0={tile_x0}, y0={tile_y0}, z0={tile_z0}\n")
 
     viewer = napari.Viewer(title=f"Post-Pipeline — {tile_name}")
@@ -1985,18 +2182,23 @@ def _run_post(vis_cfg, config, paths, routing_config):
 
     # ── Image layers (raw, no shift) ──────────────────────────────────────────
     if not no_images:
+        img_layers = []
         for ch in routing_config:
             cid      = ch['id']
             ch_base  = os.path.abspath(paths[ch['dir_key']])
             tile_dir = os.path.join(ch_base, os.path.relpath(tile_path, anchor_dir))
             print(f"[img] Loading {cid}  ({tile_dir}) ...")
-            vol = load_volume(tile_dir, z_range=z_range)
+            vol, climits = load_volume(tile_dir, z_range=z_range, contrast_pct=contrast_pct)
             if vol is None:
                 print("  → not found, skipping")
                 continue
             canvas_shape = vol.shape
-            viewer.add_image(vol, name=f"[img] {cid}", **_ch_vis(cid))
-            print(f"  → {vol.shape}")
+            img_layer = viewer.add_image(vol, name=f"[img] {cid}", contrast_limits=climits,
+                                          **_ch_vis(cid))
+            img_layer.contrast_limits_range = (0, 65535)
+            img_layers.append((cid, img_layer))
+            print(f"  → {vol.shape}  contrast_limits={climits}")
+        _add_contrast_panel(viewer, img_layers)
 
     # ── Overlap margins (hide inaccurate boxes in left/top tile boundaries) ──────
     left_m, top_m = _get_tile_overlap_margins(anchor_dir, tile_name, canvas_w, canvas_h)
@@ -2098,6 +2300,7 @@ def _run_post(vis_cfg, config, paths, routing_config):
                 min_z_layers=zl_p.get('min_z_layers', 1),
                 max_cell_z_span=zl_p.get('max_cell_z_span', 5),
                 max_z_gap=zl_p.get('max_z_gap', 0),
+                ch_id=cid,
             )
     _debug_soma_vols, _debug_tf_dict = _build_merged_soma_vols(
         _per_ch_vols, soma_ch_ids_p, tf_ch_ids_p, zl_soma)
@@ -2258,7 +2461,7 @@ def main():
     parser = argparse.ArgumentParser(description='brain_detector unified visualizer.')
     parser.add_argument(
         '--config',
-        default=os.path.join(project_root, 'config', 'vis', 'vis_config.json'),
+        default=os.path.join(project_root, 'config', 'vis_config.json'),
         help='Path to vis_config.json',
     )
     args = parser.parse_args()
@@ -2269,27 +2472,13 @@ def main():
     mode = vis_cfg.get('mode', 'prealign')
     print(f"Mode: {mode}\n")
 
-    # Resolve main config: pATHRESULT/runtime_config.json > config.json
-    config_path = os.path.join(project_root, 'config', 'config.json')
-    pat = (vis_cfg.get('paths') or {}).get('pATHRESULT')
-    if pat:
-        runtime_cfg = os.path.join(pat, 'runtime_config.json')
-        if os.path.isfile(runtime_cfg):
-            config_path = runtime_cfg
-            print(f"[config] Using runtime_config.json: {runtime_cfg}")
-    config = load_config(config_path)
-
-    paths = config['paths']
-    for key, val in (vis_cfg.get('paths') or {}).items():
-        if val:
-            paths[key] = val
-
-    routing_config = [ch for ch in config['channels_routing'] if ch.get('active', True)]
+    paths = vis_cfg.get('paths') or {}
+    routing_config = [ch for ch in vis_cfg.get('channels_routing', []) if ch.get('active', True)]
 
     if mode == 'prealign':
-        _run_prealign(vis_cfg, config, paths, routing_config)
+        _run_prealign(vis_cfg, paths, routing_config)
     elif mode == 'post':
-        _run_post(vis_cfg, config, paths, routing_config)
+        _run_post(vis_cfg, paths, routing_config)
     else:
         sys.exit(f"Unknown mode '{mode}'. Use 'prealign' or 'post'.")
 
