@@ -26,3 +26,11 @@ labels/
 models/
 scripts/logs/
 config/
+
+# 本地一次性脚本，不纳入版本控制
+local_scripts/
+
+# 本地 YOLO 结果复核 GUI，不纳入版本控制
+scripts/review_gui.py
+src/core/yolo_infer.py
+src/gui/

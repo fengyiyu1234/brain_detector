@@ -115,6 +115,10 @@ Array defining each channel's detection strategy. Order matters — the first en
 | `model` | `"yolo"` / `"stardist"` | Inference backend |
 | `dir_key` | key in `paths` | Points to this channel's tile directory |
 | `active` | `true` / `false` | Set `false` to skip a channel entirely |
+| `double_exposure` | `true` / `false` | Optional. When `true`, this channel has a second exposure/laser-power image that gets fused in at the raw per-tile 2D level before filtering (Stage 2.6) |
+| `second_intensity_id` | e.g. `"GFP_25"` | Required if `double_exposure=true`. Internal id for the second exposure (used for its raw CSV filename and in logs) |
+| `second_intensity_dir_key` | key in `paths` | Required if `double_exposure=true`. Points to the second exposure's tile directory |
+| `fusion_iou_thresh` | float, default `0.3` | Per-z-slice IoU threshold used to match low/high exposure boxes during fusion |
 
 ### `paths`
 | Key | Description |
@@ -165,7 +169,7 @@ Additional soma-only keys:
 | Key | Description |
 |-----|-------------|
 | `iou_thresh_3d` | 3D IoU threshold for cross-channel soma matching |
-| `z_pad_3d` | Z padding (slices) applied during 3D soma matching |
+| `z_pad_3d` | One-sided z-gap tolerance (slices) for 3D soma matching; only bridges a real gap between non-overlapping boxes, never inflates boxes that already overlap in z |
 | `cross_class_iou_thresh` | neuron–glia overlap threshold; glia takes priority |
 
 Additional tf-only keys:

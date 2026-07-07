@@ -19,11 +19,12 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
-from src.config.loader import load_config
+from src.config.loader import load_config, expand_double_exposure_channels
 from src.utils.logger import setup_logging
-from src.utils.io import listTile, listTile_from_local_csvs, loadTeraxml, save_run_metadata
+from src.utils.io import (listTile, listTile_from_local_csvs, loadTeraxml,
+                          save_run_metadata, compute_grid_fallback_offsets)
 from src.core.worker import process_single_tile_wrapper, init_worker
-from src.core.stitcher import combine_predictions
+from src.core.stitcher import combine_predictions, fuse_dual_intensity_2d
 from src.core.z_linker import run_z_linker
 from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_containment,
                                permutation_test_colocalization, _merge_class,
@@ -67,6 +68,7 @@ if __name__ == '__main__':
     derived['pATH_ALIGN_OFFSETS'] = os.path.join(base_res_path, "0_channel_alignment")
     derived['pATH_DET_RES']      = os.path.join(base_res_path, "1_tile_2d_raw")
     derived['pATH_DET_FILTERED'] = os.path.join(base_res_path, "1_tile_2d_filtered")
+    derived['pATH_DET_FUSED']    = os.path.join(base_res_path, "1_tile_2d_fused")
     derived['pATH_GLOBAL_2D']    = os.path.join(base_res_path, "2_global_2d_raw")
     derived['pATH_CHANNEL_3D']    = os.path.join(base_res_path, "3_channel_3d")
     derived['pATH_COLOCALIZATION'] = os.path.join(base_res_path, "4_colocalization")
@@ -95,9 +97,15 @@ if __name__ == '__main__':
     anchor_ch = routing_config[0]
     anchor_dir = paths.get(anchor_ch['dir_key'])
 
+    # 2b. 展开 double_exposure 通道，得到检测阶段(Stage 2)专用的路由列表（含合成的第二曝光通道）。
+    # Stage 2 之后的所有阶段（2.5 部分、2.75、3、4、5）继续使用未展开的 routing_config——
+    # 融合(Stage 2.6)之后两个曝光就是同一个逻辑通道了。
+    detect_routing_config = expand_double_exposure_channels(routing_config)
+    config['channels_routing_detect'] = detect_routing_config
+
     if start_from_stage < 2:
         logging.info("=== 多通道路径检查 ===")
-        for ch in routing_config:
+        for ch in detect_routing_config:
             d_path = paths.get(ch['dir_key'])
             if not d_path or not os.path.exists(d_path):
                 raise FileNotFoundError(f"❌ 通道 {ch['id']} 路径不存在: {d_path}")
@@ -143,39 +151,10 @@ if __name__ == '__main__':
         logging.info(f"✔️ 已加载 TeraStitcher XML: {pATHxml}")
     elif pipeline_mode == 'pre_align':
         # 回退：从 tile 目录名解析行列号，用均匀 Grid 推算全局偏移
-        overlap = pre_align_cfg.get('tile_overlap_pct', 15) / 100.0
-        step_px = int(tile_size * (1.0 - overlap))
+        overlap_pct = pre_align_cfg.get('tile_overlap_pct', 15)
         logging.warning(f"⚠️ 未找到 TeraStitcher XML（路径: {pATHxml}），pre_align 模式回退到文件名解析全局偏移。")
-        dir_dict = {}   # dir_name → (grid_row, grid_col)
-        raw_entries = []  # (tile_name, raw_row, raw_col)
-        for tile_path in sorted(pATHTILE_all):
-            tile_name = os.path.split(tile_path)[-1]
-            parts = tile_name.split('_')
-            try:
-                raw_row = int(parts[0]) if len(parts) >= 2 else 0
-                raw_col = int(parts[1]) if len(parts) >= 2 else 0
-            except ValueError:
-                raw_row, raw_col = 0, 0
-            raw_entries.append((tile_name, raw_row, raw_col))
-        if raw_entries:
-            # 目录名可能是像素偏移坐标而非网格索引，映射为紧凑 0..N-1 索引避免 OOM
-            sorted_rows = sorted(set(r for _, r, _ in raw_entries))
-            sorted_cols = sorted(set(c for _, _, c in raw_entries))
-            row_idx = {v: i for i, v in enumerate(sorted_rows)}
-            col_idx = {v: i for i, v in enumerate(sorted_cols)}
-            n_row, n_col = len(sorted_rows), len(sorted_cols)
-            use_raw_offset = (sorted_rows[-1] > step_px or sorted_cols[-1] > step_px)
-            disp_mat_fin = np.zeros((n_row, n_col, 3), dtype=int)
-            for tile_name, raw_row, raw_col in raw_entries:
-                gi, gj = row_idx[raw_row], col_idx[raw_col]
-                dir_dict[tile_name] = (gi, gj)
-                ax = raw_col if use_raw_offset else gj * step_px
-                ay = raw_row if use_raw_offset else gi * step_px
-                disp_mat_fin[gi, gj] = [ax, ay, 0]
-            logging.info(f"  解析到 {len(raw_entries)} 个 tile，网格 {n_row}×{n_col}，"
-                         f"偏移模式: {'像素坐标' if use_raw_offset else '均匀Grid'}")
-        else:
-            disp_mat_fin = np.zeros((1, 1, 3), dtype=int)
+        dir_dict, disp_mat_fin = compute_grid_fallback_offsets(pATHTILE_all, tile_size, overlap_pct)
+        logging.info(f"  解析到 {len(dir_dict)} 个 tile，网格 {disp_mat_fin.shape[0]}×{disp_mat_fin.shape[1]}")
         H = disp_mat_fin[:, :, 1].max() + tile_size
         W = disp_mat_fin[:, :, 0].max() + tile_size
         Z = len(os.listdir(pATHTILE_all[0])) if pATHTILE_all else 1
@@ -191,7 +170,7 @@ if __name__ == '__main__':
         tile_name = os.path.split(path)[-1]
         all_done = all(
             os.path.exists(os.path.join(derived['pATH_DET_RES'], f"{tile_name}_{ch['id']}_result.csv"))
-            for ch in routing_config
+            for ch in detect_routing_config
         )
         if not all_done:
             tasks_to_run.append((i, path, config))
@@ -299,6 +278,14 @@ if __name__ == '__main__':
                     containment_z_pad=pa_containment_z_pad,
                 )
 
+                # 3b. double_exposure 通道的第二曝光复用主曝光的偏移量
+                # （同一物理通道/视野，只是曝光不同，无需独立点云配准）。
+                for ch in routing_cfg_align:
+                    if ch.get('double_exposure'):
+                        second_id = ch['second_intensity_id']
+                        shifts[second_id] = shifts.get(ch['id'], (0, 0, 0))
+                        scores[second_id] = scores.get(ch['id'], 0.0)
+
                 # 4. 保存偏移 JSON
                 save_tile_offsets(tile_name, shifts, scores, derived['pATH_ALIGN_OFFSETS'])
 
@@ -311,9 +298,94 @@ if __name__ == '__main__':
                     if os.path.isfile(in_csv) and not os.path.isfile(out_csv):
                         apply_shift_to_csv(in_csv, dx, dy, dz, out_csv)
 
+                    if ch.get('double_exposure'):
+                        second_id = ch['second_intensity_id']
+                        dx2, dy2, dz2 = shifts.get(second_id, (0, 0, 0))
+                        in_csv2  = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_{second_id}_result.csv")
+                        out_csv2 = os.path.join(derived['pATH_ALIGN_OFFSETS'], f"{tile_name}_{second_id}_result.csv")
+                        if os.path.isfile(in_csv2) and not os.path.isfile(out_csv2):
+                            apply_shift_to_csv(in_csv2, dx2, dy2, dz2, out_csv2)
+
             # 写完成标记
             open(align_done_flag, 'w').close()
             logging.info("✔️ [2.5] 所有 Tile 点云对齐完成。")
+
+    # ==========================================
+    # 阶段 2.6: 双曝光强度融合 (Dual-Intensity Fusion)
+    # 输入: 0_channel_alignment (pre_align) 或 1_tile_2d_raw (post_align) —— 与 Stage 2.75 相同的
+    #       原始来源，在过滤之前完成两个曝光的融合。
+    # 输出: 1_tile_2d_fused/{tile}_{primary_id}_result.csv （落在 Stage 2.75 期望主通道数据的位置）
+    # ==========================================
+    _de_channels = [ch for ch in routing_config if ch.get('double_exposure')]
+    _tile_names_all = [os.path.split(p)[-1] for p in pATHTILE_all]
+
+    if not _de_channels:
+        logging.info("⏭️ [2.6] 未配置任何 double_exposure 通道，跳过融合阶段。")
+    else:
+        _fusion_src = (derived['pATH_ALIGN_OFFSETS']
+                       if pipeline_mode == 'pre_align'
+                       else derived['pATH_DET_RES'])
+        _fusion_dst = derived['pATH_DET_FUSED']
+
+        _fusion_done = all(
+            os.path.exists(os.path.join(_fusion_dst, f"{tn}_{ch['id']}_result.csv"))
+            for tn in _tile_names_all
+            for ch in _de_channels
+        )
+
+        if _fusion_done:
+            logging.info("✔️ Checkpoint 2.6 达成: 融合后 tile CSV 已全部存在。")
+        else:
+            logging.info(f"阶段 2.6: 融合 {len(_de_channels)} 个双曝光通道 ...")
+            _fusion_rows = []
+            _agg = {ch['id']: {'low': 0, 'high': 0, 'fused': 0} for ch in _de_channels}
+            for _tn in tqdm(_tile_names_all, desc="Fuse dual-intensity tiles"):
+                for ch in _de_channels:
+                    ch_id = ch['id']
+                    second_id = ch['second_intensity_id']
+                    out_csv = os.path.join(_fusion_dst, f"{_tn}_{ch_id}_result.csv")
+                    if os.path.exists(out_csv):
+                        continue
+                    low_csv  = os.path.join(_fusion_src, f"{_tn}_{ch_id}_result.csv")
+                    high_csv = os.path.join(_fusion_src, f"{_tn}_{second_id}_result.csv")
+                    low_df  = pd.read_csv(low_csv)  if os.path.isfile(low_csv)  else pd.DataFrame(columns=[
+                        "slice_name", "x1", "y1", "x2", "y2", "class", "score", "mean", "z"])
+                    high_df = pd.read_csv(high_csv) if os.path.isfile(high_csv) else pd.DataFrame(columns=[
+                        "slice_name", "x1", "y1", "x2", "y2", "class", "score", "mean", "z"])
+                    if low_df.empty and high_df.empty:
+                        continue
+
+                    fused_df, n_low, n_high, n_fused = fuse_dual_intensity_2d(
+                        low_df, high_df, iou_thresh=ch.get('fusion_iou_thresh', 0.3)
+                    )
+                    fused_df.to_csv(out_csv, index=False)
+
+                    n_matched = n_low + n_high - n_fused
+                    _agg[ch_id]['low']   += n_low
+                    _agg[ch_id]['high']  += n_high
+                    _agg[ch_id]['fused'] += n_fused
+                    _fusion_rows.append({
+                        "channel": ch_id, "tile": _tn, "n_low": n_low, "n_high": n_high,
+                        "n_fused": n_fused, "n_matched": n_matched,
+                    })
+                    logging.info(f"  [2.6][{ch_id}] tile={_tn}: low={n_low} high={n_high} "
+                                 f"-> fused={n_fused} (matched={n_matched})")
+
+            for ch_id, c in _agg.items():
+                n_matched_total = c['low'] + c['high'] - c['fused']
+                logging.info(f"✔️ [2.6] [{ch_id}] 汇总: low={c['low']:,} high={c['high']:,} "
+                             f"fused={c['fused']:,} (matched={n_matched_total:,})")
+
+            if _fusion_rows:
+                _df_fusion_summary = pd.DataFrame(_fusion_rows)
+                for ch_id, c in _agg.items():
+                    _df_fusion_summary = pd.concat([_df_fusion_summary, pd.DataFrame([{
+                        "channel": ch_id, "tile": "TOTAL", "n_low": c['low'], "n_high": c['high'],
+                        "n_fused": c['fused'], "n_matched": c['low'] + c['high'] - c['fused'],
+                    }])], ignore_index=True)
+                _df_fusion_summary.to_csv(
+                    os.path.join(_fusion_dst, "fusion_summary.csv"), index=False
+                )
 
     # ==========================================
     # 阶段 2.75: Tile 级 CSV 强度/尺寸过滤
@@ -329,12 +401,16 @@ if __name__ == '__main__':
     _filter_dst = derived['pATH_DET_FILTERED']
     _stage_2_75_enabled = config.get('stage_2_75_enabled', True)
 
+    def _src_for(ch):
+        """double_exposure 通道读取融合(Stage 2.6)后的结果，其余通道读取常规来源。"""
+        return derived['pATH_DET_FUSED'] if ch.get('double_exposure') else _filter_src
+
     _tile_names_all = [os.path.split(p)[-1] for p in pATHTILE_all]
     _filter_done = all(
         os.path.exists(os.path.join(_filter_dst, f"{tn}_{ch['id']}_result.csv"))
         for tn in _tile_names_all
         for ch in routing_config
-        if os.path.exists(os.path.join(_filter_src, f"{tn}_{ch['id']}_result.csv"))
+        if os.path.exists(os.path.join(_src_for(ch), f"{tn}_{ch['id']}_result.csv"))
     )
 
     if _filter_done:
@@ -345,7 +421,7 @@ if __name__ == '__main__':
         for _tn in tqdm(_tile_names_all, desc="Passthrough tiles"):
             for _ch in routing_config:
                 _ch_id  = _ch['id']
-                _in_csv = os.path.join(_filter_src, f"{_tn}_{_ch_id}_result.csv")
+                _in_csv = os.path.join(_src_for(_ch), f"{_tn}_{_ch_id}_result.csv")
                 _out_csv = os.path.join(_filter_dst, f"{_tn}_{_ch_id}_result.csv")
                 if os.path.exists(_in_csv) and not os.path.exists(_out_csv):
                     shutil.copy2(_in_csv, _out_csv)
@@ -358,7 +434,7 @@ if __name__ == '__main__':
         for _tn in tqdm(_tile_names_all, desc="Filter tiles"):
             for _ch in routing_config:
                 _ch_id   = _ch['id']
-                _in_csv  = os.path.join(_filter_src, f"{_tn}_{_ch_id}_result.csv")
+                _in_csv  = os.path.join(_src_for(_ch), f"{_tn}_{_ch_id}_result.csv")
                 _out_csv = os.path.join(_filter_dst, f"{_tn}_{_ch_id}_result.csv")
                 if not os.path.exists(_in_csv) or os.path.exists(_out_csv):
                     continue
@@ -447,23 +523,28 @@ if __name__ == '__main__':
     # 输入: _filter_src (raw CSV)
     # 输出: 1_tile_2d_histograms/{tile}_{ch}_hist.png
     # 删除输出目录可强制重建；不影响过滤及后续流程
+    # 开关: detection_params.generate_histograms (默认 true)
     # ==========================================
-    _hist_dir  = derived['pATH_HISTOGRAMS']
-    _hist_todo = [
-        (_tn, _ch)
-        for _tn in _tile_names_all
-        for _ch in routing_config
-        if _ch.get('active', True)
-        and os.path.exists(os.path.join(_filter_src, f"{_tn}_{_ch['id']}_result.csv"))
-        and not os.path.exists(os.path.join(_hist_dir, f"{_tn}_{_ch['id']}_hist.png"))
-    ]
-    if not _hist_todo:
-        logging.info("✔️ Checkpoint 2.8 达成: raw 直方图已全部存在。")
+    _hist_dir = derived['pATH_HISTOGRAMS']
+    if not dp.get('generate_histograms', True):
+        logging.info("⏭️ [2.8] generate_histograms=false，跳过 raw 直方图生成。")
+        _hist_todo = []
     else:
+        _hist_todo = [
+            (_tn, _ch)
+            for _tn in _tile_names_all
+            for _ch in routing_config
+            if _ch.get('active', True)
+            and os.path.exists(os.path.join(_src_for(_ch), f"{_tn}_{_ch['id']}_result.csv"))
+            and not os.path.exists(os.path.join(_hist_dir, f"{_tn}_{_ch['id']}_hist.png"))
+        ]
+        if not _hist_todo:
+            logging.info("✔️ Checkpoint 2.8 达成: raw 直方图已全部存在。")
+    if _hist_todo:
         logging.info(f"阶段 2.8: 生成 {len(_hist_todo)} 个 raw 2D 直方图 ...")
         for _tn, _ch in tqdm(_hist_todo, desc="Raw histograms"):
             _ch_id    = _ch['id']
-            _csv_path = os.path.join(_filter_src, f"{_tn}_{_ch_id}_result.csv")
+            _csv_path = os.path.join(_src_for(_ch), f"{_tn}_{_ch_id}_result.csv")
             _df_raw   = pd.read_csv(_csv_path)
             if _df_raw.empty:
                 continue
@@ -519,8 +600,16 @@ if __name__ == '__main__':
             for ch_id, p in global_2d_paths.items():
                 per_ch_matrices[ch_id] = pd.read_csv(p)[BOX_COLS].values
         else:
+            # 按通道跳过：已存在 global_2d CSV 的通道直接加载，只重新拼接缺失的通道
+            _ch_cached = [ch for ch in routing_config if os.path.exists(global_2d_paths[ch['id']])]
+            _ch_todo   = [ch for ch in routing_config if not os.path.exists(global_2d_paths[ch['id']])]
+            if _ch_cached:
+                logging.info(f"✔️ Checkpoint 2a (按通道): {[c['id'] for c in _ch_cached]} 已存在，直接加载。")
+                for ch in _ch_cached:
+                    per_ch_matrices[ch['id']] = pd.read_csv(global_2d_paths[ch['id']])[BOX_COLS].values
+
             # ====== 1. 逐通道独立拼接全局 2D，每个通道单独保存 ======
-            for ch in routing_config:
+            for ch in _ch_todo:
                 ch_id   = ch['id']
                 ch_type = ch.get('type', 'soma')
                 logging.info(f" -> 正在拼接通道 2D 框: [{ch_id}] (类型: {ch_type})")
@@ -596,7 +685,13 @@ if __name__ == '__main__':
                 with open(pkl_paths[cid], 'rb') as pf:
                     tf_vol_by_ch[cid] = pickle.load(pf)
         else:
+            # 按通道跳过：已存在 pkl 的通道直接加载，只对缺失的通道重新跑 Z-Linker
             for cid in soma_ch_ids:
+                if os.path.exists(pkl_paths[cid]):
+                    with open(pkl_paths[cid], 'rb') as pf:
+                        soma_vol_by_ch[cid] = pickle.load(pf)
+                    logging.info(f"✔️ [{cid}] 已存在 3D 追踪结果，直接加载（跳过 Z-Linker）。")
+                    continue
                 ch_mat = per_ch_matrices.get(cid)
                 if ch_mat is None or len(ch_mat) == 0:
                     continue
@@ -615,6 +710,11 @@ if __name__ == '__main__':
                 logging.info(f"✔️ [{cid}] Z-Link soma: {len(vol_list)} 个细胞 → {out_3d}")
 
             for cid in tf_ch_ids:
+                if os.path.exists(pkl_paths[cid]):
+                    with open(pkl_paths[cid], 'rb') as pf:
+                        tf_vol_by_ch[cid] = pickle.load(pf)
+                    logging.info(f"✔️ [{cid}] 已存在 3D 追踪结果，直接加载（跳过 Z-Linker）。")
+                    continue
                 ch_mat = per_ch_matrices.get(cid)
                 if ch_mat is None or len(ch_mat) == 0:
                     continue

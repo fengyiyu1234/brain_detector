@@ -340,6 +340,12 @@ def _iou_matrix_2d(rows_a, rows_b):
 
 _CELL_TYPE_PRIORITY = {'glia': 1, 'neuron': 0}
 
+# Private provenance tags used only inside fuse_dual_intensity_2d to dodge _merge_class's
+# bare-single-token branch (see that function's docstring). Never written to disk — stripped
+# back to the bare base type before the fused rows are returned.
+_DUAL_LO_TAG = "dilo"
+_DUAL_HI_TAG = "dihi"
+
 
 def _merge_class(cls_a, cls_b):
     """Merge two class strings, combining markers: 'neuron_RFP' + 'neuron_GFP' → 'neuron_GFP_RFP'.
@@ -410,6 +416,60 @@ def merge_soma_detections_2d(ch_a_matrix, ch_b_matrix, iou_thresh=0.1):
     return np.array(result, dtype=object) if result else np.empty((0, 8), dtype=object)
 
 
+_RAW_COLS = ["slice_name", "x1", "y1", "x2", "y2", "class", "score", "mean", "z"]
+_BOX_COLS = ["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]
+
+
+def _raw_df_to_tagged_box_matrix(df, tag):
+    """Raw 9-col tile dataframe -> (_BOX_COLS 8-col object matrix with tagged class, z->slice_name map).
+    Tagging avoids _merge_class's bare-single-token branch (see fuse_dual_intensity_2d)."""
+    if df.empty:
+        return np.empty((0, 8), dtype=object), {}
+    z_to_slice = dict(zip(df["z"].astype(int), df["slice_name"]))
+    mat = df[_BOX_COLS].values.copy()
+    mat[:, 6] = np.array([f"{v}_{tag}" for v in mat[:, 6]], dtype=object)
+    return mat, z_to_slice
+
+
+def fuse_dual_intensity_2d(low_df, high_df, iou_thresh=0.3):
+    """
+    Fuse two per-tile raw detection CSVs (same physical channel, two exposures/laser
+    powers) at the 2D per-z-slice level via merge_soma_detections_2d, before any
+    downstream filtering.
+
+    low_df/high_df: raw 9-col dataframes (slice_name,x1,y1,x2,y2,class,score,mean,z),
+    e.g. loaded from 1_tile_2d_raw or 0_channel_alignment.
+
+    Classes are tagged internally before merging (so _merge_class's bare-token branch
+    doesn't fire on plain untagged YOLO/StarDist classes like "neuron"/"glia" and
+    fabricate a bogus "neuron_neuron" class), then stripped back to the bare base type
+    on the fused output — no provenance tag ever reaches the caller.
+
+    Returns (fused_df, n_low, n_high, n_fused) — fused_df in the same raw 9-col format.
+    """
+    n_low, n_high = len(low_df), len(high_df)
+
+    low_mat, low_z2s = _raw_df_to_tagged_box_matrix(low_df, _DUAL_LO_TAG)
+    high_mat, high_z2s = _raw_df_to_tagged_box_matrix(high_df, _DUAL_HI_TAG)
+
+    fused_mat = merge_soma_detections_2d(low_mat, high_mat, iou_thresh=iou_thresh)
+    n_fused = len(fused_mat)
+
+    z_to_slice = dict(low_z2s)
+    z_to_slice.update(high_z2s)
+
+    rows = []
+    for row in fused_mat:
+        x1, y1, x2, y2, score, mean, cls, z = row
+        base_cls = str(cls).split('_')[0]
+        z_int = int(float(z))
+        slice_name = z_to_slice.get(z_int, str(z_int))
+        rows.append([slice_name, x1, y1, x2, y2, base_cls, score, mean, z_int])
+
+    fused_df = pd.DataFrame(rows, columns=_RAW_COLS)
+    return fused_df, n_low, n_high, n_fused
+
+
 def annotate_soma_with_tf_2d(soma_matrix, tf_matrix, z_tolerance_slices=0):
     """
     For each soma 2D detection, find TF nucleus detections whose bbox is fully
@@ -460,7 +520,9 @@ def annotate_soma_with_tf_2d(soma_matrix, tf_matrix, z_tolerance_slices=0):
 
 def _cells_to_arrays(cells, z_pad=0):
     """Extract bounding-box fields from a list of cell dicts into float32 NumPy arrays.
-    Returns (x1,y1,x2,y2,z1,z2, coords[N,3], radii[N]) where coords/radii are for spatial queries."""
+    Returns (x1,y1,x2,y2,z1,z2, coords[N,3], radii[N]) where coords/radii are for spatial queries.
+    z_pad only widens the KDTree candidate-search radius here (conservative upper bound);
+    the actual one-sided gap-bridging is applied later in _iou_3d_batch, not to these raw boxes."""
     x1 = np.array([c['x1_3d'] for c in cells], dtype=np.float32)
     y1 = np.array([c['y1_3d'] for c in cells], dtype=np.float32)
     x2 = np.array([c['x2_3d'] for c in cells], dtype=np.float32)
@@ -468,7 +530,7 @@ def _cells_to_arrays(cells, z_pad=0):
     z1 = np.array([c['z_min']  for c in cells], dtype=np.float32)
     z2 = np.array([c['z_max']  for c in cells], dtype=np.float32)
     cx = (x1 + x2) * 0.5;  cy = (y1 + y2) * 0.5;  cz = (z1 + z2) * 0.5
-    rx = (x2 - x1) * 0.5;  ry = (y2 - y1) * 0.5;  rz = (z2 - z1 + 1 + 2 * z_pad) * 0.5
+    rx = (x2 - x1) * 0.5;  ry = (y2 - y1) * 0.5;  rz = (z2 - z1 + 1 + z_pad) * 0.5
     radii = np.sqrt(rx**2 + ry**2 + rz**2)
     coords = np.stack([cx, cy, cz], axis=1).astype(np.float64)
     return x1, y1, x2, y2, z1, z2, coords, radii
@@ -478,14 +540,24 @@ def _iou_3d_batch(x1a, y1a, x2a, y2a, z1a, z2a,
                    x1b, y1b, x2b, y2b, z1b, z2b,
                    i_arr, j_arr, z_pad):
     """Vectorized 3D IoU and IoMin for candidate pairs given by index arrays i_arr, j_arr.
-    Returns (iou_vals, iomin_vals) where iomin = intersection / min(vol_a, vol_b)."""
+    Returns (iou_vals, iomin_vals) where iomin = intersection / min(vol_a, vol_b).
+
+    z_pad is a one-sided gap-bridging tolerance, not a symmetric box inflation: it only
+    fills in a real z-gap between two boxes that don't already overlap in z (up to z_pad
+    slices), mirroring the single-side tolerance used for TF containment. Boxes that already
+    overlap in z use their raw (unpadded) overlap/volume, so z_pad never dilutes the IoU of
+    pairs that don't need bridging."""
     ix = np.maximum(0.0, np.minimum(x2a[i_arr], x2b[j_arr]) - np.maximum(x1a[i_arr], x1b[j_arr]))
     iy = np.maximum(0.0, np.minimum(y2a[i_arr], y2b[j_arr]) - np.maximum(y1a[i_arr], y1b[j_arr]))
-    iz = np.maximum(0.0,
-         np.minimum(z2a[i_arr], z2b[j_arr]) - np.maximum(z1a[i_arr], z1b[j_arr]) + 1 + 2 * z_pad)
+    raw_iz  = (np.minimum(z2a[i_arr], z2b[j_arr]) - np.maximum(z1a[i_arr], z1b[j_arr]) + 1)
+    depth_a = z2a[i_arr] - z1a[i_arr] + 1
+    depth_b = z2b[j_arr] - z1b[j_arr] + 1
+    # Bridged credit can never exceed either box's own depth, or inter would exceed va/vb.
+    bridged_iz = np.minimum(np.maximum(0.0, raw_iz + z_pad), np.minimum(depth_a, depth_b))
+    iz = np.where(raw_iz > 0, raw_iz, bridged_iz)
     inter = ix * iy * iz
-    va = (x2a[i_arr] - x1a[i_arr]) * (y2a[i_arr] - y1a[i_arr]) * (z2a[i_arr] - z1a[i_arr] + 1 + 2 * z_pad)
-    vb = (x2b[j_arr] - x1b[j_arr]) * (y2b[j_arr] - y1b[j_arr]) * (z2b[j_arr] - z1b[j_arr] + 1 + 2 * z_pad)
+    va = (x2a[i_arr] - x1a[i_arr]) * (y2a[i_arr] - y1a[i_arr]) * (z2a[i_arr] - z1a[i_arr] + 1)
+    vb = (x2b[j_arr] - x1b[j_arr]) * (y2b[j_arr] - y1b[j_arr]) * (z2b[j_arr] - z1b[j_arr] + 1)
     iou   = inter / (va + vb - inter + 1e-8)
     iomin = inter / (np.minimum(va, vb) + 1e-8)
     return iou, iomin
@@ -690,10 +762,13 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
                 s['y1_3d'] - xy_margin <= tf['y1_3d'] and
                 tf['y2_3d'] <= s['y2_3d'] + xy_margin
             )
-            eff_z_pad = z_pad if s['z_max'] > s['z_min'] else 0
+            # z_pad slices of tolerance on exactly one side only, never both at once
+            # (padding both sides simultaneously lets a truncated box balloon into
+            # an oversized capture window) — applies the same way to single- and
+            # multi-layer soma boxes.
             contained_z = (
-                s['z_min'] - eff_z_pad <= tf['z_min'] and
-                tf['z_max'] <= s['z_max'] + eff_z_pad
+                (tf['z_min'] >= s['z_min'] - z_pad and tf['z_max'] <= s['z_max']) or
+                (tf['z_min'] >= s['z_min']          and tf['z_max'] <= s['z_max'] + z_pad)
             )
             if not (contained_xy and contained_z):
                 continue
@@ -903,16 +978,17 @@ def non_max_suppression_iou(boxes, overlapThresh=0.45, sort_idx=4, containment_t
 def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, disp_mat, size, metadata_registry, tile_name, tILESIZE=2048, file_z0=None):
     row, col = pos
     ABS_X, ABS_Y, ABS_Z = disp_mat[pos]
-    H, W = size
-    mask = np.zeros((H, W), dtype=float)
+    # 重叠区判定只涉及当前 tile 自身的局部范围，用 tile 大小的局部 mask
+    # 即可，不要用全局拼接画布尺寸 (size)，否则超大画布会尝试分配 TB 级内存。
+    mask = np.zeros((tILESIZE, tILESIZE), dtype=bool)
     if col > 0:
         x_pre_start = disp_mat[row, col - 1][0]; y_pre_start = disp_mat[row, col - 1][1]
-        mask[max(ABS_Y, y_pre_start):min(ABS_Y + tILESIZE, y_pre_start + tILESIZE),
-             max(ABS_X, x_pre_start):min(ABS_X + tILESIZE, x_pre_start + tILESIZE)] = 1
+        mask[max(ABS_Y, y_pre_start) - ABS_Y:min(ABS_Y + tILESIZE, y_pre_start + tILESIZE) - ABS_Y,
+             max(ABS_X, x_pre_start) - ABS_X:min(ABS_X + tILESIZE, x_pre_start + tILESIZE) - ABS_X] = True
     if row > 0:
         x_pre_start = disp_mat[row - 1, col][0]; y_pre_start = disp_mat[row - 1, col][1]
-        mask[max(ABS_Y, y_pre_start):min(ABS_Y + tILESIZE, y_pre_start + tILESIZE),
-             max(ABS_X, x_pre_start):min(ABS_X + tILESIZE, x_pre_start + tILESIZE)] = 1
+        mask[max(ABS_Y, y_pre_start) - ABS_Y:min(ABS_Y + tILESIZE, y_pre_start + tILESIZE) - ABS_Y,
+             max(ABS_X, x_pre_start) - ABS_X:min(ABS_X + tILESIZE, x_pre_start + tILESIZE) - ABS_X] = True
     z0 = z_start - ABS_Z
     z1 = z0 + Z
 
@@ -922,11 +998,13 @@ def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, d
         x1   = float(x1); x2 = float(x2); y1 = float(y1); y2 = float(y2)
         score = float(score); mean = float(mean)
         if z - 1 in range(z0, z1):
+            cy_local = min(max(int((y1 + y2) // 2), 0), tILESIZE - 1)
+            cx_local = min(max(int((x1 + x2) // 2), 0), tILESIZE - 1)
             x1 += ABS_X; x2 += ABS_X; y1 += ABS_Y; y2 += ABS_Y; z = z - z0
             cell_type_index = 0 if 'glia' in class_name.lower() else 1
             new_box = np.array([[x1, y1, x2, y2, score, mean, class_name, z]], dtype=object)
 
-            if not mask[int((y1 + y2) // 2), int((x1 + x2) // 2)] > 0:
+            if not mask[cy_local, cx_local]:
                 # 非重叠区：直接写入
                 all_predictions[z - 1][cell_type_index] = np.concatenate(
                     (all_predictions[z - 1][cell_type_index], new_box)

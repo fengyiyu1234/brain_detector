@@ -31,7 +31,9 @@ def init_worker(config, gpu_queue=None):
     else:
         _worker_device = config['device']
     device = _worker_device
-    routing_config = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
+    routing_config = config.get('channels_routing_detect') or [
+        ch for ch in config.get('channels_routing', []) if ch.get('active', True)
+    ]
     required_models = {ch['model'].lower() for ch in routing_config}
 
     if 'yolo' in required_models:
@@ -237,9 +239,11 @@ def process_single_tile(i, pATHTEST, config):
     current_logger = logging.getLogger(__name__)
     current_logger.info(f"🚀 Worker (PID:{os.getpid()}) 开始接管 Tile: {dir_name}，日志已绑定至输出目录！")
 
-    # --- 1. 解析路由 ---
-    routing_config = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
-    
+    # --- 1. 解析路由 (含 double_exposure 展开出的第二曝光合成通道，仅用于检测) ---
+    routing_config = config.get('channels_routing_detect') or [
+        ch for ch in config.get('channels_routing', []) if ch.get('active', True)
+    ]
+
     if not routing_config:
         current_logger.error("配置文件中没有激活的 channels_routing！")
         return [], dir_name
