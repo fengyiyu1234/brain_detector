@@ -396,8 +396,11 @@ def _containment_score(soma_idx, tf_arrays, dx, dy, dz,
 
     contained_xy = ((s_x1 - xy_margin <= tf_x1c) & (tf_x2c <= s_x2 + xy_margin) &
                     (s_y1 - xy_margin <= tf_y1c) & (tf_y2c <= s_y2 + xy_margin))
-    eff_z_pad = np.where(s_z2 > s_z1, z_pad, 0)
-    contained_z = (s_z1 - eff_z_pad <= tf_z1c) & (tf_z2c <= s_z2 + eff_z_pad)
+    # z_pad slices of tolerance on exactly one side only, never both at once
+    # (padding both sides simultaneously lets a truncated box balloon into an
+    # oversized capture window) — applies the same way to single- and multi-layer
+    # soma boxes.
+    contained_z = ((tf_z1c >= s_z1 - z_pad) & (tf_z2c <= s_z2)) | ((tf_z1c >= s_z1) & (tf_z2c <= s_z2 + z_pad))
     ok = contained_xy & contained_z
     if not ok.any():
         return 0, 0.0
