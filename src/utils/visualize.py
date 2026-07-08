@@ -472,13 +472,23 @@ def _print_tile_grid(grid, name_to_idx):
     print("^ row")
 
 
-def _select_tile(vis_cfg, tile_paths):
+def _select_tiles(vis_cfg, tile_paths):
+    """Resolve which tile(s) to visualize -> list of (tile_path, tile_name).
+
+    vis_cfg['tile'] may be a single tile-dir name, a list of names, or absent
+    (None) — in which case the tile list/grid is printed and the user types one
+    or more comma-separated indices (e.g. "1,3,10,15") to open several at once.
+    """
     tile_arg = vis_cfg.get('tile', None)
     if tile_arg is not None:
-        tile_path = next((p for p in tile_paths if os.path.basename(p) == tile_arg), None)
-        if tile_path is None:
-            sys.exit(f"Tile '{tile_arg}' not found.")
-        return tile_path, tile_arg
+        names = tile_arg if isinstance(tile_arg, list) else [tile_arg]
+        selected = []
+        for name in names:
+            tile_path = next((p for p in tile_paths if os.path.basename(p) == name), None)
+            if tile_path is None:
+                sys.exit(f"Tile '{name}' not found.")
+            selected.append((tile_path, name))
+        return selected
 
     name_to_idx = {os.path.basename(p): i for i, p in enumerate(tile_paths)}
     grid = _get_tile_grid_from_names(tile_paths)
@@ -488,9 +498,9 @@ def _select_tile(vis_cfg, tile_paths):
     print(f"\nAvailable tiles ({len(tile_paths)}):")
     for i, p in enumerate(tile_paths):
         print(f"  [{i:3d}] {os.path.basename(p)}")
-    idx = int(input("\nEnter tile index: ").strip() or 0)
-    tile_path = tile_paths[idx]
-    return tile_path, os.path.basename(tile_path)
+    raw = input("\nEnter tile index(es), comma-separated (e.g. 1,3,10,15): ").strip()
+    idxs = [int(s) for s in raw.split(',') if s.strip()] if raw else [0]
+    return [(tile_paths[i], os.path.basename(tile_paths[i])) for i in idxs]
 
 
 def _list_tiffs(path):
@@ -499,22 +509,14 @@ def _list_tiffs(path):
                   ) if os.path.isdir(path) else []
 
 
-def _resolve_z_range(vis_cfg, pa_cfg, tile_path):
-    z_range_arg = vis_cfg.get('z_range', None)
-    z_start_cfg = vis_cfg.get('z_start', None)
-    z_count_cfg = vis_cfg.get('z_count', None)
-    if z_range_arg is not None:
-        return tuple(z_range_arg)
+def _resolve_z_range(vis_cfg, tile_path):
     tiffs   = _list_tiffs(tile_path)
     total_z = len(tiffs)
-    if z_start_cfg is not None or z_count_cfg is not None:
-        s = int(z_start_cfg) if z_start_cfg is not None else 0
-        c = int(z_count_cfg)  if z_count_cfg  is not None else total_z - s
-        return (max(0, s), min(total_z, s + c))
-    sample_count = pa_cfg.get('sample_z_center_count', 50)
-    half = sample_count // 2
-    z_center = total_z // 2
-    return (max(0, z_center - half), min(total_z, z_center + half))
+    z_start_cfg = vis_cfg.get('z_start', None)
+    z_count_cfg = vis_cfg.get('z_count', None)
+    s = int(z_start_cfg) if z_start_cfg is not None else 0
+    c = int(z_count_cfg) if z_count_cfg is not None else total_z - s
+    return (max(0, s), min(total_z, s + c))
 
 
 def _canvas_shape_from_tile(tile_path, z_range):
@@ -700,7 +702,14 @@ def _add_contrast_panel(viewer, image_layers):
         max_box.valueChanged.connect(lambda _v, c=_commit: c('max'))
         layer.events.contrast_limits.connect(_sync_from_layer)
 
-    viewer.window.add_dock_widget(panel, area='right', name='Contrast (manual)')
+    dock = viewer.window.add_dock_widget(panel, area='right', name='Contrast (manual)', tabify=False)
+    # tabify explicitly with napari's built-in "layer controls" dock rather than
+    # whatever else napari.window.add_dock_widget(tabify=True) would grab last
+    # (e.g. the layer list) — puts our panel one click away as a sibling tab.
+    qt_window = viewer.window._qt_window
+    qt_window.tabifyDockWidget(viewer.window._qt_viewer.dockLayerControls, dock)
+    dock.show()
+    dock.raise_()
 
 
 # ── CSV → shapes ──────────────────────────────────────────────────────────────
@@ -1617,10 +1626,66 @@ def _run_tile_colocalization(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
     return merged
 
 
+# ── Dual-intensity helpers ─────────────────────────────────────────────────────
+
+def _add_second_intensity_layer(viewer, ch, paths, anchor_dir, tile_path, z_range,
+                                 contrast_pct, offsets=None):
+    """For a double_exposure channel, load its second-intensity volume as its own
+    image layer (same colormap as the primary channel — same physical channel,
+    just a different laser power). No-op for regular channels.
+
+    offsets: prealign's per-channel shift dict, keyed by channel id — the pipeline
+    already copies the primary channel's shift onto second_intensity_id when writing
+    0_channel_alignment/*_offsets.json, so this needs no special-case resolution.
+    Pass None in post mode (raw, unshifted images).
+    Returns (second_id, layer), or None if nothing was loaded.
+    """
+    if not ch.get('double_exposure'):
+        return None
+    second_id = ch['second_intensity_id']
+    second_base = os.path.abspath(paths[ch['second_intensity_dir_key']])
+    tile_dir = os.path.join(second_base, os.path.relpath(tile_path, anchor_dir))
+    print(f"[img] Loading {second_id}  ({tile_dir})  [dual-intensity] ...")
+    vol, climits = load_volume(tile_dir, z_range=z_range, contrast_pct=contrast_pct)
+    if vol is None:
+        print("  → not found, skipping")
+        return None
+    if offsets and second_id in offsets:
+        o = offsets[second_id]
+        dx, dy, dz = o['dx'], o['dy'], o['dz']
+        if dx != 0 or dy != 0 or dz != 0:
+            vol = _shift_volume(vol, dx, dy, dz)
+            print(f"  → shifted ({dx:+d}, {dy:+d}, {dz:+d})")
+    layer = viewer.add_image(vol, name=f"[img] {second_id}", contrast_limits=climits,
+                              **_ch_vis(ch['id']))
+    layer.contrast_limits_range = (0, 65535)
+    print(f"  → {vol.shape}  contrast_limits={climits}")
+    return second_id, layer
+
+
+def _channel_2d_csv(ch, tile_name, primary_dir, fallback_dir, fused_dir,
+                     use_fallback=True):
+    """Resolve the tile-local 2D-detection CSV path for a channel.
+
+    double_exposure channels always read the fused result (1_tile_2d_fused) —
+    the pre-fusion per-exposure CSV under primary_dir/fallback_dir would only
+    hold that one exposure's detections, not the merged channel. Regular
+    channels keep the existing primary_dir -> fallback_dir behavior.
+    use_fallback: whether to fall back to fallback_dir when the file isn't at
+    primary_dir (mirrors the callers' own has_aligned / os.path.exists checks).
+    """
+    cid = ch['id']
+    if ch.get('double_exposure'):
+        return os.path.join(fused_dir, f"{tile_name}_{cid}_result.csv")
+    csv_path = os.path.join(primary_dir, f"{tile_name}_{cid}_result.csv")
+    if not os.path.isfile(csv_path) and use_fallback:
+        csv_path = os.path.join(fallback_dir, f"{tile_name}_{cid}_result.csv")
+    return csv_path
+
+
 # ── Mode: prealign ────────────────────────────────────────────────────────────
 
-def _run_prealign(vis_cfg, paths, routing_config):
-    pa_cfg  = vis_cfg.get('pre_align_params', {})
+def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
     zl_cfg  = vis_cfg.get('z_linker', {})
     zl_soma = zl_cfg.get('soma', {})
     zl_tf   = zl_cfg.get('tf',   {})
@@ -1642,18 +1707,19 @@ def _run_prealign(vis_cfg, paths, routing_config):
     sphere_raw_opacity = vis_cfg.get('sphere_raw_opacity', 0.3)
     sphere_colors_cfg  = vis_cfg.get('sphere_colors',      {})
 
-    base_res  = paths['pATHRESULT']
-    align_dir = os.path.join(base_res, '0_channel_alignment')
-    raw_dir   = os.path.join(base_res, '1_tile_2d_raw')
+    base_res     = paths['pATHRESULT']
+    align_dir    = os.path.join(base_res, '0_channel_alignment')
+    raw_dir      = os.path.join(base_res, '1_tile_2d_raw')
+    fused_dir    = os.path.join(base_res, '1_tile_2d_fused')
+    filtered_dir = os.path.join(base_res, '1_tile_2d_filtered')
 
     anchor_ch  = routing_config[0]
     anchor_dir = os.path.abspath(paths[anchor_ch['dir_key']])
     _, tile_paths = listTile(anchor_dir)
 
-    tile_path, tile_name = _select_tile(vis_cfg, tile_paths)
     print(f"\nTile: {tile_name}")
 
-    z_range      = _resolve_z_range(vis_cfg, pa_cfg, tile_path)
+    z_range      = _resolve_z_range(vis_cfg, tile_path)
     canvas_shape = _canvas_shape_from_tile(tile_path, z_range)
     canvas_z, canvas_h, canvas_w = canvas_shape
     print(f"Z-range: {z_range[0]} – {z_range[1]} ({z_range[1] - z_range[0]} slices)\n")
@@ -1684,12 +1750,10 @@ def _run_prealign(vis_cfg, paths, routing_config):
         for ch in routing_config:
             cid   = ch['id']
             ctype = ch.get('type', 'soma')
-            aligned_csv = os.path.join(align_dir, f"{tile_name}_{cid}_result.csv")
-            if not os.path.isfile(aligned_csv) and not has_aligned:
-                aligned_csv = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
+            filtered_csv = os.path.join(filtered_dir, f"{tile_name}_{cid}_result.csv")
             zl_p = zl_soma if ctype == 'soma' else zl_tf
             vol_list = _run_zlink_for_csv(
-                aligned_csv, z_range,
+                filtered_csv, z_range,
                 iou_thresh=zl_p.get('iou_thresh', 0.35),
                 min_z_layers=zl_p.get('min_z_layers', 1),
                 max_cell_z_span=zl_p.get('max_cell_z_span', 5),
@@ -1742,6 +1806,12 @@ def _run_prealign(vis_cfg, paths, routing_config):
             img_layer.contrast_limits_range = (0, 65535)
             img_layers.append((cid, img_layer))
             print(f"  → {vol.shape}  contrast_limits={climits}")
+
+            second = _add_second_intensity_layer(
+                viewer, ch, paths, anchor_dir, tile_path, z_range, contrast_pct,
+                offsets=offsets)
+            if second:
+                img_layers.append(second)
         _add_contrast_panel(viewer, img_layers)
 
     box_registry = []  # {z, x1, y1, x2, y2, cls, layer_name} — populated below
@@ -1771,10 +1841,9 @@ def _run_prealign(vis_cfg, paths, routing_config):
     # ── Intensity histogram (before any filtering) ────────────────────────────
     if show_hist and raw_vols:
         ch_means = {}
+        ch_by_id = {ch['id']: ch for ch in routing_config}
         for cid, rv in raw_vols.items():
-            aligned_csv = os.path.join(align_dir, f"{tile_name}_{cid}_result.csv")
-            if not os.path.isfile(aligned_csv):
-                aligned_csv = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
+            aligned_csv = _channel_2d_csv(ch_by_id[cid], tile_name, align_dir, raw_dir, fused_dir)
             print(f"[hist] Computing box means for {cid} ...")
             ch_means[cid] = _compute_box_means_from_csv(aligned_csv, z_range, rv)
             print(f"[hist] {cid}: {len(ch_means[cid]):,} boxes")
@@ -1786,9 +1855,8 @@ def _run_prealign(vis_cfg, paths, routing_config):
         ch_areas = {}
         for ch in routing_config:
             cid = ch['id']
-            aligned_csv = os.path.join(align_dir, f"{tile_name}_{cid}_result.csv")
-            if not os.path.isfile(aligned_csv) and not has_aligned:
-                aligned_csv = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
+            aligned_csv = _channel_2d_csv(ch, tile_name, align_dir, raw_dir, fused_dir,
+                                           use_fallback=not has_aligned)
             print(f"[area_hist] Computing box areas for {cid} ...")
             ch_areas[cid] = _compute_box_areas_from_csv(aligned_csv, z_range)
             print(f"[area_hist] {cid}: {len(ch_areas[cid]):,} boxes")
@@ -1802,9 +1870,7 @@ def _run_prealign(vis_cfg, paths, routing_config):
     for ch in routing_config:
         cid     = ch['id']
         iou_str = (f"  iou={offsets[cid]['iou_score']:.3f}" if cid in offsets else "")
-        aligned_csv = os.path.join(align_dir, f"{tile_name}_{cid}_result.csv")
-        if not os.path.isfile(aligned_csv) and not has_aligned:
-            aligned_csv = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
+        aligned_csv = os.path.join(filtered_dir, f"{tile_name}_{cid}_result.csv")
         ch_filt = _get_ch_filter(filter_cfg, ch)
         (shapes_a, colors_a, meta_a), (rej_sa, rej_ca, _) = _load_tile_csv_shapes(
             aligned_csv, z_range,
@@ -2097,13 +2163,11 @@ def _run_prealign(vis_cfg, paths, routing_config):
     viewer.mouse_drag_callbacks.append(_on_click)
 
     viewer.reset_view()
-    napari.run()
 
 
 # ── Mode: post (single tile) ──────────────────────────────────────────────────
 
-def _run_post(vis_cfg, paths, routing_config):
-    pa_cfg  = vis_cfg.get('pre_align_params', {})
+def _run_post(vis_cfg, paths, routing_config, tile_path, tile_name):
     zl_cfg  = vis_cfg.get('z_linker', {})
     zl_soma = zl_cfg.get('soma', {})
     zl_tf   = zl_cfg.get('tf',   {})
@@ -2117,6 +2181,7 @@ def _run_post(vis_cfg, paths, routing_config):
     base_res     = paths['pATHRESULT']
     raw_dir      = os.path.join(base_res, '1_tile_2d_raw')
     filtered_dir = os.path.join(base_res, '1_tile_2d_filtered')
+    fused_dir    = os.path.join(base_res, '1_tile_2d_fused')
     s3_dir    = os.path.join(base_res, '3_channel_3d')
     coloc_csv = os.path.join(base_res, '4_colocalization', 'coloc_result.csv')
 
@@ -2124,10 +2189,9 @@ def _run_post(vis_cfg, paths, routing_config):
     anchor_dir = os.path.abspath(paths[anchor_ch['dir_key']])
     _, tile_paths = listTile(anchor_dir)
 
-    tile_path, tile_name = _select_tile(vis_cfg, tile_paths)
     print(f"\nTile: {tile_name}")
 
-    z_range      = _resolve_z_range(vis_cfg, pa_cfg, tile_path)
+    z_range      = _resolve_z_range(vis_cfg, tile_path)
     canvas_shape = _canvas_shape_from_tile(tile_path, z_range)
     _, canvas_h, canvas_w = canvas_shape
     print(f"Z-range: {z_range[0]} – {z_range[1]} ({z_range[1] - z_range[0]} slices)\n")
@@ -2161,8 +2225,9 @@ def _run_post(vis_cfg, paths, routing_config):
     # ── Intensity histogram (before any filtering) ────────────────────────────
     if show_hist and raw_vols:
         ch_means = {}
+        ch_by_id = {ch['id']: ch for ch in routing_config}
         for cid, rv in raw_vols.items():
-            csv_p = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
+            csv_p = _channel_2d_csv(ch_by_id[cid], tile_name, raw_dir, raw_dir, fused_dir)
             print(f"[hist] Computing box means for {cid} ...")
             ch_means[cid] = _compute_box_means_from_csv(csv_p, z_range, rv)
             print(f"[hist] {cid}: {len(ch_means[cid]):,} boxes")
@@ -2174,7 +2239,7 @@ def _run_post(vis_cfg, paths, routing_config):
         ch_areas = {}
         for ch in routing_config:
             cid = ch['id']
-            csv_p = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
+            csv_p = _channel_2d_csv(ch, tile_name, raw_dir, raw_dir, fused_dir)
             print(f"[area_hist] Computing box areas for {cid} ...")
             ch_areas[cid] = _compute_box_areas_from_csv(csv_p, z_range)
             print(f"[area_hist] {cid}: {len(ch_areas[cid]):,} boxes")
@@ -2198,6 +2263,11 @@ def _run_post(vis_cfg, paths, routing_config):
             img_layer.contrast_limits_range = (0, 65535)
             img_layers.append((cid, img_layer))
             print(f"  → {vol.shape}  contrast_limits={climits}")
+
+            second = _add_second_intensity_layer(
+                viewer, ch, paths, anchor_dir, tile_path, z_range, contrast_pct)
+            if second:
+                img_layers.append(second)
         _add_contrast_panel(viewer, img_layers)
 
     # ── Overlap margins (hide inaccurate boxes in left/top tile boundaries) ──────
@@ -2206,14 +2276,13 @@ def _run_post(vis_cfg, paths, routing_config):
         print(f"[overlap] hiding boxes in left={left_m}px / top={top_m}px margin")
     _add_margin_overlay(viewer, canvas_shape, left_m, top_m)
 
-    # ── [s1] 2D detections (filtered if 1_tile_2d_filtered exists, else raw) ──
+    # ── [s1] 2D detections (from 1_tile_2d_filtered — regular channels are filtered
+    # directly, double_exposure channels are fused then filtered; either way this is
+    # the single source of truth Stage 3 itself reads from) ──────────────────────
     if stage_cfg in ('all', 's1'):
         for ch in routing_config:
             cid = ch['id']
-            _filtered_csv = os.path.join(filtered_dir, f"{tile_name}_{cid}_result.csv")
-            _raw_csv      = os.path.join(raw_dir,      f"{tile_name}_{cid}_result.csv")
-            csv_p   = _filtered_csv if os.path.exists(_filtered_csv) else _raw_csv
-            s1_src  = "filtered" if os.path.exists(_filtered_csv) else "raw"
+            csv_p = os.path.join(filtered_dir, f"{tile_name}_{cid}_result.csv")
             (shapes, colors, meta), (rej_s, rej_c, _) = _load_tile_csv_shapes(
                 csv_p, z_range,
                 raw_vol=raw_vols.get(cid), filt=_get_ch_filter(filter_cfg, ch),
@@ -2227,7 +2296,7 @@ def _run_post(vis_cfg, paths, routing_config):
                 )
                 for m in meta:
                     box_registry.append({**m, 'layer_name': layer_name_s1})
-                print(f"[s1] {cid}: {len(shapes)} 2D boxes ({s1_src}) (hidden)")
+                print(f"[s1] {cid}: {len(shapes)} 2D boxes (filtered) (hidden)")
             if rej_s:
                 _add_labels_layer(
                     viewer, rej_s, rej_c, canvas_shape,
@@ -2289,9 +2358,7 @@ def _run_post(vis_cfg, paths, routing_config):
             print(f"[trace] {cid}: loaded {len(vols)} cells from pkl")
             _per_ch_vols[cid] = vols
         else:
-            filt_csv = os.path.join(filtered_dir, f"{tile_name}_{cid}_result.csv")
-            raw_csv  = os.path.join(raw_dir,      f"{tile_name}_{cid}_result.csv")
-            csv_p = filt_csv if os.path.isfile(filt_csv) else raw_csv
+            csv_p = os.path.join(filtered_dir, f"{tile_name}_{cid}_result.csv")
             zl_p  = zl_soma if ctype == 'soma' else zl_tf
             print(f"[trace] {cid}: pkl not found, falling back to CSV re-z-link")
             _per_ch_vols[cid] = _run_zlink_for_csv(
@@ -2452,7 +2519,6 @@ def _run_post(vis_cfg, paths, routing_config):
     viewer.mouse_drag_callbacks.append(_on_click)
 
     viewer.reset_view()
-    napari.run()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -2472,15 +2538,30 @@ def main():
     mode = vis_cfg.get('mode', 'prealign')
     print(f"Mode: {mode}\n")
 
+    if mode not in ('prealign', 'post'):
+        sys.exit(f"Unknown mode '{mode}'. Use 'prealign' or 'post'.")
+
     paths = vis_cfg.get('paths') or {}
     routing_config = [ch for ch in vis_cfg.get('channels_routing', []) if ch.get('active', True)]
 
-    if mode == 'prealign':
-        _run_prealign(vis_cfg, paths, routing_config)
-    elif mode == 'post':
-        _run_post(vis_cfg, paths, routing_config)
-    else:
-        sys.exit(f"Unknown mode '{mode}'. Use 'prealign' or 'post'.")
+    anchor_ch  = routing_config[0]
+    anchor_dir = os.path.abspath(paths[anchor_ch['dir_key']])
+    _, tile_paths = listTile(anchor_dir)
+    selected_tiles = _select_tiles(vis_cfg, tile_paths)
+    print(f"\n{len(selected_tiles)} tile(s) selected: "
+          f"{', '.join(name for _, name in selected_tiles)}")
+
+    # One napari.Viewer() (= one OS window) per tile, all built up-front; napari.run()
+    # is called once at the end so every window stays open and you can Alt-Tab / click
+    # between them, instead of blocking on a single tile at a time.
+    for tile_path, tile_name in selected_tiles:
+        print(f"\n{'=' * 70}\nTile: {tile_name}\n{'=' * 70}")
+        if mode == 'prealign':
+            _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name)
+        else:
+            _run_post(vis_cfg, paths, routing_config, tile_path, tile_name)
+
+    napari.run()
 
 
 if __name__ == '__main__':
