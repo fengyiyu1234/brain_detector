@@ -34,7 +34,14 @@ def loadTeraxml(fxml, tile_size=2048):
     disp_mat_fin = disp_mat_fin - [x_min,y_min,0]
     return dir_dict, H, W, Z, z_start, disp_mat_fin
 
-def compute_grid_fallback_offsets(tile_paths, tile_size, overlap_pct):
+# 台面坐标编码单位：tile 目录名里的行/列数字是显微镜台面位置，以 0.1 um 为
+# 一个单位（通过对照本项目 sample12_410q 自己的 TeraStitcher xml 输出交叉
+# 验证得到：目录名间距 11300 对应 xml 里的真实像素间距 1738px，
+# 11300/10/0.65um = 1738.46px，吻合）。
+STAGE_UNIT_UM = 0.1
+
+
+def compute_grid_fallback_offsets(tile_paths, tile_size, overlap_pct, xy_res_um):
     """Parse '<row>_<col>'-style tile directory names into a grid and derive
     per-tile global pixel offsets, used when no TeraStitcher XML exists
     (pre_align mode fallback). Mirrors loadTeraxml's grid outputs:
@@ -65,9 +72,20 @@ def compute_grid_fallback_offsets(tile_paths, tile_size, overlap_pct):
         for tile_name, raw_row, raw_col in raw_entries:
             gi, gj = row_idx[raw_row], col_idx[raw_col]
             dir_dict[tile_name] = (gi, gj)
-            ax = raw_col if use_raw_offset else gj * step_px
-            ay = raw_row if use_raw_offset else gi * step_px
+            if use_raw_offset:
+                # 目录名数字是台面坐标（单位 STAGE_UNIT_UM），换算成像素
+                ax = round(raw_col * STAGE_UNIT_UM / xy_res_um)
+                ay = round(raw_row * STAGE_UNIT_UM / xy_res_um)
+            else:
+                ax = gj * step_px
+                ay = gi * step_px
             disp_mat_fin[gi, gj] = [ax, ay, 0]
+        if use_raw_offset:
+            # 和 loadTeraxml 一样，归一化到从 0 开始
+            x_min = disp_mat_fin[:, :, 0].min()
+            y_min = disp_mat_fin[:, :, 1].min()
+            disp_mat_fin[:, :, 0] -= x_min
+            disp_mat_fin[:, :, 1] -= y_min
     else:
         disp_mat_fin = np.zeros((1, 1, 3), dtype=int)
     return dir_dict, disp_mat_fin

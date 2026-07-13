@@ -153,7 +153,9 @@ if __name__ == '__main__':
         # 回退：从 tile 目录名解析行列号，用均匀 Grid 推算全局偏移
         overlap_pct = pre_align_cfg.get('tile_overlap_pct', 15)
         logging.warning(f"⚠️ 未找到 TeraStitcher XML（路径: {pATHxml}），pre_align 模式回退到文件名解析全局偏移。")
-        dir_dict, disp_mat_fin = compute_grid_fallback_offsets(pATHTILE_all, tile_size, overlap_pct)
+        dir_dict, disp_mat_fin = compute_grid_fallback_offsets(
+            pATHTILE_all, tile_size, overlap_pct, xy_res_um=dp.get('xy_resolution_um', 0.65)
+        )
         logging.info(f"  解析到 {len(dir_dict)} 个 tile，网格 {disp_mat_fin.shape[0]}×{disp_mat_fin.shape[1]}")
         H = disp_mat_fin[:, :, 1].max() + tile_size
         W = disp_mat_fin[:, :, 0].max() + tile_size

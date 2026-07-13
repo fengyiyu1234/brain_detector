@@ -567,7 +567,8 @@ def _get_tile_offset(channel_dir, tile_name, base_res=None, tile_paths=None):
             if runtime_cfg.get('pipeline_mode') == 'pre_align':
                 tile_size   = runtime_cfg.get('detection_params', {}).get('tILESIZE', 2048)
                 overlap_pct = runtime_cfg.get('pre_align_params', {}).get('tile_overlap_pct', 15)
-                dir_dict, disp_mat_fin = compute_grid_fallback_offsets(tile_paths, tile_size, overlap_pct)
+                xy_res_um   = runtime_cfg.get('detection_params', {}).get('xy_resolution_um', 0.65)
+                dir_dict, disp_mat_fin = compute_grid_fallback_offsets(tile_paths, tile_size, overlap_pct, xy_res_um)
                 if tile_name in dir_dict:
                     gi, gj = dir_dict[tile_name]
                     ax, ay, az = disp_mat_fin[gi, gj]
