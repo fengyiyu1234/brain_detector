@@ -1,0 +1,148 @@
+{
+    // ── 模式选择 ──────────────────────────────────────────────────────────────
+    // "prealign": 单 tile 对齐质量 QC（图像 shifted，显示 aligned/raw 框，in-memory z-link）
+    // "post":     单 tile 流水线结果（原始图像，s1 raw 框 / s3 已保存 z-link / s4 coloc）
+    "mode": "prealign",
+
+    // ── Ctrl+click false-negative 标注输出路径（跨平台手动设置）─────────────────
+    // macOS 示例:  "/Users/yourname/data/false_negatives.csv"
+    // Windows 示例: "Y:/Fengyi/detection_training/false_negatives.csv"
+    // null = 禁用 Ctrl+click 标注功能
+    "fn_ann_path": "Y:/Fengyi/detection_training/new_MADMdata/04/false_negatives.csv",
+
+    // ── 路径 ────────────────────────────────────────────────────────────────
+    "paths": {
+        // "rfp_dir":    "y:/Fengyi/EGFR_brain/batch4/sample4/numorph_align/aligned/RFP",
+        // "gfp_dir":    "y:/Fengyi/EGFR_brain/batch4/sample4/numorph_align/aligned/GFP_15",
+        // "sox9_dir":   "y:/Fengyi/EGFR_brain/batch4/sample4/numorph_align/aligned/Sox9",
+        // "olig2_dir":  "y:/Fengyi/EGFR_brain/batch4/sample4/numorph_align/aligned/Olig2",
+        // "pATHRESULT": "y:/Fengyi/EGFR_brain/batch4/sample4/detection_results_stardist"
+        
+        "rfp_dir":    "y:/Fengyi/TSC_brain/sample10_reimg/561nm",
+        "gfp_dir":    "y:/Fengyi/TSC_brain/sample10_reimg/640nm_30",
+        "gfp_dir2":   "y:/Fengyi/TSC_brain/sample10_reimg/640nm_5",
+        "sox9_dir":   "y:/Fengyi/TSC_brain/sample10_reimg/730nm",
+        "pATHRESULT": "y:/Fengyi/TSC_brain/sample10_reimg/detection_results"
+
+    },
+
+    // ── 通道路由（dir_key 对应上面 paths 中的 key）────────────────────────────
+    // double_exposure: 该通道是双激光强度拍摄，second_intensity_id/second_intensity_dir_key
+    // 指向第二强度的合成通道 id / 图像目录；可视化时两张图都加载，2D 检测框用 1_tile_2d_fused 的融合结果
+    "channels_routing": [
+        {"id": "RFP",  "type": "soma", "dir_key": "rfp_dir",  "active": true},
+        {"id": "GFP",  "type": "soma", "dir_key": "gfp_dir",  "active": true,
+            "double_exposure": true, "second_intensity_id": "GFP2",
+            "second_intensity_dir_key": "gfp_dir2", "fusion_iou_thresh": 0.3},
+        {"id": "Sox9", "type": "tf",   "dir_key": "sox9_dir", "active": true},
+        {"id": "Olig2", "type": "tf",   "dir_key": "olig2_dir", "active": false}
+    ],
+
+    // ── Z-Linker 参数（按通道类型分组，供 in-memory z-link / coloc 追踪使用）─────
+    "z_linker": {
+        "soma": {
+            "iou_thresh":             0.35,
+            "min_z_layers":           1,
+            "max_cell_z_span":        5,
+            "max_z_gap":              0,
+            "iou_thresh_3d":          0.15,
+            "z_pad_3d":               0,
+            "cross_class_iou_thresh": 0.5
+        },
+        "tf": {
+            "iou_thresh":            0.25,
+            "min_z_layers":          1,
+            "max_cell_z_span":       3,
+            "max_z_gap":             0,
+            "gmm_p_thresh":          0.5,
+            "containment_z_pad":     0,
+            "containment_xy_margin": 0,
+            "max_center_dist_ratio": 0.3
+        }
+    },
+
+    // ── Tile 选择（两种模式通用，支持一次开多个 tile）───────────────────────────
+    // tile: null = 交互式选择（此时输入端支持逗号分隔多个下标，如 "1,3,10,15"，
+    //   会一次性打开对应数量的 napari 窗口，可用 Alt+Tab / 任务栏切换）；
+    //   也可以直接填一个 tile 目录名（单个），或一个名字数组（多个），如
+    //   ["000000_001000_000000", "000000_002000_000000"]
+    "tile": null,
+
+    // ── Z 范围（两种模式通用）────────────────────────────────────────────────
+    // z_start: 从哪一层开始（0-based），null = 从 0 开始
+    "z_start": 430,
+    // z_count: 可视化的层数，null = 到末尾
+    "z_count": 50,
+
+    // ── 通用开关 ─────────────────────────────────────────────────────────────
+    "no_images": false,
+
+    // ── 图像对比度（按16-bit原始强度值的百分位数设置初始 contrast limits）────────
+    // [low, high]：初始对比度上下限的百分位数。图像本身按16-bit原始值显示（不做0-1归一化），
+    // napari 对比度滑块的数值就是真实16-bit强度值，滑块范围为完整 0–65535，
+    // 可在滑块两端数字上点击直接输入精确的 min/max 值
+    "contrast_pct": [0.1, 99.9],
+
+    // ── prealign 专用开关 ─────────────────────────────────────────────────────
+    // show_before:  显示对齐前 [raw] 框（隐藏层，可在 napari 手动打开）
+    // show_zlinked: 显示 in-memory z-link 中心层检测框
+    // show_coloc:   显示 coloc_result.csv 共定位结果
+    // spheres:      3D 球体视图（切换 napari 到 3D 模式）
+    "show_before":  false,
+    "show_zlinked": true,
+    "show_coloc":   true,
+    "spheres":      false,
+
+    // ── post 专用开关 ─────────────────────────────────────────────────────────
+    // stage: "all" | "s1" | "s3" | "s4"
+    //   s1 = 1_tile_2d_raw 原始 2D 检测（默认隐藏）
+    //   s3 = 3_channel_3d  已保存 z-link 结果
+    //   s4 = 4_colocalization coloc 结果
+    "stage": "all",
+
+    // ── 强度分布图（true = 启动时输出每通道 box 强度直方图，matplotlib 独立窗口）─
+    "show_intensity_hist": true,
+
+    "show_box_area_hist": true,
+
+    // ── 检测框外观 ────────────────────────────────────────────────────────────
+    "outline_width":      4,
+    "aligned_opacity":    0.8,
+    "raw_opacity":        0.6,
+    "zlinked_opacity":    0.7,
+    "coloc_opacity":      0.9,
+
+    // ── 球体外观（prealign spheres 模式）─────────────────────────────────────
+    "sphere_opacity":     0.6,
+    "sphere_raw_opacity": 0.3,
+    "sphere_colors": {
+        "RFP":   [1.0,  0.25, 0.25, 0.85],
+        "GFP":   [0.25, 1.0,  0.25, 0.85],
+        "Sox9":  [0.0,  0.85, 1.0,  0.85],
+        "Olig2": [1.0,  0.2,  1.0,  0.85]
+    },
+
+    "marker_colors": {},
+
+    // ── 检测框过滤（可视化阶段，不影响 CSV 文件）────────────────────────────────
+    // key 为通道类型：soma（RFP/GFP）或 tf（Sox9/Olig2）；同类型共用同一套参数
+    // 过滤顺序：bbox_min/max → bbox_area_pct_min → bbox_mean_pct_min
+    // bbox_min/bbox_max:    宽高同时满足才保留（px）；null = 不过滤
+    // bbox_area_pct_min:    面积百分位下限，过滤掉面积最小的 N%；null = 不过滤
+    // bbox_mean_pct_min:    亮度百分位下限，过滤掉最暗的 N%；null = 不过滤
+    // 被过滤掉的框会在 napari 中单独显示为灰色隐藏层，可手动打开查看
+    "filter": {
+        "soma": {
+            "bbox_min":          null,
+            "bbox_max":          null,
+            "bbox_area_pct_min": null,
+            "bbox_mean_pct_min": null
+        },
+        "tf": {
+            "bbox_min":          8,
+            "bbox_max":          17,
+            "bbox_area_pct_min": null,
+            "bbox_mean_pct_min": null
+        }
+    }
+}

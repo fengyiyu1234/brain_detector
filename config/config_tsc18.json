@@ -1,0 +1,155 @@
+{
+    // ── 模型权重路径 ──────────────────────────────────────────────────────────
+    "models": {
+        "yolo_path":        "models/train18_best_0515.pt",
+        "stardist_basedir": "models",           // StarDist 模型所在目录（相对项目根目录）
+        "stardist_name":    "2D_versatile_fluo" // 目录名，即 models/2D_versatile_fluo/
+    },
+
+    // ── 模型输出类别映射 ──────────────────────────────────────────────────────
+    "model_classes": {
+        "yolo": {"0": "neuron", "1": "glia"}   // 0=神经元, 1=胶质细胞
+    },
+
+    // ── 通道路由配置 ──────────────────────────────────────────────────────────
+    // type "soma" → YOLO 检测细胞体；type "tf" → model "cellpose" 或 "stardist" 均支持
+    // active: false 的通道在推理时跳过
+    "channels_routing": [
+        {"id": "RFP",   "type": "soma", "model": "yolo",     "dir_key": "rfp_dir",   "active": true},
+        {"id": "GFP",   "type": "soma", "model": "yolo",     "dir_key": "gfp_dir",   "active": true,
+            "double_exposure": true, "second_intensity_id": "GFP2",
+            "second_intensity_dir_key": "gfp_dir2", "fusion_iou_thresh": 0.3},
+        {"id": "Sox9",  "type": "tf",   "model": "stardist", "dir_key": "sox9_dir",  "active": true}
+    ],
+
+    // ── 文件路径 ──────────────────────────────────────────────────────────────
+
+        "paths": {
+
+        "rfp_dir":    "/rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample18/561nm",
+        "gfp_dir":    "/rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample18/640nm_2",
+        "gfp_dir2":    "/rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample18/640nm_20",
+        "sox9_dir":   "/rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample18/730nm",
+        "pATHRESULT": "/rsstu/users/a/agrinba/DeepDesign/Fengyi/TSC_brain/sample18/detection_results"
+
+    },
+
+    "device": "cuda",               // 推理设备，"cuda" 或 "cpu"
+
+    // ── Pipeline 模式 ──────────────────────────────────────────────────────────
+    // "post_align": 在 numorph+TeraStitcher 对齐后的图片上检测（默认行为）
+    // "pre_align" : 在未对齐的原始图片上检测，用点云匹配计算通道偏移（替代numorph）
+    "pipeline_mode": "pre_align",
+
+    // ── Pre-Align 参数（仅 pipeline_mode="pre_align" 时生效）──────────────────
+    "pre_align_params": {
+        "sample_z_center_count": 50,    // 取z轴中心多少张切片用于体素对齐
+        "voxel_bin_size_px":     4,     // XY体素大小（像素/bin）；越小越精确但越慢
+        "xy_search_range_px":    30,    // 3D FFT粗搜索XY半径（像素）
+        "z_search_range_slices": 5,     // 3D FFT粗搜索Z半径（切片数）
+        "xy_fine_search_px":     8,     // FFT峰值周围精细搜索XY范围（像素）
+        "z_fine_search_slices":  2,     // FFT峰值周围精细搜索Z范围（切片数）
+        "tile_overlap_pct":      15     // tile重叠率%（仅在无TeraStitcher XML时用于回退grid计算）
+    },
+
+    "stop_after_detection": false,  // true = Stage 1 完成后立即退出，释放 GPU；Stage 2~5 可在 CPU 或本地单独运行
+    "start_from_stage": 2,          // 1=正常全流程; 2=跳过网络扫描+检测，从本地CSV推导Tile直接进Stage 3+
+
+    // ── Stage 2.75 过滤开关 ────────────────────────────────────────────────────
+    // true : Stage 2.75 正常过滤（适合旧的未过滤 1_tile_2d_raw，或想在 CPU 上重跑过滤）
+    // false: Stage 2.75 直接透传（检测阶段已内建过滤时使用，避免重复处理）
+    "stage_2_75_enabled": true,
+
+    "ENABLE_Z_LINKER": true,        // 是否执行 Z 轴串联；false 时直接输出 2D 结果
+
+    // ── Z-Linker 参数（按通道类型分组）────────────────────────────────────────
+    "z_linker": {
+        "soma": {
+            "iou_thresh":      0.35,    // 相邻 z 层 bbox 匹配所需最小 IoU
+            "min_z_layers":    1,       // 判定为真实 3D 细胞的最少 z 层数
+            "max_cell_z_span": 5,       // 单个细胞允许跨越的最大 z 层数（防止过度合并）
+            "max_z_gap":       0,       // 细胞内允许的最大断层数（0=不允许任何断层）
+            "iou_thresh_3d":   0.15,    // soma 跨通道 3D IoU 匹配阈值
+            "z_pad_3d":        1,       // 3D IoU 匹配时 z 轴方向的扩展层数
+            "cross_class_iou_thresh": 0.5  // neuron-glia 跨类别去重阈值（glia 优先）
+        },
+        "tf": {
+            "iou_thresh":      0.25,    // 细胞核较小，IoU 阈值适当降低
+            "min_z_layers":    1,       // 核标记较薄，允许单层即算 3D
+            "max_cell_z_span": 3,       // 核一般横跨 2-3 个 z 层
+            "max_z_gap":       0,       // 细胞内允许的最大断层数（0=不允许任何断层）
+            "gmm_p_thresh":    0.5,     // GMM 标注概率阈值（仅可视化in-memory路径生效）
+            "max_center_dist_ratio": 0.3,  // 核质心到细胞体中心的最大距离（相对细胞体半径）；超过则不算共定位，防止大bbox边缘误判
+            "containment_z_pad": 1        // TF包含检测时z轴容差层数；0=TF必须完全在soma的z范围内
+        }
+    },
+
+    // ── 检测参数 ──────────────────────────────────────────────────────────────
+    "detection_params": {
+        // 物理分辨率
+        "xy_resolution_um": 0.65,   // XY 像素物理尺寸 (µm/pixel)
+        "z_resolution_um":  8,      // Z 轴切片间距 (µm)
+
+        // 检测阈值
+        "conf_thresh": 0.3,         // YOLO 置信度阈值
+        "nms_iou":     0.3,         // NMS IoU 阈值（去重）
+
+        // 推理 patch 参数
+        "xsize": 512,               // 推理 patch 宽 (px)
+        "ysize": 512,               // 推理 patch 高 (px)
+        "step":  384,               // 滑窗步长 (px)；重叠 = xsize - step = 128 px
+        "tILESIZE": 2048,           // TeraStitcher tile 边长 (px)
+
+        // 处理范围
+        "sTARTID": null,            // 起始 tile 编号（null = 从头）
+        "eNDID":   null,            // 结束 tile 编号（null = 到尾）
+
+        // 图像归一化
+        "normalize_PERCENTILE_LOW":  0.1,   // 拉伸下分位数 (%)
+        "normalize_PERCENTILE_HIGH": 99.9,  // 拉伸上分位数 (%)
+
+        // Z 轴下采样（加速调试用）
+        "DOWNSAMPLE":        false, // 是否跳帧；true 时只处理每隔 DOWNSAMPLE_Z_STEP 的切片
+        "DOWNSAMPLE_Z_STEP": 41,    // 跳帧步长（DOWNSAMPLE=true 时生效）
+
+        // 置换检验（共定位统计显著性）
+        "n_permutations":   100,    // 随机置换次数；越大越精确，越慢
+        "max_soma_sample": 50000,   // 置换时胞体随机采样上限（防止超大样本超时）
+        "cross_tile_iomin_thresh": 0.5, // tile 间重叠区 IoMin 阈值：>此值视为同一细胞做 union 合并，否则新增
+
+        "generate_histograms": false,
+
+        // YOLO 参数（仅 model="yolo" 通道生效）
+        // 过滤顺序（Stage 2.75）：bbox_min/max → bbox_area_pct_min/max → bbox_mean_pct_min/min
+        "yolo": {
+            "bbox_min":           12, // box 宽高最小值 (px)；null = 不过滤
+            "bbox_max":           null, // box 宽高最大值 (px)；null = 不过滤
+            "bbox_max_aspect_ratio": 2, // 宽高比上限（max(w,h)/min(w,h)）；null = 不过滤
+            "bbox_area_pct_min":  5, // 面积百分位下限（如 10 = 过滤掉面积最小的 10%）；null = 不过滤
+            "bbox_area_pct_max":  95, // 面积百分位上限（如 95 = 保留面积 ≤ 第95百分位，去掉最大的 5%）；null = 不过滤
+            "bbox_mean_pct_min":  null, // 亮度百分位下限（如 20 = 过滤掉最暗 20%）；null = 不过滤
+            "bbox_mean_min":      0,    // 亮度绝对下限（16-bit 原始像素值）；0 = 不过滤
+            "nms_containment_thresh": 0.98 // IoMin 阈值：小框有 60% 面积在大框内即抑制；null = 不启用
+        },
+
+        // StarDist 参数（仅 model="stardist" 通道生效）
+        // 过滤顺序（Stage 2.75）：bbox_min/max → bbox_max_aspect_ratio → bbox_area_pct_min/max → bbox_mean_pct_min/min
+        "stardist": {
+            "norm_low":           1,    // 归一化下分位数 (%)
+            "norm_high":          99.9, // 归一化上分位数 (%)
+            "prob_thresh":        0.5,  // 实例概率阈值（越高检测越严格）
+            "nms_thresh":         0.4,  // NMS 重叠阈值
+            "n_tiles":            [4, 4], // 推理分块数 [Y, X]；[4,4] 比 [2,2] 峰值显存低 4x
+            "bbox_min":           8,    // box 宽高最小值 (px)
+            "bbox_max":           22,   // box 宽高最大值 (px)
+            "bbox_max_aspect_ratio": 2, // 宽高比上限（max(w,h)/min(w,h)）；null = 不过滤
+            "bbox_area_pct_min":  5,    // 面积百分位下限；null = 不过滤
+            "bbox_area_pct_max":  null, // 面积百分位上限（如 95 = 保留面积 ≤ 第95百分位，去掉最大的 5%）；null = 不bu过滤
+            "bbox_mean_pct_min":  20,   // 亮度百分位下限；null = 不过滤
+            "bbox_mean_min":      0,    // 亮度绝对下限；0 = 不过滤
+            "nms_containment_thresh": null // StarDist 自带 NMS，通常不需要；null = 不启用
+        }
+
+    }
+
+}
