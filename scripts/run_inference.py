@@ -140,19 +140,43 @@ if __name__ == '__main__':
     target_indices = list(range(sTARTID - 1, eNDID))
     pATHTILE = [pATHTILE_all[i] for i in target_indices]
 
-    # 5. 加载 TeraStitcher XML（pre_align 模式下如果不存在则回退到文件名 Grid 推算）
+    # 5. 加载 TeraStitcher XML
+    #    查找优先级: paths.pATHXML(显式) > anchor_dir/xml_merging.xml > anchor_dir/xml_import.xml
+    #
+    #    为什么要能显式指定：拼接位移是在参考通道（如 730nm 自发荧光）上算出来的，检测通道目录里
+    #    未必有这份 XML、或者放着一份 ABS_D 全为 0 的旧版本。细胞坐标必须和「真正 merge 出注册用
+    #    全脑图像」的那份 XML 共用同一套 ABS_H/ABS_V/ABS_D，否则 z 会按 tile 错位。
     tile_size = dp.get('tILESIZE', 2048)
-    xml_name = 'xml_merging.xml' if os.path.isfile(os.path.join(anchor_dir, 'xml_merging.xml')) else 'xml_import.xml'
-    pATHxml = os.path.join(anchor_dir, xml_name)
-    has_tera_xml = os.path.exists(pATHxml)
+    xml_candidates = []
+    if paths.get('pATHXML'):
+        xml_candidates.append(paths['pATHXML'])
+    xml_candidates += [os.path.join(anchor_dir, n) for n in ('xml_merging.xml', 'xml_import.xml')]
+    pATHxml = next((p for p in xml_candidates if os.path.isfile(p)), None)
 
-    if has_tera_xml:
+    if pATHxml:
         dir_dict, H, W, Z, z_start, disp_mat_fin = loadTeraxml(pATHxml, tile_size)
+        _absd = disp_mat_fin[:, :, 2]
+        _dmin, _dmax = _absd.min(), _absd.max()
         logging.info(f"✔️ 已加载 TeraStitcher XML: {pATHxml}")
-    elif pipeline_mode == 'pre_align':
-        # 回退：从 tile 目录名解析行列号，用均匀 Grid 推算全局偏移
+        logging.info(f"  画布 W×H = {W}×{H}, Z = {Z}, z_start = {z_start}, "
+                     f"ABS_D 范围 = [{_dmin}, {_dmax}]")
+        if _dmin == _dmax:
+            logging.warning(
+                f"⚠️ 这份 XML 的 ABS_D 全部等于 {_dmin}，即没有任何 z 方向拼接位移，"
+                f"于是 Z = stack_slices、每个 tile 的 z0 都是 0。若注册用的全脑图像是用带 z 位移的 "
+                f"XML merge 出来的，细胞 z 会逐 tile 错位（错位量 = ABS_D − max(ABS_D)）。"
+                f"请确认这份 XML 就是 merge 出那张图的同一份。"
+            )
+    elif dp.get('allow_grid_fallback', False):
+        # 回退：从 tile 目录名解析行列号，用均匀 Grid 推算全局偏移。
+        # 这是均匀网格，拿不到 TeraStitcher 逐 tile 的真实位移——行/列间距会有十几像素的系统
+        # 偏差，跨整个网格累积可达上百像素。只适合没有拼接结果时的探索性跑批。
         overlap_pct = pre_align_cfg.get('tile_overlap_pct', 15)
-        logging.warning(f"⚠️ 未找到 TeraStitcher XML（路径: {pATHxml}），pre_align 模式回退到文件名解析全局偏移。")
+        logging.warning("⚠️ 未找到任何 TeraStitcher XML，allow_grid_fallback=true，"
+                        "回退到文件名解析的【均匀网格】全局偏移。")
+        logging.warning("   这套坐标不等于真实拼接坐标，不要用它做配准/图谱定量。已尝试的路径：")
+        for _p in xml_candidates:
+            logging.warning(f"     - {_p}")
         dir_dict, disp_mat_fin = compute_grid_fallback_offsets(
             pATHTILE_all, tile_size, overlap_pct, xy_res_um=dp.get('xy_resolution_um', 0.65)
         )
@@ -162,7 +186,14 @@ if __name__ == '__main__':
         Z = len(os.listdir(pATHTILE_all[0])) if pATHTILE_all else 1
         z_start = 0
     else:
-        raise FileNotFoundError(f"❌ 找不到拼接坐标文件！确保 {anchor_dir} 存在 {xml_name}")
+        raise FileNotFoundError(
+            "❌ 找不到 TeraStitcher 拼接坐标文件，已尝试：\n"
+            + "\n".join(f"    - {p}" for p in xml_candidates)
+            + "\n  请在 config 的 paths 里加 \"pATHXML\" 指向 merge 出注册用图像的那份 "
+              "xml_merging.xml，或确认 anchor 通道目录下存在该文件。\n"
+              "  （若确实要用文件名推算的均匀网格跑，设 detection_params.allow_grid_fallback=true，"
+              "但那套坐标不能用于配准。）"
+        )
 
     # ==========================================
     # 阶段 2: 线性 Checkpoint - Tile 级别检测 
