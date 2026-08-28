@@ -2536,6 +2536,16 @@ def main():
     vis_cfg_path = args.config
     vis_cfg = load_config(vis_cfg_path) if os.path.isfile(vis_cfg_path) else {}
 
+    samples = vis_cfg.get('samples')
+    if samples:
+        active_sample = vis_cfg.get('active_sample')
+        if not active_sample:
+            sys.exit(f"'samples' 已定义，但 'active_sample' 未设置。可选: {', '.join(samples)}")
+        if active_sample not in samples:
+            sys.exit(f"未知 sample '{active_sample}'。可选: {', '.join(samples)}")
+        vis_cfg = {**vis_cfg, **samples[active_sample]}
+        print(f"Sample: {active_sample}")
+
     mode = vis_cfg.get('mode', 'prealign')
     print(f"Mode: {mode}\n")
 
