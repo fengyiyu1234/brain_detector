@@ -1,29 +1,47 @@
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from src.utils.markers import class_markers, split_class
+
+
+# 每次只物化 _IOU_BLOCK 行的中间矩阵。TF 通道（如 Sox9）单层可能有
+# 两万个框对两万条轨迹，一次性开 x1/y1/x2/y2/inter/union 等十几个
+# (n_d, n_t) 中间数组会占几十 GB，在内存吃紧的机器上直接 MemoryError。
+_IOU_BLOCK = 2048
+
 
 def _iou_matrix(det_boxes, track_boxes):
-    """Vectorized IoU: (n_d, 4) × (n_t, 4) → (n_d, n_t)."""
-    x1 = np.maximum(det_boxes[:, 0:1], track_boxes[:, 0])
-    y1 = np.maximum(det_boxes[:, 1:2], track_boxes[:, 1])
-    x2 = np.minimum(det_boxes[:, 2:3], track_boxes[:, 2])
-    y2 = np.minimum(det_boxes[:, 3:4], track_boxes[:, 3])
-    inter = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
-    area_d = (det_boxes[:, 2] - det_boxes[:, 0]) * (det_boxes[:, 3] - det_boxes[:, 1])
+    """Vectorized IoU: (n_d, 4) × (n_t, 4) → (n_d, n_t).
+
+    按行分块计算，峰值内存 ≈ 结果矩阵 + _IOU_BLOCK×n_t 的中间量，
+    而不是十几个完整 (n_d, n_t)。逐元素结果与不分块版本完全一致。
+    """
+    n_d = det_boxes.shape[0]
+    n_t = track_boxes.shape[0]
+    out = np.empty((n_d, n_t), dtype=np.float64)
     area_t = (track_boxes[:, 2] - track_boxes[:, 0]) * (track_boxes[:, 3] - track_boxes[:, 1])
-    union = area_d[:, None] + area_t[None, :] - inter
-    return inter / (union + 1e-8)
+    for s in range(0, n_d, _IOU_BLOCK):
+        e = min(s + _IOU_BLOCK, n_d)
+        blk = det_boxes[s:e]
+        x1 = np.maximum(blk[:, 0:1], track_boxes[:, 0])
+        y1 = np.maximum(blk[:, 1:2], track_boxes[:, 1])
+        x2 = np.minimum(blk[:, 2:3], track_boxes[:, 2])
+        y2 = np.minimum(blk[:, 3:4], track_boxes[:, 3])
+        inter = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+        area_d = (blk[:, 2] - blk[:, 0]) * (blk[:, 3] - blk[:, 1])
+        union = area_d[:, None] + area_t[None, :] - inter
+        np.divide(inter, union + 1e-8, out=out[s:e])
+    return out
 
 
 def parse_class_string(cls_str):
     """
     解析动态生成的类别字符串，例如 "neuron_RFP_Sox9"
     返回: base_type ("neuron"), markers_set ({"RFP", "Sox9"})
+    伪 marker（旧结果里 "GFP_3" 通道名拆出的 "3"）由 split_class 过滤。
     """
-    parts = str(cls_str).split('_')
-    base_type = parts[0]
-    markers = set(parts[1:]) if len(parts) > 1 else set()
-    return base_type, markers
+    base_type, markers = split_class(cls_str)
+    return base_type, set(markers)
 
 
 def run_z_linker(full_stack_matrix, iou_thresh=0.45, min_z_layers=2,
@@ -68,7 +86,9 @@ def run_z_linker(full_stack_matrix, iou_thresh=0.45, min_z_layers=2,
             track_boxes  = np.array([active_tracks[ti]['last_box'] for ti in active_t_indices], dtype=float)
             iou_mat      = _iou_matrix(det_boxes, track_boxes)     # (n_d, n_t)
 
-            cost_mat = 1.0 - iou_mat
+            # 原地转成 cost，省掉一份和 iou_mat 同样大的副本
+            cost_mat = iou_mat
+            np.subtract(1.0, cost_mat, out=cost_mat)
             cost_mat[det_bases[:, None] != track_bases[None, :]] = 1e6  # cross-type → infeasible
 
             row_ind, col_ind = linear_sum_assignment(cost_mat)
@@ -110,7 +130,7 @@ def run_z_linker(full_stack_matrix, iou_thresh=0.45, min_z_layers=2,
     for track in finished_tracks:
         if len(track['all_boxes']) >= min_z_layers:
             boxes    = track['all_boxes']
-            best_det = max(boxes, key=lambda x: (len(str(x[6]).split('_')) - 1, float(x[4])))
+            best_det = max(boxes, key=lambda x: (len(class_markers(x[6])), float(x[4])))
             best_x1, best_y1, best_x2, best_y2, best_score, best_mean = best_det[:6]
             z_list   = [b[7] for b in boxes]
             center_z = int(np.median(z_list))

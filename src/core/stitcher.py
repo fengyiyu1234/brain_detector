@@ -7,6 +7,8 @@ from concurrent.futures import ProcessPoolExecutor
 from scipy.spatial import cKDTree
 from scipy.optimize import linear_sum_assignment
 
+from src.utils.markers import class_markers, split_class
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Module-level permutation worker (must be at top level for multiprocessing pickle)
@@ -176,15 +178,10 @@ def colocalize_3d(soma_3d_boxes, nuc_3d_boxes, xy_res=1.0, z_res=0.008, distance
     for i, nbr_indices in soma_to_nucs.items():
         matched_markers = []
         for idx in nbr_indices:
-            parts = nuc_classes[idx].split('_')
-            if len(parts) > 1:
-                matched_markers.extend(parts[1:])
+            matched_markers.extend(class_markers(nuc_classes[idx]))
         if not matched_markers:
             continue
-        current_class = str(final_merged[i][6])
-        soma_parts    = current_class.split('_')
-        base_type     = soma_parts[0]
-        existing      = soma_parts[1:] if len(soma_parts) > 1 else []
+        base_type, existing = split_class(final_merged[i][6])
         final_merged[i][6] = f"{base_type}_" + "_".join(sorted(set(existing + matched_markers)))
 
     return final_merged
@@ -251,15 +248,10 @@ def colocalize_3d_centroid_in_box(soma_3d_boxes, nuc_3d_boxes,
     for i, nbr_indices in soma_to_nucs.items():
         matched_markers = []
         for idx in nbr_indices:
-            parts = nuc_classes[idx].split('_')
-            if len(parts) > 1:
-                matched_markers.extend(parts[1:])
+            matched_markers.extend(class_markers(nuc_classes[idx]))
         if not matched_markers:
             continue
-        current_class = str(final_merged[i][6])
-        soma_parts    = current_class.split('_')
-        base_type     = soma_parts[0]
-        existing      = soma_parts[1:] if len(soma_parts) > 1 else []
+        base_type, existing = split_class(final_merged[i][6])
         final_merged[i][6] = f"{base_type}_" + "_".join(sorted(set(existing + matched_markers)))
 
     return final_merged
@@ -303,10 +295,9 @@ def colocalize_soma_channels(ch_a_boxes, ch_b_boxes,
             continue
         a, b = ch_a_boxes[ri], ch_b_boxes[ci]
         winner = a if float(a[4]) >= float(b[4]) else b
-        a_parts = str(a[6]).split('_')
-        b_parts = str(b[6]).split('_')
-        base = a_parts[0]
-        markers = sorted(set(a_parts[1:]) | set(b_parts[1:]))
+        base, a_markers = split_class(a[6])
+        _,    b_markers = split_class(b[6])
+        markers = sorted(set(a_markers) | set(b_markers))
         merged_row = winner.copy()
         merged_row[6] = f"{base}_" + "_".join(markers) if markers else base
         merged.append(merged_row)
@@ -351,14 +342,13 @@ def _merge_class(cls_a, cls_b):
     """Merge two class strings, combining markers: 'neuron_RFP' + 'neuron_GFP' → 'neuron_GFP_RFP'.
     Glia takes priority over neuron when base types differ.
     If cls_b has no underscore (e.g. 'Sox9'), the whole string is treated as a bare marker."""
-    parts_a = str(cls_a).split('_')
-    parts_b = str(cls_b).split('_')
-    base_a, base_b = parts_a[0], parts_b[0]
+    base_a, mk_a = split_class(cls_a)
+    base_b, mk_b = split_class(cls_b)
     pri_a = _CELL_TYPE_PRIORITY.get(base_a, -1)
     pri_b = _CELL_TYPE_PRIORITY.get(base_b, -1)
     base = base_a if pri_a >= pri_b else base_b
-    markers_a = set(parts_a[1:])
-    markers_b = set(parts_b[1:]) if len(parts_b) > 1 else set(parts_b)
+    markers_a = set(mk_a)
+    markers_b = set(mk_b) if mk_b else {base_b}
     markers = sorted(markers_a | markers_b)
     return f"{base}_" + "_".join(markers) if markers else base
 
@@ -483,8 +473,8 @@ def annotate_soma_with_tf_2d(soma_matrix, tf_matrix, z_tolerance_slices=0):
     tf_by_channel = defaultdict(lambda: defaultdict(list))
     for row in tf_matrix:
         cls = str(row[6])
-        parts = cls.split('_')
-        ch_id = parts[1] if len(parts) > 1 else cls
+        _, cls_markers = split_class(cls)
+        ch_id = cls_markers[0] if cls_markers else cls
         tf_by_channel[ch_id][int(row[7])].append(
             (float(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]), cls)
         )
@@ -505,8 +495,8 @@ def annotate_soma_with_tf_2d(soma_matrix, tf_matrix, z_tolerance_slices=0):
                         candidates.append((score, cls))
             if candidates:
                 best_cls = max(candidates, key=lambda x: x[0])[1]
-                parts = best_cls.split('_')
-                new_markers.extend(parts[1:] if len(parts) > 1 else [ch_id])
+                best_markers = class_markers(best_cls)
+                new_markers.extend(best_markers if best_markers else [ch_id])
 
         if new_markers:
             row[6] = _merge_class(str(row[6]), '_'.join(sorted(set(new_markers))))
@@ -712,7 +702,8 @@ def annotate_soma_with_tf_gmm(soma_vol_list, tf_vol_list, p_thresh=0.5):
     for tf, soma_idx, d_norm in tf_soma_pairs:
         proba = gmm.predict_proba([[d_norm]])[0][coloc_comp]
         if proba > p_thresh:
-            tf_marker = tf['class'].split('_')[-1]  # e.g. "nucleus_Sox9" → "Sox9"
+            tf_base, tf_mk = split_class(tf['class'])
+            tf_marker = tf_mk[-1] if tf_mk else tf_base   # "nucleus_Sox9" → "Sox9"
             soma_markers[soma_idx].add(tf_marker)
 
     for idx, soma in enumerate(soma_vol_list):
@@ -749,7 +740,8 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
     soma_markers = defaultdict(set)
     for tf in tf_vol_list:
         tf_pt = np.array([tf['cx'], tf['cy'], tf['cz']], dtype=float)
-        tf_marker = tf['class'].split('_')[-1]
+        tf_base, tf_mk = split_class(tf['class'])
+        tf_marker = tf_mk[-1] if tf_mk else tf_base
 
         candidate_idxs = tree.query_ball_point(tf_pt, r=max_radius * 2)
 
@@ -813,8 +805,8 @@ def permutation_test_colocalization(soma_3d_boxes, tf_3d_boxes,
 
     tf_marker_all = []
     for box in tf_3d_boxes:
-        parts = str(box[6]).split('_')
-        tf_marker_all.append(parts[1] if len(parts) > 1 else None)
+        box_markers = class_markers(box[6])
+        tf_marker_all.append(box_markers[0] if box_markers else None)
 
     unique_markers = sorted({m for m in tf_marker_all if m})
     if not unique_markers:

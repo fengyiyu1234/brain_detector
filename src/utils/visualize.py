@@ -42,6 +42,7 @@ from qtpy.QtWidgets import QWidget, QGridLayout, QLabel, QSpinBox
 
 from src.config.loader import load_config
 from src.utils.io import listTile, compute_grid_fallback_offsets
+from src.utils.markers import channel_marker, class_markers, split_class
 from src.core.z_linker import run_z_linker
 from src.core.stitcher import (
     match_soma_3d_iou, annotate_soma_with_tf_containment,
@@ -97,11 +98,16 @@ def _get_ch_filter(filter_cfg, ch):
 
 
 def _extract_markers(class_str):
-    return set(str(class_str).split('_')[1:])
+    return set(class_markers(class_str))
 
 
 def _ch_vis(ch_id):
-    return CHANNEL_VIS.get(ch_id, _EXTRA_VIS.get(ch_id, DEFAULT_VIS))
+    for key in (ch_id, channel_marker(ch_id)):
+        if key in CHANNEL_VIS:
+            return CHANNEL_VIS[key]
+        if key in _EXTRA_VIS:
+            return _EXTRA_VIS[key]
+    return DEFAULT_VIS
 
 
 def _marker_combo_color(markers):
@@ -125,7 +131,7 @@ def _auto_groups_from_classes(classes, outline_width=4, dash_size=8):
     """
     seen = {}
     for cls in classes:
-        markers = tuple(sorted(str(cls).split('_')[1:]))
+        markers = tuple(sorted(class_markers(cls)))
         if len(markers) >= 2:
             seen[markers] = None
     groups = []
@@ -976,10 +982,10 @@ def _load_coloc_s4_shapes(coloc_csv, tile_name, z_range, s4_groups,
         dash_size    = grp.get('dash_size', 8)
         if grp.get('exact', False):
             mask = df['class'].apply(
-                lambda c: frozenset(p.lower() for p in str(c).split('_')[1:]) == req)
+                lambda c: frozenset(m.lower() for m in class_markers(c)) == req)
         else:
             mask = df['class'].apply(
-                lambda c: req.issubset(frozenset(p.lower() for p in str(c).split('_')[1:])))
+                lambda c: req.issubset(frozenset(m.lower() for m in class_markers(c))))
         df_grp = df[mask]
         if df_grp.empty:
             results.append((grp, [], [], [], []))
@@ -1507,7 +1513,9 @@ def _run_zlink_for_csv(csv_path, z_range, iou_thresh, min_z_layers, max_cell_z_s
     if df.empty:
         return []
     if ch_id is not None:
-        df['class'] = df['class'].astype(str) + '_' + ch_id
+        # "GFP_3" 这类带曝光后缀的通道 id 先规范成单个 marker token，
+        # 否则 class 会变成 "neuron_GFP_3"，下游按 '_' 拆分时多出一个伪 marker "3"
+        df['class'] = df['class'].astype(str) + '_' + channel_marker(ch_id)
     matrix = df[['x1', 'y1', 'x2', 'y2', 'score', 'mean', 'class', 'z']].values
     _, vol_list = run_z_linker(
         matrix,
@@ -1555,9 +1563,8 @@ def _vol_list_to_s4_shapes(vol_list, z_range, s4_groups):
         dash_size    = grp.get('dash_size', 8)
         shapes, colors, dash_sizes, box_meta = [], [], [], []
         for cell in vol_list:
-            parts        = str(cell.get('class', '')).split('_')
-            base         = parts[0]
-            cell_markers = frozenset(p.lower() for p in parts[1:])
+            base, markers = split_class(cell.get('class', ''))
+            cell_markers  = frozenset(m.lower() for m in markers)
             if not req.issubset(cell_markers):
                 continue
             cz = int(round(cell['cz']))
@@ -1932,7 +1939,9 @@ def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
     if show_spheres:
         for ch in routing_config:
             cid   = ch['id']
-            color = sphere_colors_cfg.get(cid) or SPHERE_COLORS.get(cid, _DEFAULT_SPHERE_COLOR)
+            cid_mk = channel_marker(cid)
+            color = (sphere_colors_cfg.get(cid) or sphere_colors_cfg.get(cid_mk)
+                     or SPHERE_COLORS.get(cid) or SPHERE_COLORS.get(cid_mk, _DEFAULT_SPHERE_COLOR))
             centers, sizes = _vol_list_to_points(per_ch_vol_lists.get(cid, []), z_range)
             if centers is not None:
                 viewer.add_points(

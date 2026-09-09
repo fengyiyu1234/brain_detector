@@ -23,6 +23,7 @@ from src.config.loader import load_config, expand_double_exposure_channels
 from src.utils.logger import setup_logging
 from src.utils.io import (listTile, listTile_from_local_csvs, loadTeraxml,
                           save_run_metadata, compute_grid_fallback_offsets)
+from src.utils.markers import channel_marker, class_markers, split_class
 from src.core.worker import process_single_tile_wrapper, init_worker
 from src.core.stitcher import combine_predictions, fuse_dual_intensity_2d
 from src.core.z_linker import run_z_linker
@@ -643,8 +644,10 @@ if __name__ == '__main__':
 
             # ====== 1. 逐通道独立拼接全局 2D，每个通道单独保存 ======
             for ch in _ch_todo:
-                ch_id   = ch['id']
-                ch_type = ch.get('type', 'soma')
+                ch_id     = ch['id']
+                ch_type   = ch.get('type', 'soma')
+                # class 标签用规范化 marker（"GFP_3" → "GFP"），文件名仍用原始 ch_id
+                ch_marker = channel_marker(ch_id)
                 logging.info(f" -> 正在拼接通道 2D 框: [{ch_id}] (类型: {ch_type})")
 
                 current_ch_global_2d = []
@@ -684,7 +687,7 @@ if __name__ == '__main__':
                 if current_ch_global_2d:
                     ch_matrix = np.concatenate(current_ch_global_2d, axis=0)
                     for row in ch_matrix:
-                        row[6] = f"{row[6]}_{ch_id}"   # "neuron" → "neuron_RFP"
+                        row[6] = f"{row[6]}_{ch_marker}"   # "neuron" → "neuron_RFP"
                     per_ch_matrices[ch_id] = ch_matrix
                     out_2d = os.path.join(derived['pATH_GLOBAL_2D'], f"{ch_id}_2d_global.csv")
                     pd.DataFrame(ch_matrix, columns=BOX_COLS).to_csv(out_2d, index=False)
@@ -785,7 +788,7 @@ if __name__ == '__main__':
         merged_soma_vols = suppress_cross_class_overlap(
             merged_soma_vols, iou_thresh=cross_iou, z_pad=z_pad_3d
         )
-        n_multi  = sum(1 for c in merged_soma_vols if len(c['class'].split('_')) > 2)
+        n_multi  = sum(1 for c in merged_soma_vols if len(class_markers(c['class'])) > 1)
         n_single = len(merged_soma_vols) - n_multi
         logging.info(f"✔️ [3A] Soma 3D IoU 匹配: {len(merged_soma_vols)} 个 "
                      f"(多阳性 {n_multi}, 单阳性 {n_single})")
@@ -813,11 +816,18 @@ if __name__ == '__main__':
                     max_center_dist_ratio=max_center_dist
                 )
                 logging.info(f"✔️ [3B] [{cid}] TF containment 标注完成")
+        tf_markers_set = {channel_marker(cid) for cid in tf_ch_ids}
         n_tf_annotated = sum(
             1 for c in merged_soma_vols
-            if any(cid in c['class'] for cid in tf_ch_ids)
+            if tf_markers_set & set(class_markers(c['class']))
         )
         logging.info(f"✔️ [3B] 全部TF标注完成: {n_tf_annotated} 个 soma 有 TF marker")
+
+        # 统一规范 class 字符串：丢掉旧结果（如 "GFP_3" 通道名）带进来的伪 marker。
+        # 只参与合并的细胞会经过 _merge_class，单通道细胞不会，所以这里补一次。
+        for soma in merged_soma_vols:
+            _base, _mk = split_class(soma['class'])
+            soma['class'] = f"{_base}_" + "_".join(sorted(_mk)) if _mk else _base
 
         # Phase C: 输出为 2D 形式（center_z处的bbox），排除TF单阳性
         output_rows = []
@@ -889,25 +899,29 @@ if __name__ == '__main__':
         total_cells = len(df_final)
 
         # 1. 拆解分析动态标签 (例如把 "neuron_RFP_Sox9" 拆成类别和具体 Marker)
-        df_final['base_type'] = df_final['class'].apply(lambda x: x.split('_')[0])
-        
+        #    split_class 同时丢掉旧结果里由 "GFP_3" 这类通道名产生的伪 marker "3"
+        parsed_cls = df_final['class'].apply(split_class)
+        df_final['base_type']   = parsed_cls.apply(lambda pc: pc[0])
+        df_final['marker_set']  = parsed_cls.apply(lambda pc: frozenset(pc[1]))
+        df_final['class_clean'] = parsed_cls.apply(
+            lambda pc: f"{pc[0]}_" + "_".join(sorted(pc[1])) if pc[1] else pc[0]
+        )
+
         # 统计组合情况 (e.g. neuron_RFP_Sox9: 150个)
-        combo_counts = df_final['class'].value_counts()
-        
+        combo_counts = df_final['class_clean'].value_counts()
+
         # 统计基类情况 (e.g. neuron: 800个, glia: 1200个)
         base_counts = df_final['base_type'].value_counts()
-        
+
         # 提取所有的 Markers 并独立统计阳性率
         all_markers_found = set()
-        for c in df_final['class'].unique():
-            parts = str(c).split('_')
-            if len(parts) > 1:
-                all_markers_found.update(parts[1:])
-                
+        for ms in df_final['marker_set']:
+            all_markers_found.update(ms)
+
         marker_counts = {}
-        for m in all_markers_found:
-            # 只要包含该 Marker 字符即算阳性
-            marker_counts[m] = df_final[df_final['class'].str.contains(m)].shape[0]
+        for m in sorted(all_markers_found):
+            # 按 marker token 精确匹配，避免 str.contains 的子串误判
+            marker_counts[m] = int(df_final['marker_set'].apply(lambda s: m in s).sum())
 
         # 2. 写入极其详细的层级分析报告
         with open(report_path, 'w', encoding='utf-8') as f:
@@ -930,7 +944,7 @@ if __name__ == '__main__':
         df_final['cx'] = (df_final['x1'] + df_final['x2']) / 2
         df_final['cy'] = (df_final['y1'] + df_final['y2']) / 2
         
-        for label, group in df_final.groupby('class'):
+        for label, group in df_final.groupby('class_clean'):
             group_sorted = group.sort_values('z')
             out_df = group_sorted[['cx', 'cy', 'z', 'score', 'slice_name', 'tile_name']]
             

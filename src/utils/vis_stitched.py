@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 
 from src.utils.io import loadTeraxml
+from src.utils.markers import split_class
 from src.config.loader import load_config
 
 _DEFAULT_CFG = os.path.join(project_root, 'config', 'vis', 'vis_stitched.json')
@@ -137,9 +138,11 @@ def make_rgb_composite(ch_gray_u16, ch_colors_8bit):
 # ── Detection loading ─────────────────────────────────────────────────────────
 
 def parse_class(class_str):
-    """'neuron_GFP_RFP_Sox9' → ('neuron', frozenset({'GFP','RFP','Sox9'}))."""
-    parts = str(class_str).strip().split('_')
-    return parts[0], frozenset(parts[1:]) if len(parts) > 1 else frozenset()
+    """'neuron_GFP_RFP_Sox9' → ('neuron', frozenset({'GFP','RFP','Sox9'})).
+
+    伪 marker（旧结果里 "GFP_3" 通道名拆出的 "3"）已由 split_class 过滤。"""
+    base, markers = split_class(str(class_str).strip())
+    return base, frozenset(markers)
 
 
 def load_detections(csv_path, xy_scale, z_scale, z_start, n_layers):
