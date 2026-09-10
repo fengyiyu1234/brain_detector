@@ -97,6 +97,16 @@ def _get_ch_filter(filter_cfg, ch):
     return filter_cfg.get(ch.get('type', 'soma')) or filter_cfg.get(ch.get('id', '')) or None
 
 
+def _needs_raw_vol(filter_cfg, ch):
+    """True only when a channel's filter needs pixel data, i.e. an intensity threshold.
+
+    Size/area filters are geometry-only, so gating on this avoids re-reading a whole
+    tile volume that the image layers already loaded.
+    """
+    filt = _get_ch_filter(filter_cfg, ch) or {}
+    return any(filt.get(k) is not None for k in ('bbox_mean_pct_min', 'bbox_mean_min'))
+
+
 def _extract_markers(class_str):
     return set(class_markers(class_str))
 
@@ -199,124 +209,6 @@ def load_raw_volume(tile_dir, z_range=None):
     return np.stack(slices) if slices else None
 
 
-def _compute_box_means_from_csv(csv_path, z_range, raw_vol):
-    """Compute mean 16-bit intensity for every box in csv from raw_vol (no filtering)."""
-    if not os.path.isfile(csv_path) or raw_vol is None:
-        return np.array([], dtype=np.float32)
-    df = pd.read_csv(csv_path,
-                     names=['slice_name', 'x1', 'y1', 'x2', 'y2', 'class', 'score', 'mean', 'z'],
-                     skiprows=1)
-    if df.empty:
-        return np.array([], dtype=np.float32)
-    df['z'] = df['z'].astype(float).astype(int) - 1
-    if z_range is not None:
-        df['z_local'] = df['z'] - z_range[0]
-        df = df[(df['z_local'] >= 0) & (df['z_local'] < z_range[1] - z_range[0])]
-        z_col_arr = df['z_local'].values
-    else:
-        z_col_arr = df['z'].values
-    if df.empty:
-        return np.array([], dtype=np.float32)
-    x1v = df['x1'].values.astype(float); x2v = df['x2'].values.astype(float)
-    y1v = df['y1'].values.astype(float); y2v = df['y2'].values.astype(float)
-    Z_v, H_v, W_v = raw_vol.shape
-    n = len(df)
-    means = np.zeros(n, dtype=np.float32)
-    for i in range(n):
-        zi = int(z_col_arr[i])
-        if 0 <= zi < Z_v:
-            x1c = max(0, int(round(x1v[i]))); x2c = min(W_v, int(round(x2v[i])))
-            y1c = max(0, int(round(y1v[i]))); y2c = min(H_v, int(round(y2v[i])))
-            if y2c > y1c and x2c > x1c:
-                means[i] = raw_vol[zi, y1c:y2c, x1c:x2c].mean()
-    return means
-
-
-def _compute_box_areas_from_csv(csv_path, z_range):
-    """Compute 2D box area (w*h px²) for every box in csv (no filtering)."""
-    if not os.path.isfile(csv_path):
-        return np.array([], dtype=np.float32)
-    df = pd.read_csv(csv_path,
-                     names=['slice_name', 'x1', 'y1', 'x2', 'y2', 'class', 'score', 'mean', 'z'],
-                     skiprows=1)
-    if df.empty:
-        return np.array([], dtype=np.float32)
-    df['z'] = df['z'].astype(float).astype(int) - 1
-    if z_range is not None:
-        df = df[(df['z'] >= z_range[0]) & (df['z'] < z_range[1])]
-    if df.empty:
-        return np.array([], dtype=np.float32)
-    w = df['x2'].values.astype(float) - df['x1'].values.astype(float)
-    h = df['y2'].values.astype(float) - df['y1'].values.astype(float)
-    return (w * h).astype(np.float32)
-
-
-def _plot_box_area_histograms(ch_areas_dict, tile_name='', out_dir=None):
-    """Save per-channel box area histograms as PNG to out_dir."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    channels = [cid for cid, a in ch_areas_dict.items() if len(a) > 0]
-    if not channels:
-        print("[area_hist] No area data to plot.")
-        return
-    n_ch = len(channels)
-    fig, axes = plt.subplots(1, n_ch, figsize=(6 * n_ch, 4), squeeze=False)
-    fig.suptitle(f"Box area distribution  —  {tile_name}")
-    pct_marks  = [10, 50, 90]
-    pct_colors = ['orange', 'steelblue', 'red']
-    for ax, cid in zip(axes[0], channels):
-        areas = ch_areas_dict[cid]
-        ax.hist(areas, bins=120, color='steelblue', alpha=0.75, log=True)
-        for pct, col in zip(pct_marks, pct_colors):
-            v = float(np.percentile(areas, pct))
-            ax.axvline(v, color=col, linestyle='--', linewidth=1.2,
-                       label=f'p{pct} = {v:.0f}')
-        ax.set_title(f"{cid}  (n={len(areas):,})")
-        ax.set_xlabel('Box area (px²)')
-        ax.set_ylabel('Box count (log scale)')
-        ax.legend(fontsize=8)
-    plt.tight_layout()
-    save_dir = out_dir or '.'
-    os.makedirs(save_dir, exist_ok=True)
-    out_path = os.path.join(save_dir, f"box_area_hist_{tile_name}.png")
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"[area_hist] Saved → {out_path}")
-
-
-def _plot_intensity_histograms(ch_means_dict, tile_name='', out_dir=None):
-    """Save per-channel box intensity histograms as PNG to out_dir."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    channels = [cid for cid, m in ch_means_dict.items() if len(m) > 0]
-    if not channels:
-        print("[hist] No intensity data to plot.")
-        return
-    n_ch = len(channels)
-    fig, axes = plt.subplots(1, n_ch, figsize=(6 * n_ch, 4), squeeze=False)
-    fig.suptitle(f"Box intensity distribution  —  {tile_name}")
-    pct_marks  = [10, 20, 50]
-    pct_colors = ['orange', 'red', 'steelblue']
-    for ax, cid in zip(axes[0], channels):
-        means = ch_means_dict[cid]
-        ax.hist(means, bins=120, color='steelblue', alpha=0.75, log=True)
-        for pct, col in zip(pct_marks, pct_colors):
-            v = float(np.percentile(means, pct))
-            ax.axvline(v, color=col, linestyle='--', linewidth=1.2,
-                       label=f'p{pct} = {v:.0f}')
-        ax.set_title(f"{cid}  (n={len(means):,})")
-        ax.set_xlabel('Mean intensity (16-bit raw)')
-        ax.set_ylabel('Box count (log scale)')
-        ax.legend(fontsize=8)
-    plt.tight_layout()
-    save_dir = out_dir or '.'
-    os.makedirs(save_dir, exist_ok=True)
-    out_path = os.path.join(save_dir, f"intensity_hist_{tile_name}.png")
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"[hist] Saved → {out_path}")
 
 
 def _filter_df_by_size_and_intensity(x1, y1, x2, y2, z_col, raw_vol, filt):
@@ -1388,14 +1280,53 @@ def _print_s3_cell_info(cell, cid):
     print(f'{sep}\n')
 
 
-def _append_false_negative(ann_path, tile_name, tile_path, z_abs, x, y, channel=''):
+def _append_false_negative(ann_path, tile_name, tile_path, z_abs, x, y,
+                           channel='', crop_file=''):
     """Append one false-negative annotation to ann_path (CSV), creating header if new."""
     exists = os.path.isfile(ann_path)
+    os.makedirs(os.path.dirname(os.path.abspath(ann_path)), exist_ok=True)
     with open(ann_path, 'a', encoding='utf-8', newline='') as f:
         if not exists:
-            f.write("tile_name,tile_path,z,x,y,channel,timestamp\n")
+            f.write("tile_name,tile_path,z,x,y,channel,crop_file,timestamp\n")
         ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        f.write(f"{tile_name},{tile_path},{z_abs},{x:.0f},{y:.0f},{channel},{ts}\n")
+        f.write(f"{tile_name},{tile_path},{z_abs},{x:.0f},{y:.0f},"
+                f"{channel},{crop_file},{ts}\n")
+
+
+def _save_fn_crop(out_dir, tile_dir, z_file, x, y, size, channel):
+    """Cut a size×size window centred on (x, y) out of the original slice at z_file.
+
+    Saved as "<original slice name>_<channel>.tif", with a numeric suffix appended
+    when that name is taken, so marking several cells on one slice keeps every crop.
+    Reads the source TIFF unchanged so the crop keeps its original bit depth, and
+    clamps the window inward instead of padding, so a full-size crop is all real
+    pixels.  Returns (out_path, note); out_path is None when the crop could not
+    be made and note then says why.
+    """
+    if not os.path.isdir(tile_dir):
+        return None, f"tile dir not found: {tile_dir}"
+    files = sorted(f for f in os.listdir(tile_dir)
+                   if f.lower().endswith(('.tif', '.tiff')))
+    if not 0 <= z_file < len(files):
+        return None, f"z={z_file} outside slice range 0–{len(files) - 1}"
+    src = os.path.join(tile_dir, files[z_file])
+    img = cv2.imread(src, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None, f"unreadable: {src}"
+    h, w = img.shape[:2]
+    x0 = int(min(max(round(x) - size // 2, 0), max(w - size, 0)))
+    y0 = int(min(max(round(y) - size // 2, 0), max(h - size, 0)))
+    crop = img[y0:y0 + size, x0:x0 + size]
+    os.makedirs(out_dir, exist_ok=True)
+    stem = f"{os.path.splitext(files[z_file])[0]}_{channel}"
+    out_path = os.path.join(out_dir, f"{stem}.tif")
+    dup = 2
+    while os.path.exists(out_path):
+        out_path = os.path.join(out_dir, f"{stem}_{dup}.tif")
+        dup += 1
+    if not cv2.imwrite(out_path, crop):
+        return None, f"write failed: {out_path}"
+    return out_path, f"{crop.shape[1]}×{crop.shape[0]} at ({x0},{y0}) from {files[z_file]}"
 
 
 def _active_image_channel(viewer):
@@ -1408,6 +1339,71 @@ def _active_image_channel(viewer):
     if len(img_visible) == 1:
         return img_visible[0].name[len('[img] '):]
     return ''
+
+
+def _make_fn_recorder(vis_cfg, paths, routing_config, anchor_dir, tile_path,
+                      tile_name, z_range, offsets=None):
+    """Build the Ctrl+click false-negative handler, or None when fn_ann_path is unset.
+
+    Crops are cut from the original per-slice TIFFs, so in prealign mode the clicked
+    position is un-shifted by the channel's alignment offset first.
+    """
+    ann_path = vis_cfg.get('fn_ann_path') or None
+    if not ann_path:
+        print("[info] Ctrl+click  disabled  (set 'fn_ann_path' in vis_config.json to enable)")
+        return None
+    crop_dir  = vis_cfg.get('fn_crop_dir') or None
+    crop_size = int(vis_cfg.get('fn_crop_size', 256))
+    offsets   = offsets or {}
+    rel     = os.path.relpath(tile_path, anchor_dir)
+    ch_dirs = {}
+    for ch in routing_config:
+        ch_dirs[ch['id']] = os.path.join(os.path.abspath(paths[ch['dir_key']]), rel)
+        if ch.get('double_exposure'):
+            ch_dirs[ch['second_intensity_id']] = os.path.join(
+                os.path.abspath(paths[ch['second_intensity_dir_key']]), rel)
+    print(f"[info] Ctrl+click  anywhere  → mark false-negative position → {ann_path}")
+    if crop_dir:
+        print(f"[info]            + save {crop_size}×{crop_size} TIFF crop → {crop_dir}")
+    else:
+        print(f"[info]            (set 'fn_crop_dir' to also save image crops)")
+
+    def record(viewer, z_cur, x, y, box_registry):
+        z_abs  = z_cur + z_range[0]
+        ch_tag = _active_image_channel(viewer)
+        crop_name, crop_note, crop_log = '', '', ''
+        if crop_dir and not ch_tag:
+            crop_note = "  (no crop — select a single [img] layer first)"
+        elif crop_dir:
+            o = offsets.get(ch_tag, {})
+            z_f = z_abs + o.get('dz', 0)
+            x_f = x + o.get('dx', 0)
+            y_f = y + o.get('dy', 0)
+            out_path, note = _save_fn_crop(crop_dir, ch_dirs.get(ch_tag, ''),
+                                           z_f, x_f, y_f, crop_size, ch_tag)
+            if out_path:
+                crop_name = os.path.basename(out_path)
+                crop_note = f"  → {crop_name}"
+                crop_log  = f"[fn]   crop {note}"
+            else:
+                crop_note = "  (crop failed — see terminal)"
+                crop_log  = f"[fn]   crop FAILED — {note}"
+        _append_false_negative(ann_path, tile_name, tile_path, z_abs, x, y,
+                               channel=ch_tag, crop_file=crop_name)
+        hits = [b for b in box_registry
+                if b['z'] == z_cur and b['x1'] <= x <= b['x2'] and b['y1'] <= y <= b['y2']]
+        box_note = ""
+        if hits:
+            best_h = min(hits, key=lambda b: (b['x2'] - b['x1']) * (b['y2'] - b['y1']))
+            box_note = f"  (inside [{best_h['layer_name']}] {best_h['cls']})"
+        ch_note = f"  ch={ch_tag}" if ch_tag else ""
+        print(f"[fn] {tile_name}  z={z_abs}  x={x:.0f}  y={y:.0f}{ch_note}{box_note}")
+        if crop_log:
+            print(crop_log)
+        viewer.status = (f"⌃ FN marked: z={z_abs} x={x:.0f} y={y:.0f}"
+                         f"{ch_note}{box_note}{crop_note}")
+
+    return record
 
 
 def _build_s3_span_shapes(cell, z_range, canvas_shape):
@@ -1671,26 +1667,6 @@ def _add_second_intensity_layer(viewer, ch, paths, anchor_dir, tile_path, z_rang
     return second_id, layer
 
 
-def _channel_2d_csv(ch, tile_name, primary_dir, fallback_dir, fused_dir,
-                     use_fallback=True):
-    """Resolve the tile-local 2D-detection CSV path for a channel.
-
-    double_exposure channels always read the fused result (1_tile_2d_fused) —
-    the pre-fusion per-exposure CSV under primary_dir/fallback_dir would only
-    hold that one exposure's detections, not the merged channel. Regular
-    channels keep the existing primary_dir -> fallback_dir behavior.
-    use_fallback: whether to fall back to fallback_dir when the file isn't at
-    primary_dir (mirrors the callers' own has_aligned / os.path.exists checks).
-    """
-    cid = ch['id']
-    if ch.get('double_exposure'):
-        return os.path.join(fused_dir, f"{tile_name}_{cid}_result.csv")
-    csv_path = os.path.join(primary_dir, f"{tile_name}_{cid}_result.csv")
-    if not os.path.isfile(csv_path) and use_fallback:
-        csv_path = os.path.join(fallback_dir, f"{tile_name}_{cid}_result.csv")
-    return csv_path
-
-
 # ── Mode: prealign ────────────────────────────────────────────────────────────
 
 def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
@@ -1732,8 +1708,7 @@ def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
     canvas_z, canvas_h, canvas_w = canvas_shape
     print(f"Z-range: {z_range[0]} – {z_range[1]} ({z_range[1] - z_range[0]} slices)\n")
 
-    offsets     = load_offsets(align_dir, tile_name)
-    has_aligned = bool(offsets)
+    offsets = load_offsets(align_dir, tile_name)
 
     print("=== Channel alignment summary ===")
     for ch in routing_config:
@@ -1824,14 +1799,12 @@ def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
 
     box_registry = []  # {z, x1, y1, x2, y2, cls, layer_name} — populated below
 
-    # ── Load raw volumes for intensity filtering / histogram (prealign: apply shift) ─
+    # ── Load raw volumes for intensity filtering (prealign: apply shift) ──────
     filter_cfg = vis_cfg.get('filter', {})
-    show_hist  = vis_cfg.get('show_intensity_hist', False)
     raw_vols   = {}
     for ch in routing_config:
         cid = ch['id']
-        need_vol = bool(_get_ch_filter(filter_cfg, ch)) or show_hist
-        if not need_vol:
+        if not _needs_raw_vol(filter_cfg, ch):
             continue
         ch_base  = os.path.abspath(paths[ch['dir_key']])
         tile_dir = os.path.join(ch_base, os.path.relpath(tile_path, anchor_dir))
@@ -1843,32 +1816,7 @@ def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
         if rv is not None:
             raw_vols[cid] = rv
             active = [k for k, v in (_get_ch_filter(filter_cfg, ch) or {}).items() if v is not None]
-            tag = f"— active filter: {active}" if active else "— hist only"
-            print(f"[raw_vol] [{cid}] loaded {rv.shape} {tag}")
-
-    # ── Intensity histogram (before any filtering) ────────────────────────────
-    if show_hist and raw_vols:
-        ch_means = {}
-        ch_by_id = {ch['id']: ch for ch in routing_config}
-        for cid, rv in raw_vols.items():
-            aligned_csv = _channel_2d_csv(ch_by_id[cid], tile_name, align_dir, raw_dir, fused_dir)
-            print(f"[hist] Computing box means for {cid} ...")
-            ch_means[cid] = _compute_box_means_from_csv(aligned_csv, z_range, rv)
-            print(f"[hist] {cid}: {len(ch_means[cid]):,} boxes")
-        _plot_intensity_histograms(ch_means, tile_name=tile_name, out_dir=base_res)
-
-    # ── Box area histogram ────────────────────────────────────────────────────
-    show_box_area_hist = vis_cfg.get('show_box_area_hist', False)
-    if show_box_area_hist:
-        ch_areas = {}
-        for ch in routing_config:
-            cid = ch['id']
-            aligned_csv = _channel_2d_csv(ch, tile_name, align_dir, raw_dir, fused_dir,
-                                           use_fallback=not has_aligned)
-            print(f"[area_hist] Computing box areas for {cid} ...")
-            ch_areas[cid] = _compute_box_areas_from_csv(aligned_csv, z_range)
-            print(f"[area_hist] {cid}: {len(ch_areas[cid]):,} boxes")
-        _plot_box_area_histograms(ch_areas, tile_name=tile_name, out_dir=base_res)
+            print(f"[raw_vol] [{cid}] loaded {rv.shape} — active filter: {active}")
 
     # ── [aligned] & [raw] boxes ───────────────────────────────────────────────
     left_m, top_m = _get_tile_overlap_margins(anchor_dir, tile_name, canvas_w, canvas_h)
@@ -2042,14 +1990,11 @@ def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
             )
 
     # ── Click-to-inspect  /  Shift+click traces  /  Ctrl+click FN annotation ────
-    fn_ann_path = vis_cfg.get('fn_ann_path') or None
     print(f"\n[info] Click any detection box → dimensions in status bar.")
     print(f"[info] Shift+click [coloc]   box → TF colocalization trace in terminal.")
     print(f"[info] Shift+click [zlinked] box → per-z span highlighted in yellow + info.")
-    if fn_ann_path:
-        print(f"[info] Ctrl+click  anywhere  → mark false-negative position → {fn_ann_path}")
-    else:
-        print(f"[info] Ctrl+click  disabled  (set 'fn_ann_path' in vis_config.json to enable)")
+    fn_record = _make_fn_recorder(vis_cfg, paths, routing_config, anchor_dir,
+                                  tile_path, tile_name, z_range, offsets=offsets)
     print(f"[info] {len(box_registry)} boxes indexed across all layers.")
 
     @viewer.bind_key('Shift')
@@ -2081,25 +2026,10 @@ def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
         x_cur = float(pos[2])
 
         if is_ctrl:
-            if not fn_ann_path:
+            if fn_record is None:
                 viewer.status = "⌃ Ctrl+click disabled — set 'fn_ann_path' in vis_config.json"
-                return
-            z_abs = z_cur + z_range[0]
-            ch_tag = _active_image_channel(viewer)
-            _append_false_negative(fn_ann_path, tile_name, tile_path, z_abs, x_cur, y_cur,
-                                   channel=ch_tag)
-            hits = [b for b in box_registry
-                    if b['z'] == z_cur
-                    and b['x1'] <= x_cur <= b['x2']
-                    and b['y1'] <= y_cur <= b['y2']]
-            box_note = ""
-            if hits:
-                best_h = min(hits, key=lambda b: (b['x2']-b['x1'])*(b['y2']-b['y1']))
-                box_note = f"  (inside [{best_h['layer_name']}] {best_h['cls']})"
-            ch_note = f"  ch={ch_tag}" if ch_tag else ""
-            print(f"[fn] {tile_name}  z={z_abs}  x={x_cur:.0f}  y={y_cur:.0f}{ch_note}{box_note}")
-            viewer.status = (f"⌃ FN marked: z={z_abs} x={x_cur:.0f} y={y_cur:.0f}"
-                             f"{ch_note}{box_note}  → {os.path.basename(fn_ann_path)}")
+            else:
+                fn_record(viewer, z_cur, x_cur, y_cur, box_registry)
             return
 
         hits = [
@@ -2214,14 +2144,12 @@ def _run_post(vis_cfg, paths, routing_config, tile_path, tile_name):
 
     box_registry = []  # {z, x1, y1, x2, y2, cls, layer_name} — populated below
 
-    # ── Load raw volumes for intensity filtering / histogram ──────────────────
-    filter_cfg    = vis_cfg.get('filter', {})
-    show_hist     = vis_cfg.get('show_intensity_hist', False)
-    raw_vols = {}
+    # ── Load raw volumes for intensity filtering ──────────────────────────────
+    filter_cfg = vis_cfg.get('filter', {})
+    raw_vols   = {}
     for ch in routing_config:
         cid = ch['id']
-        need_vol = bool(_get_ch_filter(filter_cfg, ch)) or show_hist
-        if not need_vol:
+        if not _needs_raw_vol(filter_cfg, ch):
             continue
         ch_base  = os.path.abspath(paths[ch['dir_key']])
         tile_dir = os.path.join(ch_base, os.path.relpath(tile_path, anchor_dir))
@@ -2229,31 +2157,7 @@ def _run_post(vis_cfg, paths, routing_config, tile_path, tile_name):
         if rv is not None:
             raw_vols[cid] = rv
             active = [k for k, v in (_get_ch_filter(filter_cfg, ch) or {}).items() if v is not None]
-            tag = f"— active filter: {active}" if active else "— hist only"
-            print(f"[raw_vol] [{cid}] loaded {rv.shape} {tag}")
-
-    # ── Intensity histogram (before any filtering) ────────────────────────────
-    if show_hist and raw_vols:
-        ch_means = {}
-        ch_by_id = {ch['id']: ch for ch in routing_config}
-        for cid, rv in raw_vols.items():
-            csv_p = _channel_2d_csv(ch_by_id[cid], tile_name, raw_dir, raw_dir, fused_dir)
-            print(f"[hist] Computing box means for {cid} ...")
-            ch_means[cid] = _compute_box_means_from_csv(csv_p, z_range, rv)
-            print(f"[hist] {cid}: {len(ch_means[cid]):,} boxes")
-        _plot_intensity_histograms(ch_means, tile_name=tile_name, out_dir=base_res)
-
-    # ── Box area histogram ────────────────────────────────────────────────────
-    show_box_area_hist = vis_cfg.get('show_box_area_hist', False)
-    if show_box_area_hist:
-        ch_areas = {}
-        for ch in routing_config:
-            cid = ch['id']
-            csv_p = _channel_2d_csv(ch, tile_name, raw_dir, raw_dir, fused_dir)
-            print(f"[area_hist] Computing box areas for {cid} ...")
-            ch_areas[cid] = _compute_box_areas_from_csv(csv_p, z_range)
-            print(f"[area_hist] {cid}: {len(ch_areas[cid]):,} boxes")
-        _plot_box_area_histograms(ch_areas, tile_name=tile_name, out_dir=base_res)
+            print(f"[raw_vol] [{cid}] loaded {rv.shape} — active filter: {active}")
 
     # ── Image layers (raw, no shift) ──────────────────────────────────────────
     if not no_images:
@@ -2393,14 +2297,11 @@ def _run_post(vis_cfg, paths, routing_config, tile_path, tile_name):
           f"({len(_debug_soma_vols)} soma, {len(_debug_all_tf)} TF)")
 
     # ── Click-to-inspect  /  Shift+click traces  /  Ctrl+click FN annotation ────
-    fn_ann_path = vis_cfg.get('fn_ann_path') or None
     print(f"\n[info] Click any detection box → dimensions in status bar.")
     print(f"[info] Shift+click [coloc] box → TF colocalization trace in terminal.")
     print(f"[info] Shift+click [s3]    box → per-z span highlighted in yellow + info.")
-    if fn_ann_path:
-        print(f"[info] Ctrl+click  anywhere  → mark false-negative position → {fn_ann_path}")
-    else:
-        print(f"[info] Ctrl+click  disabled  (set 'fn_ann_path' in vis_config.json to enable)")
+    fn_record = _make_fn_recorder(vis_cfg, paths, routing_config, anchor_dir,
+                                  tile_path, tile_name, z_range)
     print(f"[info] {len(box_registry)} boxes indexed across all layers.")
 
     @viewer.bind_key('Shift')
@@ -2432,25 +2333,10 @@ def _run_post(vis_cfg, paths, routing_config, tile_path, tile_name):
         x_cur = float(pos[2])
 
         if is_ctrl:
-            if not fn_ann_path:
+            if fn_record is None:
                 viewer.status = "⌃ Ctrl+click disabled — set 'fn_ann_path' in vis_config.json"
-                return
-            z_abs = z_cur + z_range[0]
-            ch_tag = _active_image_channel(viewer)
-            _append_false_negative(fn_ann_path, tile_name, tile_path, z_abs, x_cur, y_cur,
-                                   channel=ch_tag)
-            hits = [b for b in box_registry
-                    if b['z'] == z_cur
-                    and b['x1'] <= x_cur <= b['x2']
-                    and b['y1'] <= y_cur <= b['y2']]
-            box_note = ""
-            if hits:
-                best_h = min(hits, key=lambda b: (b['x2']-b['x1'])*(b['y2']-b['y1']))
-                box_note = f"  (inside [{best_h['layer_name']}] {best_h['cls']})"
-            ch_note = f"  ch={ch_tag}" if ch_tag else ""
-            print(f"[fn] {tile_name}  z={z_abs}  x={x_cur:.0f}  y={y_cur:.0f}{ch_note}{box_note}")
-            viewer.status = (f"⌃ FN marked: z={z_abs} x={x_cur:.0f} y={y_cur:.0f}"
-                             f"{ch_note}{box_note}  → {os.path.basename(fn_ann_path)}")
+            else:
+                fn_record(viewer, z_cur, x_cur, y_cur, box_registry)
             return
 
         hits = [
