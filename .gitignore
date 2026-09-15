@@ -20,6 +20,7 @@ venv/
 *.json
 *.out
 *.sh
+*.slurm
 *.h5
 images/
 labels/

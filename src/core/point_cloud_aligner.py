@@ -15,7 +15,7 @@ Workflow per tile:
   10. apply_shift_to_csv()       – applies (dx, dy, dz) to a detection CSV
   11. save_tile_offsets()        – writes per-tile offset JSON for traceability
 
-Two-step alignment strategy:
+Two-step alignment strategy (tf_align_mode='chain', default):
   Step 1a  intra-soma  : align each extra soma channel → reference soma channel
   Step 1b  intra-TF    : align each extra TF channel   → reference TF channel
   Step 2   cross-group : align reference TF channel    → reference soma channel
@@ -24,6 +24,10 @@ Two-step alignment strategy:
     soma-N   : intra-soma shift
     ref-TF   : cross-group shift
     TF-N     : intra-TF shift + cross-group shift
+
+tf_align_mode='direct': Step 1a as above, then every TF channel is aligned
+independently to the reference soma channel with the cross-group containment
+search (no intra-TF step). Use when TF markers label different populations.
 
 Step 2 uses containment-based scoring (find_shift_containment) rather than
 voxel-IoU: TF nucleus boxes (e.g. Sox9, ~8-17px) are much smaller than soma
@@ -37,6 +41,7 @@ since a nucleus centroid crossing the gate radius flips the match on/off.
 
 import os
 import json
+import logging
 import warnings
 import numpy as np
 import pandas as pd
@@ -528,7 +533,7 @@ def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
                                 xy_range_px=30, z_range_slices=5,
                                 fine_xy_px=8, fine_z_slices=2,
                                 max_center_dist_ratio=0.3, xy_margin=0,
-                                containment_z_pad=0):
+                                containment_z_pad=0, tf_align_mode='chain'):
     """
     Compute final (dx, dy, dz) per channel for one tile using two-step strategy.
 
@@ -537,6 +542,12 @@ def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
     per_ch_vol_lists : dict  ch_id → list of volumetric cell dicts
     soma_ch_ids      : list  ordered soma channel IDs; first is the reference
     tf_ch_ids        : list  ordered TF channel IDs; first is the reference TF
+                             (only meaningful in 'chain' mode)
+    tf_align_mode    : str   'chain'  — TF-N → ref TF (voxel IoU), ref TF → ref soma
+                                        (containment); TF-N shift is the sum
+                             'direct' — every TF channel → ref soma by containment,
+                                        independently (use when TF markers label
+                                        different cell populations)
     z_center         : float z-center of the alignment window (slice index)
     z_half_window    : int   half-width of the alignment z-window (slices)
     bin_size         : int   XY voxel bin size in pixels
@@ -588,6 +599,19 @@ def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
         dx, dy, dz, sc = find_shift(boxes_ref_soma, _boxes(cid), **align_kwargs)
         shifts[cid] = (dx, dy, dz)
         scores[cid] = sc
+
+    # direct mode: every TF channel → ref soma by containment, no TF-to-TF step
+    if tf_align_mode == 'direct':
+        for cid in tf_ch_ids:
+            dx, dy, dz, sc = find_shift_containment(
+                boxes_ref_soma, _boxes(cid),
+                max_center_dist_ratio=max_center_dist_ratio,
+                xy_margin=xy_margin, z_pad=containment_z_pad,
+                **align_kwargs
+            )
+            shifts[cid] = (dx, dy, dz)
+            scores[cid] = sc
+        return shifts, scores
 
     # Step 1b: intra-TF alignment (extra TF channels → ref TF)
     if ref_tf:
@@ -675,3 +699,92 @@ def save_tile_offsets(tile_name, shifts, scores, out_dir):
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2)
     return out_path
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 10.  Alignment settings: resolve once, persist, guard against stale outputs
+# ──────────────────────────────────────────────────────────────────────────────
+
+ALIGN_SETTINGS_FILE = "_align_settings.json"
+
+
+def resolve_align_settings(config, routing_config):
+    """
+    Resolve every setting that influences the Stage 2.5 shifts, defaults applied,
+    so one dict both drives the alignment and is persisted next to its outputs.
+
+    Raises ValueError for an invalid reference_channel / tf_align_mode.
+    """
+    pa = config.get('pre_align_params', {})
+    dp = config.get('detection_params', {})
+    zl = config.get('z_linker', {})
+    soma_ids = [ch['id'] for ch in routing_config if ch.get('type', 'soma') == 'soma']
+    tf_ids   = [ch['id'] for ch in routing_config if ch.get('type') == 'tf']
+
+    ref = pa.get('reference_channel') or (soma_ids[0] if soma_ids else None)
+    if soma_ids and ref not in soma_ids:
+        raise ValueError(f"❌ pre_align_params.reference_channel='{ref}' 不是已激活的 soma 通道 {soma_ids}")
+    mode = pa.get('tf_align_mode', 'chain')
+    if mode not in ('chain', 'direct'):
+        raise ValueError(f"❌ pre_align_params.tf_align_mode='{mode}'，只能是 'chain' 或 'direct'")
+
+    def _z_link(p):
+        return {'iou_thresh': p.get('iou_thresh', 0.35), 'min_z_layers': p.get('min_z_layers', 1),
+                'max_cell_z_span': p.get('max_cell_z_span', 5), 'max_z_gap': p.get('max_z_gap', 0)}
+
+    zl_tf = zl.get('tf', {})
+    return {
+        'reference_channel': ref,
+        'tf_align_mode': mode,
+        # compute_tile_channel_shifts treats soma_ch_ids[0] as the reference (stable sort)
+        'soma_ch_ids': sorted(soma_ids, key=lambda c: c != ref),
+        'tf_ch_ids': tf_ids,
+        'z_link': {'soma': _z_link(zl.get('soma', {})), 'tf': _z_link(zl_tf)},
+        'sample_z_center_count': pa.get('sample_z_center_count', 50),
+        'voxel_bin_size_px': pa.get('voxel_bin_size_px', 4),
+        'xy_search_range_px': pa.get('xy_search_range_px', 30),
+        'z_search_range_slices': pa.get('z_search_range_slices', 5),
+        'xy_fine_search_px': pa.get('xy_fine_search_px', 8),
+        'z_fine_search_slices': pa.get('z_fine_search_slices', 2),
+        'xy_resolution_um': dp.get('xy_resolution_um', 0.65),
+        'z_resolution_um': dp.get('z_resolution_um', 8.0),
+        'max_center_dist_ratio': zl_tf.get('max_center_dist_ratio', 0.3),
+        'containment_z_pad': zl_tf.get('containment_z_pad', 0),
+    }
+
+
+def check_align_settings(align_dir, settings):
+    """
+    Refuse to reuse alignment outputs produced with different settings.
+
+    apply_shift_to_csv outputs are never overwritten, so re-running Stage 2.5 with
+    changed settings would silently mix old and new shifts.
+    Returns True when saved settings match, False when there is nothing to compare
+    (fresh directory, or legacy outputs from before settings were saved — logged).
+    Raises ValueError on a mismatch.
+    """
+    path = os.path.join(align_dir, ALIGN_SETTINGS_FILE)
+    if os.path.isfile(path):
+        with open(path, encoding='utf-8') as f:
+            saved = json.load(f)
+        current = json.loads(json.dumps(settings))
+        if saved != current:
+            changed = sorted(k for k in set(saved) | set(current) if saved.get(k) != current.get(k))
+            details = "; ".join(f"{k}: {saved.get(k)!r} -> {current.get(k)!r}" for k in changed)
+            raise ValueError(
+                f"❌ 对齐设置与 {align_dir} 里已有的结果不一致（{details}）。"
+                f"已有的对齐 CSV 不会被覆盖，请删除该目录后重跑 Stage 2.5。"
+            )
+        return True
+    if os.path.isdir(align_dir) and any(f.endswith(('_result.csv', '_offsets.json'))
+                                        for f in os.listdir(align_dir)):
+        logging.warning(f"⚠️ {align_dir} 已有对齐结果但没有 {ALIGN_SETTINGS_FILE}（旧版本生成），"
+                        f"无法校验参数是否一致；如果改过对齐参数，请删除该目录后重跑。")
+    return False
+
+
+def save_align_settings(align_dir, settings):
+    """Write the resolved settings next to the alignment outputs."""
+    os.makedirs(align_dir, exist_ok=True)
+    with open(os.path.join(align_dir, ALIGN_SETTINGS_FILE), 'w', encoding='utf-8') as f:
+        json.dump(settings, f, indent=2, ensure_ascii=False)

@@ -45,17 +45,27 @@ Runs on images already aligned by numorph + TeraStitcher. Reads per-channel alig
 ### `pre_align`
 Runs on raw unaligned images. After per-tile detection, inserts a **Stage 2.5** point-cloud alignment step that computes per-tile XYZ channel offsets (replacing numorph), then continues with the same downstream pipeline.
 
-Two-step alignment strategy:
+The reference channel is `pre_align_params.reference_channel` (must be a soma channel; defaults to the first soma channel in `channels_routing`). Other soma channels are aligned to it by voxel IoU. TF channels are aligned according to `pre_align_params.tf_align_mode`:
+
+`"chain"` (default):
 ```
-Step 1a: align secondary soma channels (GFP) → reference soma (RFP)
-Step 1b: align secondary TF channels (Olig2) → reference TF (Sox9)
-Step 2:  align reference TF (Sox9)           → reference soma (RFP)
+Step 1a: align other soma channels (RFP)      → reference soma (GFP)
+Step 1b: align other TF channels (Olig2)      → first TF (Sox9)
+Step 2:  align first TF (Sox9)                → reference soma (GFP)   [containment]
 
 Final offsets:
-  RFP:   (0, 0, 0)              ← global reference
-  GFP:   step-1a shift
+  GFP:   (0, 0, 0)              ← global reference
+  RFP:   step-1a shift
   Sox9:  step-2 shift
   Olig2: step-1b shift + step-2 ← chained
+```
+
+`"direct"`: every TF channel is aligned independently to the reference soma by containment (no TF-to-TF step). Use this when the TF markers label different cell populations (e.g. Sox9 vs Olig2), where TF-to-TF overlap is too sparse to align on.
+```
+  GFP:   (0, 0, 0)              ← global reference
+  RFP:   voxel-IoU shift → GFP
+  Sox9:  containment shift → GFP
+  Olig2: containment shift → GFP
 ```
 
 Z-search is soft-capped at ±5 slices (warning if exceeded) and hard-capped at ±10 (forced to 0).
@@ -149,6 +159,8 @@ Use `3` to re-run only colocalization and downstream steps without re-running de
 ### `pre_align_params` *(pre_align mode only)*
 | Key | Default | Description |
 |-----|---------|-------------|
+| `reference_channel` | first soma channel | Soma channel every other channel is shifted onto |
+| `tf_align_mode` | `"chain"` | `"chain"`: TF-N → first TF → reference; `"direct"`: each TF → reference independently (see [pre_align](#pre_align)) |
 | `sample_z_center_count` | 50 | Z slices from tile center used to build alignment point cloud |
 | `voxel_bin_size_px` | 4 | Voxel bin size for 3D FFT alignment (px); smaller = more precise but slower |
 | `xy_search_range_px` | 30 | FFT coarse-search XY radius (px) |
@@ -249,7 +261,8 @@ Additional tf-only keys:
 ```text
 pATHRESULT/
 ├── 0_channel_alignment/         # [pre_align only] per-tile offset JSONs + aligned CSVs
-│   └── _align_done.flag         # checkpoint: alignment complete
+│   ├── _align_settings.json     # resolved alignment settings; a re-run with different settings stops and asks you to delete this folder
+│   └── _align_done.flag         # checkpoint: alignment complete (not written if any detection CSV is missing)
 ├── 1_tile_2d_raw/               # Per-tile 2D detection CSVs (one file per tile×channel)
 ├── 1_tile_2d_filtered/          # Same CSVs after size/intensity filtering (Stage 2.75 output)
 ├── 2_global_2d_raw/             # Globally stitched 2D detections (one CSV per channel)

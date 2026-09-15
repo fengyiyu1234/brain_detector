@@ -32,6 +32,7 @@ from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_containm
 from src.core.point_cloud_aligner import (
     compute_tile_channel_shifts,
     apply_shift_to_csv, save_tile_offsets,
+    resolve_align_settings, check_align_settings, save_align_settings,
 )
 
 
@@ -96,6 +97,15 @@ if __name__ == '__main__':
         
     anchor_ch = routing_config[0]
     anchor_dir = paths.get(anchor_ch['dir_key'])
+
+    # 2a. pre_align 对齐设置：在检测之前解析并校验，免得配置写错、或与已有对齐结果不一致，
+    #     要等检测跑完才报错。
+    align_settings = None
+    if pipeline_mode == 'pre_align':
+        align_settings = resolve_align_settings(config, routing_config)
+        check_align_settings(derived['pATH_ALIGN_OFFSETS'], align_settings)
+        logging.info(f"Pre-align 参考通道: {align_settings['reference_channel']}，"
+                     f"TF 对齐方式: {align_settings['tf_align_mode']}")
 
     # 2b. 展开 double_exposure 通道，得到检测阶段(Stage 2)专用的路由列表（含合成的第二曝光通道）。
     # Stage 2 之后的所有阶段（2.5 部分、2.75、3、4）继续使用未展开的 routing_config——
@@ -185,24 +195,22 @@ if __name__ == '__main__':
             logging.info("阶段 2.5: 开始点云通道对齐 (pre_align 模式)...")
             os.makedirs(derived['pATH_ALIGN_OFFSETS'], exist_ok=True)
 
+            save_align_settings(derived['pATH_ALIGN_OFFSETS'], align_settings)
+
             routing_cfg_align = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
-            soma_ch_ids_align = [ch['id'] for ch in routing_cfg_align if ch.get('type', 'soma') == 'soma']
-            tf_ch_ids_align   = [ch['id'] for ch in routing_cfg_align if ch.get('type') == 'tf']
-
-            zl_pre   = config.get('z_linker', {})
-            zl_soma  = zl_pre.get('soma', {})
-            zl_tf    = zl_pre.get('tf', {})
-
-            pa_sample_z      = pre_align_cfg.get('sample_z_center_count', 50)
-            pa_bin_size      = pre_align_cfg.get('voxel_bin_size_px', 4)
-            pa_xy_range      = pre_align_cfg.get('xy_search_range_px', 30)
-            pa_z_range       = pre_align_cfg.get('z_search_range_slices', 5)
-            pa_fine_xy       = pre_align_cfg.get('xy_fine_search_px', 8)
-            pa_fine_z        = pre_align_cfg.get('z_fine_search_slices', 2)
-            pa_xy_res        = dp.get('xy_resolution_um', 0.65)
-            pa_z_res         = dp.get('z_resolution_um', 8.0)
-            pa_max_center_dist_ratio = zl_tf.get('max_center_dist_ratio', 0.3)
-            pa_containment_z_pad     = zl_tf.get('containment_z_pad', 0)
+            soma_ch_ids_align        = align_settings['soma_ch_ids']   # 参考通道已排在第一位
+            tf_ch_ids_align          = align_settings['tf_ch_ids']
+            pa_sample_z              = align_settings['sample_z_center_count']
+            pa_bin_size              = align_settings['voxel_bin_size_px']
+            pa_xy_range              = align_settings['xy_search_range_px']
+            pa_z_range               = align_settings['z_search_range_slices']
+            pa_fine_xy               = align_settings['xy_fine_search_px']
+            pa_fine_z                = align_settings['z_fine_search_slices']
+            pa_xy_res                = align_settings['xy_resolution_um']
+            pa_z_res                 = align_settings['z_resolution_um']
+            pa_max_center_dist_ratio = align_settings['max_center_dist_ratio']
+            pa_containment_z_pad     = align_settings['containment_z_pad']
+            missing_csvs = []   # 缺失的检测 CSV；有缺失就不写完成标记
 
             for tile_path in tqdm(pATHTILE, desc="Pre-Align Tiles"):
                 tile_name = os.path.split(tile_path)[-1]
@@ -220,6 +228,7 @@ if __name__ == '__main__':
                     ctype = ch.get('type', 'soma')
                     csv_path = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_{cid}_result.csv")
                     if not os.path.isfile(csv_path):
+                        missing_csvs.append(csv_path)
                         per_ch_vol_lists[cid] = []
                         continue
                     df_tile = pd.read_csv(csv_path)
@@ -230,14 +239,8 @@ if __name__ == '__main__':
                     mat = df_tile[["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]].values
                     mat[:, 6] = np.array([f"{v}_{cid}" for v in mat[:, 6]])
 
-                    zl_params = zl_soma if ctype == 'soma' else zl_tf
                     _, vol_list = run_z_linker(
-                        mat,
-                        iou_thresh=zl_params.get('iou_thresh', 0.35),
-                        min_z_layers=zl_params.get('min_z_layers', 1),
-                        max_cell_z_span=zl_params.get('max_cell_z_span', 5),
-                        max_z_gap=zl_params.get('max_z_gap', 0),
-                    )
+                        mat, **align_settings['z_link']['soma' if ctype == 'soma' else 'tf'])
                     per_ch_vol_lists[cid] = vol_list
                     if vol_list:
                         z_counts.extend([c.get('cz', 0) for c in vol_list])
@@ -262,6 +265,7 @@ if __name__ == '__main__':
                     fine_z_slices=pa_fine_z,
                     max_center_dist_ratio=pa_max_center_dist_ratio,
                     containment_z_pad=pa_containment_z_pad,
+                    tf_align_mode=align_settings['tf_align_mode'],
                 )
 
                 # 3b. double_exposure 通道的第二曝光复用主曝光的偏移量
@@ -292,6 +296,11 @@ if __name__ == '__main__':
                         if os.path.isfile(in_csv2) and not os.path.isfile(out_csv2):
                             apply_shift_to_csv(in_csv2, dx2, dy2, dz2, out_csv2, slice_names=slice_names)
 
+            if missing_csvs:
+                raise RuntimeError(
+                    f"❌ [2.5] {len(missing_csvs)} 个检测 CSV 缺失，对齐结果不完整，未写完成标记。"
+                    f"请先补齐 Stage 2 检测后重跑。示例: {missing_csvs[:3]}"
+                )
             # 写完成标记
             open(align_done_flag, 'w').close()
             logging.info("✔️ [2.5] 所有 Tile 点云对齐完成。")
