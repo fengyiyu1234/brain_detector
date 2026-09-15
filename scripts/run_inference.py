@@ -34,6 +34,42 @@ from src.core.point_cloud_aligner import (
     apply_shift_to_csv, save_tile_offsets,
     resolve_align_settings, check_align_settings, save_align_settings,
 )
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
+
+
+def run_detection_pool(tasks, num_processes, initializer, initargs, task_fn):
+    """并行执行 tile 检测；任何 worker 出错或异常退出时立即终止，而不是卡住。
+
+    旧实现用 mp.Pool：worker 初始化失败或进程崩溃（如 CUDA 库加载失败、内存不足）时，Pool 会不断
+    补新 worker，新 worker 在 init_worker 里从已经空了的 gpu_queue 取卡号时永久阻塞，作业空占 GPU 到超时。
+    ProcessPoolExecutor 遇到 worker 异常退出会把池标记为 broken、让所有 future 报错；这里再取消排队
+    任务、终止仍在运行的 worker，把异常抛出去，作业随即以非零状态退出。
+    已写完的 tile CSV 会保留（worker 先写 .part 再改名），修复问题后重新提交即可续跑。
+    """
+    pool = ProcessPoolExecutor(max_workers=num_processes, mp_context=mp.get_context('spawn'),
+                               initializer=initializer, initargs=initargs)
+    futures = {pool.submit(task_fn, t): os.path.basename(t[1]) for t in tasks}
+    try:
+        with tqdm(total=len(futures), desc="Tile Processing", position=0, leave=True) as pbar:
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except BrokenProcessPool:
+                    logging.error("❌ 检测 worker 进程异常退出（初始化失败或被杀，例如 CUDA 库加载失败、"
+                                  "内存不足），终止作业。已完成的 tile 保留，修复后重新提交即可续跑。")
+                    raise
+                except Exception:
+                    logging.exception(f"❌ Tile {futures[fut]} 检测出错，终止作业。")
+                    raise
+                pbar.update(1)
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        for p in list((getattr(pool, '_processes', None) or {}).values()):
+            if p.is_alive():
+                p.terminate()
+        raise
+    pool.shutdown(wait=True)
 
 
 if __name__ == '__main__':
@@ -173,10 +209,8 @@ if __name__ == '__main__':
         gpu_queue = mp.Queue()
         for _i in range(num_gpus):
             gpu_queue.put(_i)
-        with mp.Pool(processes=num_processes, initializer=init_worker, initargs=(config, gpu_queue)) as pool:
-            with tqdm(total=len(tasks_to_run), desc="Tile Processing", position=0, leave=True) as pbar:
-                for _ in pool.imap_unordered(process_single_tile_wrapper, tasks_to_run):
-                    pbar.update(1)
+        run_detection_pool(tasks_to_run, num_processes, init_worker, (config, gpu_queue),
+                           process_single_tile_wrapper)
     else:
         logging.info("✔️ Checkpoint 1 达成: 所有 Tile 检测完成。")
 
