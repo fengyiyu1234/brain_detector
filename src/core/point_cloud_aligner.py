@@ -620,12 +620,18 @@ def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
 # 8.  Apply shift to a per-tile detection CSV
 # ──────────────────────────────────────────────────────────────────────────────
 
-def apply_shift_to_csv(in_csv_path, dx, dy, dz, out_csv_path):
+def apply_shift_to_csv(in_csv_path, dx, dy, dz, out_csv_path, slice_names=None):
     """
     Add (dx, dy) to bbox columns and dz to z column of a detection CSV.
 
     CSV columns expected: slice_name, x1, y1, x2, y2, class, score, mean, z
     Sign convention: aligned_coord = raw_coord + shift  (same as visualizer).
+
+    slice_names : optional list of the tile's slice names (no extension) in z
+                  order, so z (1-based) <-> slice_names[z - 1]. When given and
+                  dz != 0, slice_name is rewritten to match the shifted z. Rows
+                  shifted outside [1, len(slice_names)] get an empty slice_name
+                  (Stage 3 drops them anyway: they fall outside the stitched z range).
     """
     if not os.path.exists(in_csv_path):
         return
@@ -642,7 +648,10 @@ def apply_shift_to_csv(in_csv_path, dx, dy, dz, out_csv_path):
         if col in df.columns:
             df[col] = df[col].astype(float) + dy
     if 'z' in df.columns:
-        df['z'] = df['z'].astype(float) + dz
+        df['z'] = df['z'].astype(int) + int(dz)
+        if dz != 0 and slice_names is not None and 'slice_name' in df.columns:
+            n = len(slice_names)
+            df['slice_name'] = [slice_names[z - 1] if 1 <= z <= n else '' for z in df['z']]
 
     os.makedirs(os.path.dirname(out_csv_path), exist_ok=True)
     df.to_csv(out_csv_path, index=False)

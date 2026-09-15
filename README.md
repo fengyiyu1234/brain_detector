@@ -71,7 +71,6 @@ Z-search is soft-capped at ±5 slices (warning if exceeded) and hard-capped at �
 | 2.75 | Per-tile bbox size/intensity filtering | `1_tile_2d_filtered/<tile>_<ch>_result.csv` |
 | 3 | Global stitching → Z-linking → 3D colocalization | `4_colocalization/coloc_result.csv` |
 | 4 | Per-class centroid files + summary statistics | `5_analysis_report/global_summary_statistics.csv` |
-| 5 | Colocalization permutation test | `5_analysis_report/colocalization_significance.csv` |
 
 Each stage is a **linear checkpoint**: if its output already exists, it is skipped automatically. To re-run a stage, delete its checkpoint file/folder.
 
@@ -140,6 +139,9 @@ Use `3` to re-run only colocalization and downstream steps without re-running de
 
 ### `stop_after_detection`
 `true` = exit immediately after Stage 2 (tile detection). Useful to run GPU-heavy detection on HPC, then run the CPU-only stages locally.
+
+### `stop_before_stitching`
+`true` = run all per-tile stages (detection, 2.5 alignment, 2.6 fusion, 2.75 filtering, 2.8 histograms), then exit before Stage 3. None of these stages need the TeraStitcher XML, so a sample whose stitching isn't finished yet can be processed up to here; set back to `false` once `xml_merging.xml` exists and re-run — finished stages are skipped by their checkpoints. The XML is looked up from `paths.pATHXML` first, then `xml_merging.xml` / `xml_import.xml` in the anchor channel directory.
 
 ### `ENABLE_Z_LINKER`
 `true` (default) = run Z-axis tracking. `false` = output raw 2D detections only.
@@ -218,13 +220,6 @@ Additional tf-only keys:
 | `normalize_PERCENTILE_LOW` | 0.1 | Lower percentile for 16-bit → 8-bit stretch |
 | `normalize_PERCENTILE_HIGH` | 99.9 | Upper percentile |
 
-**Permutation test:**
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `n_permutations` | 100 | Permutation iterations for colocalization significance |
-| `max_soma_sample` | 50000 | Max soma count sampled per permutation run |
-
 **YOLO-specific filters** (`detection_params.yolo`):
 
 | Key | Default | Description |
@@ -266,7 +261,6 @@ pATHRESULT/
 │   └── <class>.csv              # Per-class split of coloc_result.csv
 └── 5_analysis_report/
     ├── global_summary_statistics.csv
-    ├── colocalization_significance.csv   # Permutation test p-values per TF marker
     └── cell_centroids/
         └── <class>_centroids.csv         # Physical centroids (µm) per cell class
 ```

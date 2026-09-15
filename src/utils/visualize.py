@@ -1376,9 +1376,10 @@ def _make_fn_recorder(vis_cfg, paths, routing_config, anchor_dir, tile_path,
             crop_note = "  (no crop — select a single [img] layer first)"
         elif crop_dir:
             o = offsets.get(ch_tag, {})
-            z_f = z_abs + o.get('dz', 0)
-            x_f = x + o.get('dx', 0)
-            y_f = y + o.get('dy', 0)
+            # 视图里是平移后的图像（对齐坐标 = 原始坐标 + shift），裁图读的是原始 TIFF，所以减去 shift
+            z_f = z_abs - o.get('dz', 0)
+            x_f = x - o.get('dx', 0)
+            y_f = y - o.get('dy', 0)
             out_path, note = _save_fn_crop(crop_dir, ch_dirs.get(ch_tag, ''),
                                            z_f, x_f, y_f, crop_size, ch_tag)
             if out_path:

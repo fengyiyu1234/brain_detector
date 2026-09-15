@@ -338,11 +338,17 @@ def process_single_tile(i, pATHTEST, config):
 
     file_handles = {}
     csv_writers = {}
+    part_paths = {}   # ch_id -> (临时 .part 路径, 正式 CSV 路径)
+    tile_ok = False
 
     for ch in channels_to_run:
         ch_id = ch['id']
         ch_csv_path = os.path.join(derived['pATH_DET_RES'], f"{dir_name}_{ch_id}_result.csv")
-        f_ch = open(ch_csv_path, 'w', newline='', encoding='utf-8')
+        # 先写 .part，整个 tile 成功后才改名为正式 CSV（见函数末尾）。checkpoint 只看正式 CSV 是否存在：
+        # 直接写正式文件的话，作业在 tile 中途被 LSF 墙钟杀掉或抛异常，会留下只有表头的 CSV，
+        # 重跑时该 tile 被当成"已完成"静默跳过。
+        part_paths[ch_id] = (ch_csv_path + '.part', ch_csv_path)
+        f_ch = open(ch_csv_path + '.part', 'w', newline='', encoding='utf-8')
         file_handles[ch_id] = f_ch
         csv_writers[ch_id] = csv.writer(f_ch)
         
@@ -383,13 +389,9 @@ def process_single_tile(i, pATHTEST, config):
                     pbar.set_description(f"Tile:[{dir_name[:10]}] | Z层:[{current_z_real}/{len(testnames_no_ext)}] | 检测通道:[{ch_id}]")
                     ch_model = ch['model']
 
-                    # --- 获取预取数据并维持流水线运转 ---
-                    future = prefetch_futures.get((z_idx, ch_id))
-                    if future is None: continue
-                    img_raw = future.result()
-                    del prefetch_futures[(z_idx, ch_id)]
-                    if img_raw is None: continue
-
+                    # --- 先续上预取流水线，再取当前层 ---
+                    # 续预取必须放在下面两个 continue 之前：否则某层缺图/读图失败时 z+8 永远不会被提交，
+                    # 进而 z+16、z+24… 链式丢失，该通道从此每 8 层静默少一层。
                     future_z_idx = z_idx + PREFETCH_DEPTH
                     if future_z_idx < len(testnames_no_ext):
                         future_name = testnames_no_ext[future_z_idx]
@@ -398,6 +400,11 @@ def process_single_tile(i, pATHTEST, config):
                             prefetch_futures[(future_z_idx, ch_id)] = downloader_pool.submit(fast_cloud_read, future_img_path)
                         else:
                             prefetch_futures[(future_z_idx, ch_id)] = None
+
+                    future = prefetch_futures.pop((z_idx, ch_id), None)
+                    if future is None: continue
+                    img_raw = future.result()
+                    if img_raw is None: continue
 
                     # --- GPU 推理图像预处理 ---
                     if len(img_raw.shape) == 3: img_raw = img_raw[:, :, 0]
@@ -493,11 +500,19 @@ def process_single_tile(i, pATHTEST, config):
 
         # --- 3. Per-tile filter and write ---
         _write_filtered_detections(det_buf, csv_writers, dp, ch_routing_map)
+        tile_ok = True
 
     finally:
         for f in file_handles.values():
             f.close()
         pbar.close()
+        if not tile_ok:
+            for part_path, _ in part_paths.values():
+                if os.path.exists(part_path):
+                    os.remove(part_path)
+
+    for part_path, final_path in part_paths.values():
+        os.replace(part_path, final_path)
     
     # =========================================================
     # 步骤 6: 彻底移除局部统计，仅做内存清理与退出

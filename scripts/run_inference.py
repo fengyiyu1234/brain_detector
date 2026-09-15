@@ -28,8 +28,7 @@ from src.core.worker import process_single_tile_wrapper, init_worker
 from src.core.stitcher import combine_predictions, fuse_dual_intensity_2d
 from src.core.z_linker import run_z_linker
 from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_containment,
-                               permutation_test_colocalization, _merge_class,
-                               suppress_cross_class_overlap)
+                               _merge_class, suppress_cross_class_overlap)
 from src.core.point_cloud_aligner import (
     compute_tile_channel_shifts,
     apply_shift_to_csv, save_tile_offsets,
@@ -99,7 +98,7 @@ if __name__ == '__main__':
     anchor_dir = paths.get(anchor_ch['dir_key'])
 
     # 2b. 展开 double_exposure 通道，得到检测阶段(Stage 2)专用的路由列表（含合成的第二曝光通道）。
-    # Stage 2 之后的所有阶段（2.5 部分、2.75、3、4、5）继续使用未展开的 routing_config——
+    # Stage 2 之后的所有阶段（2.5 部分、2.75、3、4）继续使用未展开的 routing_config——
     # 融合(Stage 2.6)之后两个曝光就是同一个逻辑通道了。
     detect_routing_config = expand_double_exposure_channels(routing_config)
     config['channels_routing_detect'] = detect_routing_config
@@ -141,60 +140,8 @@ if __name__ == '__main__':
     target_indices = list(range(sTARTID - 1, eNDID))
     pATHTILE = [pATHTILE_all[i] for i in target_indices]
 
-    # 5. 加载 TeraStitcher XML
-    #    查找优先级: paths.pATHXML(显式) > anchor_dir/xml_merging.xml > anchor_dir/xml_import.xml
-    #
-    #    为什么要能显式指定：拼接位移是在参考通道（如 730nm 自发荧光）上算出来的，检测通道目录里
-    #    未必有这份 XML、或者放着一份 ABS_D 全为 0 的旧版本。细胞坐标必须和「真正 merge 出注册用
-    #    全脑图像」的那份 XML 共用同一套 ABS_H/ABS_V/ABS_D，否则 z 会按 tile 错位。
-    tile_size = dp.get('tILESIZE', 2048)
-    xml_candidates = []
-    if paths.get('pATHXML'):
-        xml_candidates.append(paths['pATHXML'])
-    xml_candidates += [os.path.join(anchor_dir, n) for n in ('xml_merging.xml', 'xml_import.xml')]
-    pATHxml = next((p for p in xml_candidates if os.path.isfile(p)), None)
-
-    if pATHxml:
-        dir_dict, H, W, Z, z_start, disp_mat_fin = loadTeraxml(pATHxml, tile_size)
-        _absd = disp_mat_fin[:, :, 2]
-        _dmin, _dmax = _absd.min(), _absd.max()
-        logging.info(f"✔️ 已加载 TeraStitcher XML: {pATHxml}")
-        logging.info(f"  画布 W×H = {W}×{H}, Z = {Z}, z_start = {z_start}, "
-                     f"ABS_D 范围 = [{_dmin}, {_dmax}]")
-        if _dmin == _dmax:
-            logging.warning(
-                f"⚠️ 这份 XML 的 ABS_D 全部等于 {_dmin}，即没有任何 z 方向拼接位移，"
-                f"于是 Z = stack_slices、每个 tile 的 z0 都是 0。若注册用的全脑图像是用带 z 位移的 "
-                f"XML merge 出来的，细胞 z 会逐 tile 错位（错位量 = ABS_D − max(ABS_D)）。"
-                f"请确认这份 XML 就是 merge 出那张图的同一份。"
-            )
-    elif dp.get('allow_grid_fallback', False):
-        # 回退：从 tile 目录名解析行列号，用均匀 Grid 推算全局偏移。
-        # 这是均匀网格，拿不到 TeraStitcher 逐 tile 的真实位移——行/列间距会有十几像素的系统
-        # 偏差，跨整个网格累积可达上百像素。只适合没有拼接结果时的探索性跑批。
-        overlap_pct = pre_align_cfg.get('tile_overlap_pct', 15)
-        logging.warning("⚠️ 未找到任何 TeraStitcher XML，allow_grid_fallback=true，"
-                        "回退到文件名解析的【均匀网格】全局偏移。")
-        logging.warning("   这套坐标不等于真实拼接坐标，不要用它做配准/图谱定量。已尝试的路径：")
-        for _p in xml_candidates:
-            logging.warning(f"     - {_p}")
-        dir_dict, disp_mat_fin = compute_grid_fallback_offsets(
-            pATHTILE_all, tile_size, overlap_pct, xy_res_um=dp.get('xy_resolution_um', 0.65)
-        )
-        logging.info(f"  解析到 {len(dir_dict)} 个 tile，网格 {disp_mat_fin.shape[0]}×{disp_mat_fin.shape[1]}")
-        H = disp_mat_fin[:, :, 1].max() + tile_size
-        W = disp_mat_fin[:, :, 0].max() + tile_size
-        Z = len(os.listdir(pATHTILE_all[0])) if pATHTILE_all else 1
-        z_start = 0
-    else:
-        raise FileNotFoundError(
-            "❌ 找不到 TeraStitcher 拼接坐标文件，已尝试：\n"
-            + "\n".join(f"    - {p}" for p in xml_candidates)
-            + "\n  请在 config 的 paths 里加 \"pATHXML\" 指向 merge 出注册用图像的那份 "
-              "xml_merging.xml，或确认 anchor 通道目录下存在该文件。\n"
-              "  （若确实要用文件名推算的均匀网格跑，设 detection_params.allow_grid_fallback=true，"
-              "但那套坐标不能用于配准。）"
-        )
+    # 5. TeraStitcher XML 只有 Stage 3 全局拼接才用到，加载放在 Stage 3 之前，
+    #    这样拼接尚未完成的样本也能先跑检测 + tile 级对齐/过滤。
 
     # ==========================================
     # 阶段 2: 线性 Checkpoint - Tile 级别检测 
@@ -259,6 +206,11 @@ if __name__ == '__main__':
 
             for tile_path in tqdm(pATHTILE, desc="Pre-Align Tiles"):
                 tile_name = os.path.split(tile_path)[-1]
+                # 与 worker 相同的切片排序：CSV 里的 z（从 1 开始）对应 slice_names[z-1]，
+                # apply_shift_to_csv 施加 dz 时据此同步更新 slice_name
+                slice_names = [os.path.splitext(f)[0] for f in sorted(
+                    f for f in os.listdir(tile_path)
+                    if f.lower().endswith(('.tif', '.tiff')) and not f.startswith('.'))]
 
                 # 1. 对每个通道轻量 z-link，得到 per-tile 3D vol_list
                 per_ch_vol_lists = {}
@@ -330,7 +282,7 @@ if __name__ == '__main__':
                     in_csv  = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_{cid}_result.csv")
                     out_csv = os.path.join(derived['pATH_ALIGN_OFFSETS'], f"{tile_name}_{cid}_result.csv")
                     if os.path.isfile(in_csv) and not os.path.isfile(out_csv):
-                        apply_shift_to_csv(in_csv, dx, dy, dz, out_csv)
+                        apply_shift_to_csv(in_csv, dx, dy, dz, out_csv, slice_names=slice_names)
 
                     if ch.get('double_exposure'):
                         second_id = ch['second_intensity_id']
@@ -338,7 +290,7 @@ if __name__ == '__main__':
                         in_csv2  = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_{second_id}_result.csv")
                         out_csv2 = os.path.join(derived['pATH_ALIGN_OFFSETS'], f"{tile_name}_{second_id}_result.csv")
                         if os.path.isfile(in_csv2) and not os.path.isfile(out_csv2):
-                            apply_shift_to_csv(in_csv2, dx2, dy2, dz2, out_csv2)
+                            apply_shift_to_csv(in_csv2, dx2, dy2, dz2, out_csv2, slice_names=slice_names)
 
             # 写完成标记
             open(align_done_flag, 'w').close()
@@ -599,14 +551,75 @@ if __name__ == '__main__':
         logging.info(f"✔️ [2.8] 直方图输出至: {_hist_dir}")
 
     # ==========================================
+    # 可选停止点：tile 级阶段（检测 / 2.5 对齐 / 2.6 融合 / 2.75 过滤 / 2.8 直方图）都不需要
+    # TeraStitcher XML。拼接还没做完的样本设 stop_before_stitching=true 先跑到这里；
+    # 拼接完成后改回 false 重跑，前面各阶段按 checkpoint 自动跳过，从 Stage 3 继续。
+    # ==========================================
+    if config.get('stop_before_stitching', False):
+        logging.info("🛑 stop_before_stitching=true：tile 级阶段（检测/对齐/过滤）已完成，"
+                     "在需要 XML 的全局拼接之前退出。拼接完成后改为 false 重跑即可。")
+        sys.exit(0)
+
+    # 加载 TeraStitcher XML
+    #    查找优先级: paths.pATHXML(显式) > anchor_dir/xml_merging.xml > anchor_dir/xml_import.xml
+    #
+    #    为什么要能显式指定：拼接位移是在参考通道（如 730nm 自发荧光）上算出来的，检测通道目录里
+    #    未必有这份 XML、或者放着一份 ABS_D 全为 0 的旧版本。细胞坐标必须和「真正 merge 出注册用
+    #    全脑图像」的那份 XML 共用同一套 ABS_H/ABS_V/ABS_D，否则 z 会按 tile 错位。
+    tile_size = dp.get('tILESIZE', 2048)
+    xml_candidates = []
+    if paths.get('pATHXML'):
+        xml_candidates.append(paths['pATHXML'])
+    xml_candidates += [os.path.join(anchor_dir, n) for n in ('xml_merging.xml', 'xml_import.xml')]
+    pATHxml = next((p for p in xml_candidates if os.path.isfile(p)), None)
+
+    if pATHxml:
+        dir_dict, H, W, Z, z_start, disp_mat_fin = loadTeraxml(pATHxml, tile_size)
+        _absd = disp_mat_fin[:, :, 2]
+        _dmin, _dmax = _absd.min(), _absd.max()
+        logging.info(f"✔️ 已加载 TeraStitcher XML: {pATHxml}")
+        logging.info(f"  画布 W×H = {W}×{H}, Z = {Z}, z_start = {z_start}, "
+                     f"ABS_D 范围 = [{_dmin}, {_dmax}]")
+        if _dmin == _dmax:
+            logging.warning(
+                f"⚠️ 这份 XML 的 ABS_D 全部等于 {_dmin}，即没有任何 z 方向拼接位移，"
+                f"于是 Z = stack_slices、每个 tile 的 z0 都是 0。若注册用的全脑图像是用带 z 位移的 "
+                f"XML merge 出来的，细胞 z 会逐 tile 错位（错位量 = ABS_D − max(ABS_D)）。"
+                f"请确认这份 XML 就是 merge 出那张图的同一份。"
+            )
+    elif dp.get('allow_grid_fallback', False):
+        # 回退：从 tile 目录名解析行列号，用均匀 Grid 推算全局偏移。
+        # 这是均匀网格，拿不到 TeraStitcher 逐 tile 的真实位移——行/列间距会有十几像素的系统
+        # 偏差，跨整个网格累积可达上百像素。只适合没有拼接结果时的探索性跑批。
+        overlap_pct = pre_align_cfg.get('tile_overlap_pct', 15)
+        logging.warning("⚠️ 未找到任何 TeraStitcher XML，allow_grid_fallback=true，"
+                        "回退到文件名解析的【均匀网格】全局偏移。")
+        logging.warning("   这套坐标不等于真实拼接坐标，不要用它做配准/图谱定量。已尝试的路径：")
+        for _p in xml_candidates:
+            logging.warning(f"     - {_p}")
+        dir_dict, disp_mat_fin = compute_grid_fallback_offsets(
+            pATHTILE_all, tile_size, overlap_pct, xy_res_um=dp.get('xy_resolution_um', 0.65)
+        )
+        logging.info(f"  解析到 {len(dir_dict)} 个 tile，网格 {disp_mat_fin.shape[0]}×{disp_mat_fin.shape[1]}")
+        H = disp_mat_fin[:, :, 1].max() + tile_size
+        W = disp_mat_fin[:, :, 0].max() + tile_size
+        Z = len(os.listdir(pATHTILE_all[0])) if pATHTILE_all else 1
+        z_start = 0
+    else:
+        raise FileNotFoundError(
+            "❌ 找不到 TeraStitcher 拼接坐标文件，已尝试：\n"
+            + "\n".join(f"    - {p}" for p in xml_candidates)
+            + "\n  请在 config 的 paths 里加 \"pATHXML\" 指向 merge 出注册用图像的那份 "
+              "xml_merging.xml，或确认 anchor 通道目录下存在该文件。\n"
+              "  （若确实要用文件名推算的均匀网格跑，设 detection_params.allow_grid_fallback=true，"
+              "但那套坐标不能用于配准。）"
+        )
+
+    # ==========================================
     # 阶段 3: 线性 Checkpoint - 全局拼接与 Z-Linker共定位
     # ==========================================
     bbox_path = os.path.join(derived['pATH_COLOCALIZATION'], "coloc_result.csv")
     final_results = None
-    soma_3d = None
-    tf_3d   = None
-    xy_res  = dp.get('xy_resolution_um', 0.65)
-    z_res   = dp.get('z_resolution_um', 8.0)
 
     if os.path.exists(bbox_path):
         logging.info(f"✔️ Checkpoint 2 达成: 加载已有的全局检测结果 {bbox_path}")
@@ -844,7 +857,6 @@ if __name__ == '__main__':
 
         soma_3d = (np.array(output_rows, dtype=object)
                    if output_rows else np.empty((0, 8), dtype=object))
-        tf_3d   = np.empty((0, 8), dtype=object)   # TF单阳性不输出
 
         out_coloc = os.path.join(derived['pATH_COLOCALIZATION'], 'coloc_result.csv')
         pd.DataFrame(soma_3d, columns=BOX_COLS).to_csv(out_coloc, index=False)
@@ -955,33 +967,5 @@ if __name__ == '__main__':
             
         logging.info(f"已生成所有 {len(combo_counts)} 种子类型的质心文件，保存在: {derived['pATH_CENTROIDS']}")
         logging.info("阶段 4 完成: 全局统计报告生成完毕。")
-
-    # ==========================================
-    # 阶段 5: 共定位置换检验 (统计显著性)
-    # ==========================================
-    perm_path = os.path.join(derived['pATH_REPORT'], "colocalization_significance.csv")
-
-    if os.path.exists(perm_path):
-        logging.info("✔️ Checkpoint 4 达成: 置换检验结果已存在。")
-    elif soma_3d is not None and tf_3d is not None and len(soma_3d) > 0 and len(tf_3d) > 0:
-        n_perm = dp.get('n_permutations', 1000)
-        logging.info(f"阶段 5: 开始共定位置换检验 (n={n_perm})，请稍候...")
-        perm_df = permutation_test_colocalization(
-            soma_3d, tf_3d,
-            xy_res=xy_res, z_res=z_res,
-            n_permutations=n_perm,
-            max_soma_sample=dp.get('max_soma_sample', 50_000),
-        )
-        if len(perm_df) > 0:
-            perm_df.to_csv(perm_path, index=False)
-            logging.info(f"✔️ 置换检验完成，结果保存至: {perm_path}")
-            for _, row in perm_df.iterrows():
-                sig = "显著" if row['significant_p05'] else "不显著"
-                logging.info(
-                    f"  [{row['tf_marker']}] 实际={row['pct_coloc_actual']}%  随机均值={row['pct_random_mean']}%"
-                    f"  z={row['z_score']}  p={row['p_value']}  {sig}"
-                )
-    else:
-        logging.warning("⚠️ 置换检验跳过：soma_3d/tf_3d 不在本次内存中。")
 
     logging.info(f"🎉 动态多通道推断全部完成！总耗时: {(time.time() - start_time)/60:.2f} 分钟。")
