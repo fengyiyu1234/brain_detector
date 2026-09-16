@@ -17,7 +17,8 @@ brain_detector/
 │   ├── train18_best_0515.pt      # YOLO soma detector
 │   └── 2D_versatile_fluo/        # StarDist TF nucleus detector
 ├── scripts/
-│   └── run_inference.py          # Main pipeline entrypoint
+│   ├── run_inference.py          # Main pipeline entrypoint
+│   └── validate_align_shifts.py  # Pre-align QC: overlap-vs-offset curves on held-out subvolumes
 ├── src/
 │   ├── config/
 │   │   └── loader.py             # JSON config loader (strips // comments)
@@ -69,6 +70,32 @@ Final offsets:
 ```
 
 Z-search is soft-capped at ±5 slices (warning if exceeded) and hard-capped at ±10 (forced to 0).
+
+#### Validating the computed offsets
+
+`scripts/validate_align_shifts.py` answers whether a tile's offsets are a real optimum or just one point in a noise floor: it re-measures cross-channel cell overlap on a **held-out** subvolume while walking the offset away from the stored solution along each axis. A trustworthy offset gives a peak at Δ=0; a flat curve — or a peak several pixels off — means that tile's offset is not supported by data the solver never saw.
+
+```bash
+python scripts/validate_align_shifts.py --sample /path/to/sample18 \
+    --n-tiles 8 --regions-per-tile 2 --workers 4
+```
+
+`--sample` takes the sample directory (or its `detection_results/` directly). Alignment parameters are read from `0_channel_alignment/_align_settings.json` when present, otherwise re-resolved from `runtime_config.json` (override with `--config`).
+
+**Held-out region.** Stage 2.5 solves on the full XY extent of the central z-window, so the only never-used data is z *outside* that window. The script recomputes each tile's `z_center` exactly as Stage 2.5 does, samples a z-slab outside `[z_center ± sample_z_center_count/2]` plus a `--z-guard` margin (default `max_cell_z_span + z_search_range_slices + z_fine_search_slices`, because `build_cell_boxes` keeps cells that merely *overlap* the window and those extend past its edges), then crops a random `--xy-size` square inside it. If a tile is too thin to avoid the window, the region is still used but flagged `held_out=False`.
+
+**Metrics**, swept one axis at a time (Δx varies while Δy/Δz stay at the optimum):
+
+| Metric | Channels | Matches the solver's objective for |
+|--------|----------|------------------------------------|
+| `voxel_iou` | all | intra-soma / intra-TF alignment |
+| `containment` | TF only | soma↔TF alignment — fraction of TF nuclei in the region contained by a reference soma |
+
+Candidate offsets are applied to cell coordinates *before* voxelization (pixel-exact), so `--xy-step` need not be a multiple of `voxel_bin_size_px`.
+
+**Output** → `5_analysis_report/align_validation/`: `<sample>_curves.csv` (one row per tile × region × channel × axis × Δ), `<sample>_summary.csv` (peak location, half-width, edge drop per curve), and a 3-panel PNG per channel × metric (thin lines = individual regions, thick = mean). The console summary's two key columns are `peak_hit` (fraction of regions whose peak lands on Δ=0) and `drop` (relative fall at the sweep edges).
+
+Expect ~2 min/tile, dominated by z-linking dense TF channels — use `--workers`. Pass `--no-plots` where matplotlib is broken; CSVs are written before plotting, so a failure there never costs data.
 
 ---
 
@@ -274,6 +301,7 @@ pATHRESULT/
 │   └── <class>.csv              # Per-class split of coloc_result.csv
 └── 5_analysis_report/
     ├── global_summary_statistics.csv
+    ├── align_validation/            # [optional] validate_align_shifts.py: curves CSV + summary + PNGs
     └── cell_centroids/
         └── <class>_centroids.csv         # Physical centroids (µm) per cell class
 ```

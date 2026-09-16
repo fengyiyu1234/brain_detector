@@ -24,7 +24,8 @@ from src.utils.logger import setup_logging
 from src.utils.io import (listTile, listTile_from_local_csvs, loadTeraxml,
                           save_run_metadata, compute_grid_fallback_offsets)
 from src.utils.markers import channel_marker, class_markers, split_class
-from src.core.worker import process_single_tile_wrapper, init_worker
+import multiprocessing.connection
+from src.core.worker import run_tile_process
 from src.core.stitcher import combine_predictions, fuse_dual_intensity_2d
 from src.core.z_linker import run_z_linker
 from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_containment,
@@ -34,42 +35,49 @@ from src.core.point_cloud_aligner import (
     apply_shift_to_csv, save_tile_offsets,
     resolve_align_settings, check_align_settings, save_align_settings,
 )
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from concurrent.futures.process import BrokenProcessPool
 
 
-def run_detection_pool(tasks, num_processes, initializer, initargs, task_fn):
-    """并行执行 tile 检测；任何 worker 出错或异常退出时立即终止，而不是卡住。
+def run_detection_pool(tasks, gpu_ids, config):
+    """并行执行 tile 检测：每块 GPU 一个槽位，每个 tile 在全新的子进程里跑完即退出。
 
-    旧实现用 mp.Pool：worker 初始化失败或进程崩溃（如 CUDA 库加载失败、内存不足）时，Pool 会不断
-    补新 worker，新 worker 在 init_worker 里从已经空了的 gpu_queue 取卡号时永久阻塞，作业空占 GPU 到超时。
-    ProcessPoolExecutor 遇到 worker 异常退出会把池标记为 broken、让所有 future 报错；这里再取消排队
-    任务、终止仍在运行的 worker，把异常抛出去，作业随即以非零状态退出。
+    不用常驻 worker 池：TF/StarDist 在长寿命进程里持续泄漏内存，跑几小时后作业被 OOM 杀掉
+    （见 worker.run_tile_process）。Python 3.10 的 ProcessPoolExecutor 没有 max_tasks_per_child，
+    mp.Pool 的 maxtasksperchild 又会在进程崩溃后不断补新 worker 导致卡死，所以这里自己调度。
+    任何子进程非零退出（抛异常，或被杀如 OOM）时终止其余子进程并抛出异常，作业以非零状态退出。
     已写完的 tile CSV 会保留（worker 先写 .part 再改名），修复问题后重新提交即可续跑。
     """
-    pool = ProcessPoolExecutor(max_workers=num_processes, mp_context=mp.get_context('spawn'),
-                               initializer=initializer, initargs=initargs)
-    futures = {pool.submit(task_fn, t): os.path.basename(t[1]) for t in tasks}
+    ctx = mp.get_context('spawn')
+    pending = list(tasks)
+    free_gpus = list(gpu_ids)
+    running = {}  # sentinel -> (process, gpu_id, tile_name)
     try:
-        with tqdm(total=len(futures), desc="Tile Processing", position=0, leave=True) as pbar:
-            for fut in as_completed(futures):
-                try:
-                    fut.result()
-                except BrokenProcessPool:
-                    logging.error("❌ 检测 worker 进程异常退出（初始化失败或被杀，例如 CUDA 库加载失败、"
-                                  "内存不足），终止作业。已完成的 tile 保留，修复后重新提交即可续跑。")
-                    raise
-                except Exception:
-                    logging.exception(f"❌ Tile {futures[fut]} 检测出错，终止作业。")
-                    raise
-                pbar.update(1)
-    except BaseException:
-        pool.shutdown(wait=False, cancel_futures=True)
-        for p in list((getattr(pool, '_processes', None) or {}).values()):
+        with tqdm(total=len(pending), desc="Tile Processing", position=0, leave=True) as pbar:
+            while pending or running:
+                while pending and free_gpus:
+                    task, gpu_id = pending.pop(0), free_gpus.pop(0)
+                    p = ctx.Process(target=run_tile_process, args=(config, gpu_id, task))
+                    p.start()
+                    running[p.sentinel] = (p, gpu_id, os.path.basename(task[1]))
+
+                for sentinel in mp.connection.wait(list(running)):
+                    p, gpu_id, tile_name = running.pop(sentinel)
+                    p.join()
+                    if p.exitcode != 0:
+                        if p.exitcode < 0:
+                            logging.error(f"❌ Tile {tile_name} 的检测进程被信号 {-p.exitcode} 杀死"
+                                          "（SIGKILL=9 通常是内存不足），终止作业。已完成的 tile 保留，修复后重新提交即可续跑。")
+                        else:
+                            logging.error(f"❌ Tile {tile_name} 检测进程异常退出（exit code {p.exitcode}，"
+                                          "堆栈见 .err），终止作业。已完成的 tile 保留，修复后重新提交即可续跑。")
+                        raise RuntimeError(f"Tile {tile_name} detection process failed (exitcode={p.exitcode})")
+                    free_gpus.append(gpu_id)
+                    pbar.update(1)
+    finally:
+        for p, _, _ in running.values():
             if p.is_alive():
                 p.terminate()
-        raise
-    pool.shutdown(wait=True)
+        for p, _, _ in running.values():
+            p.join()
 
 
 if __name__ == '__main__':
@@ -206,11 +214,9 @@ if __name__ == '__main__':
         num_gpus = torch.cuda.device_count()
         num_processes = max(1, num_gpus)
         logging.info(f"阶段 2: 发现 {len(tasks_to_run)} 个缺失结果，启动 {num_processes} 个进程 ({num_gpus} GPU)...")
-        gpu_queue = mp.Queue()
-        for _i in range(num_gpus):
-            gpu_queue.put(_i)
-        run_detection_pool(tasks_to_run, num_processes, init_worker, (config, gpu_queue),
-                           process_single_tile_wrapper)
+        # 无 GPU 时 gpu_id=None，init_worker 回退到 config['device']
+        gpu_ids = list(range(num_gpus)) if num_gpus > 0 else [None]
+        run_detection_pool(tasks_to_run, gpu_ids, config)
     else:
         logging.info("✔️ Checkpoint 1 达成: 所有 Tile 检测完成。")
 

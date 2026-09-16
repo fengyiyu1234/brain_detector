@@ -21,11 +21,10 @@ logger = logging.getLogger(__name__)
 _global_models = {}
 _worker_device = 'cpu'
 
-def init_worker(config, gpu_queue=None):
-    """Pool initializer: load models once per worker process instead of once per tile."""
+def init_worker(config, gpu_id=None):
+    """加载模型到当前进程（每个 tile 进程启动时调用一次）。"""
     global _global_models, _worker_device
-    if gpu_queue is not None and torch.cuda.is_available():
-        gpu_id = gpu_queue.get()
+    if gpu_id is not None and torch.cuda.is_available():
         torch.cuda.set_device(gpu_id)
         _worker_device = f'cuda:{gpu_id}'
     else:
@@ -527,3 +526,17 @@ def process_single_tile(i, pATHTEST, config):
 
 def process_single_tile_wrapper(args):
     return process_single_tile(*args)
+
+def run_tile_process(config, gpu_id, task):
+    """独立子进程入口：加载模型 → 处理一个 tile → 进程退出。
+
+    TF/StarDist 反复 predict 会在进程里持续累积内存（实测每个 worker 约 8 GB/小时，且跨 tile 不回落），
+    长寿命 worker 跑几个小时后会把作业顶到内存上限被 OOM 杀掉。每个 tile 用新进程，退出时内存全部归还；
+    代价是每个 tile 多约 25 秒模型加载。
+    """
+    init_worker(config, gpu_id)
+    try:
+        process_single_tile_wrapper(task)
+    except BaseException:
+        logger.exception(f"❌ Tile {os.path.basename(task[1])} 检测出错")
+        raise
