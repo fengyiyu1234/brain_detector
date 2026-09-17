@@ -7,7 +7,6 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 import time
-import csv
 import logging
 import pickle
 import multiprocessing as mp
@@ -26,15 +25,98 @@ from src.utils.io import (listTile, listTile_from_local_csvs, loadTeraxml,
 from src.utils.markers import channel_marker, class_markers, split_class
 import multiprocessing.connection
 from src.core.worker import run_tile_process
-from src.core.stitcher import combine_predictions, fuse_dual_intensity_2d
-from src.core.z_linker import run_z_linker
+from src.core.stitcher import fuse_dual_intensity_2d
+from src.core.channel_stage3 import stitch_and_link_channel
 from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_containment,
                                _merge_class, suppress_cross_class_overlap)
 from src.core.point_cloud_aligner import (
-    compute_tile_channel_shifts,
-    apply_shift_to_csv, save_tile_offsets,
+    align_tile, tile_alignment_done,
     resolve_align_settings, check_align_settings, save_align_settings,
 )
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+
+def align_worker_count(pre_align_cfg, n_tasks):
+    """Stage 2.5 并行进程数：pre_align_params.n_workers，缺省为 slurm 分到的 CPU 数（没有则本机核数）。"""
+    n = pre_align_cfg.get('n_workers') or int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))
+    return max(1, min(int(n), n_tasks))
+
+
+_THREAD_VARS = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS')
+
+
+class _single_threaded_children:
+    """
+    进程池期间让子进程只用单线程 BLAS/OpenMP，避免 进程数 × 核数 的线程超订。
+    spawn 出来的子进程在引导阶段就会 import numpy，所以只能在父进程里设环境变量让它继承。
+    """
+    def __enter__(self):
+        self.saved = {k: os.environ.get(k) for k in _THREAD_VARS}
+        os.environ.update({k: '1' for k in _THREAD_VARS})
+
+    def __exit__(self, *exc):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def stage3_worker_count(config, n_channels):
+    """Stage 3 同时处理的通道数：stage3_n_workers，缺省 = 通道数（受 slurm 分到的 CPU 数限制）。"""
+    cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))
+    n = config.get('stage3_n_workers') or n_channels
+    return max(1, min(int(n), n_channels, cpus))
+
+
+def run_stage3_channel_pool(routing, n_workers, src_dir, global_2d_dir, channel_3d_dir,
+                            geom, zl_params, log_dir):
+    """Stage 3 前半段：每个通道一个进程做全局 2D 拼接 + Z-Link。返回 {ch_id: 结果}。"""
+    def _args(ch):
+        return (ch, src_dir, global_2d_dir, channel_3d_dir, geom,
+                zl_params['soma' if ch.get('type', 'soma') == 'soma' else 'tf'])
+
+    logging.info(f"阶段 3: {len(routing)} 个通道的拼接 + Z-Link，{n_workers} 个进程并行")
+    if n_workers <= 1:
+        return {ch['id']: stitch_and_link_channel(*_args(ch)) for ch in routing}
+    results = {}
+    with _single_threaded_children(), ProcessPoolExecutor(
+            max_workers=n_workers, mp_context=mp.get_context('spawn'),
+            initializer=setup_logging, initargs=(log_dir,)) as pool:
+        futs = {pool.submit(stitch_and_link_channel, *_args(ch)): ch['id'] for ch in routing}
+        for fut in as_completed(futs):
+            try:
+                results[futs[fut]] = fut.result()
+            except Exception:
+                logging.error(f"❌ [3] 通道 {futs[fut]} 拼接/Z-Link 失败，终止作业。"
+                              "已完成通道的 checkpoint 保留，修复后重新提交即可续跑。")
+                for f in futs:
+                    f.cancel()
+                raise
+    return results
+
+
+def run_align_pool(tile_paths, n_workers, det_dir, align_dir, routing, settings):
+    """
+    Stage 2.5：每个 tile 一个任务，在 CPU 进程池里并行跑 align_tile。返回缺失的检测 CSV 列表。
+    任一 tile 抛异常即终止作业；已写完 offsets JSON 的 tile 保留，重新提交会跳过它们。
+    """
+    if not tile_paths:
+        return []
+    missing = []
+    with _single_threaded_children(), ProcessPoolExecutor(
+            max_workers=n_workers, mp_context=mp.get_context('spawn')) as pool:
+        futs = {pool.submit(align_tile, p, det_dir, align_dir, routing, settings): p for p in tile_paths}
+        for fut in tqdm(as_completed(futs), total=len(futs), desc="Pre-Align Tiles"):
+            try:
+                missing.extend(fut.result())
+            except Exception:
+                logging.error(f"❌ [2.5] Tile {os.path.basename(futs[fut])} 对齐失败，终止作业。"
+                              "已完成的 tile 保留，修复后重新提交即可续跑。")
+                for f in futs:
+                    f.cancel()
+                raise
+    return missing
 
 
 def run_detection_pool(tasks, gpu_ids, config):
@@ -238,103 +320,16 @@ if __name__ == '__main__':
             save_align_settings(derived['pATH_ALIGN_OFFSETS'], align_settings)
 
             routing_cfg_align = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
-            soma_ch_ids_align        = align_settings['soma_ch_ids']   # 参考通道已排在第一位
-            tf_ch_ids_align          = align_settings['tf_ch_ids']
-            pa_sample_z              = align_settings['sample_z_center_count']
-            pa_bin_size              = align_settings['voxel_bin_size_px']
-            pa_xy_range              = align_settings['xy_search_range_px']
-            pa_z_range               = align_settings['z_search_range_slices']
-            pa_fine_xy               = align_settings['xy_fine_search_px']
-            pa_fine_z                = align_settings['z_fine_search_slices']
-            pa_xy_res                = align_settings['xy_resolution_um']
-            pa_z_res                 = align_settings['z_resolution_um']
-            pa_max_center_dist_ratio = align_settings['max_center_dist_ratio']
-            pa_containment_z_pad     = align_settings['containment_z_pad']
-            missing_csvs = []   # 缺失的检测 CSV；有缺失就不写完成标记
 
-            for tile_path in tqdm(pATHTILE, desc="Pre-Align Tiles"):
-                tile_name = os.path.split(tile_path)[-1]
-                # 与 worker 相同的切片排序：CSV 里的 z（从 1 开始）对应 slice_names[z-1]，
-                # apply_shift_to_csv 施加 dz 时据此同步更新 slice_name
-                slice_names = [os.path.splitext(f)[0] for f in sorted(
-                    f for f in os.listdir(tile_path)
-                    if f.lower().endswith(('.tif', '.tiff')) and not f.startswith('.'))]
-
-                # 1. 对每个通道轻量 z-link，得到 per-tile 3D vol_list
-                per_ch_vol_lists = {}
-                z_counts = []
-                for ch in routing_cfg_align:
-                    cid = ch['id']
-                    ctype = ch.get('type', 'soma')
-                    csv_path = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_{cid}_result.csv")
-                    if not os.path.isfile(csv_path):
-                        missing_csvs.append(csv_path)
-                        per_ch_vol_lists[cid] = []
-                        continue
-                    df_tile = pd.read_csv(csv_path)
-                    if df_tile.empty:
-                        per_ch_vol_lists[cid] = []
-                        continue
-
-                    mat = df_tile[["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]].values
-                    mat[:, 6] = np.array([f"{v}_{cid}" for v in mat[:, 6]])
-
-                    _, vol_list = run_z_linker(
-                        mat, **align_settings['z_link']['soma' if ctype == 'soma' else 'tf'])
-                    per_ch_vol_lists[cid] = vol_list
-                    if vol_list:
-                        z_counts.extend([c.get('cz', 0) for c in vol_list])
-
-                # 2. 估计 tile z 中心
-                z_center = float(np.median(z_counts)) if z_counts else 0.0
-                z_half   = pa_sample_z // 2
-
-                # 3. 两步体素对齐
-                shifts, scores = compute_tile_channel_shifts(
-                    per_ch_vol_lists,
-                    soma_ch_ids=soma_ch_ids_align,
-                    tf_ch_ids=tf_ch_ids_align,
-                    z_center=z_center,
-                    z_half_window=z_half,
-                    bin_size=pa_bin_size,
-                    xy_res_um=pa_xy_res,
-                    z_res_um=pa_z_res,
-                    xy_range_px=pa_xy_range,
-                    z_range_slices=pa_z_range,
-                    fine_xy_px=pa_fine_xy,
-                    fine_z_slices=pa_fine_z,
-                    max_center_dist_ratio=pa_max_center_dist_ratio,
-                    containment_z_pad=pa_containment_z_pad,
-                    tf_align_mode=align_settings['tf_align_mode'],
-                )
-
-                # 3b. double_exposure 通道的第二曝光复用主曝光的偏移量
-                # （同一物理通道/视野，只是曝光不同，无需独立点云配准）。
-                for ch in routing_cfg_align:
-                    if ch.get('double_exposure'):
-                        second_id = ch['second_intensity_id']
-                        shifts[second_id] = shifts.get(ch['id'], (0, 0, 0))
-                        scores[second_id] = scores.get(ch['id'], 0.0)
-
-                # 4. 保存偏移 JSON
-                save_tile_offsets(tile_name, shifts, scores, derived['pATH_ALIGN_OFFSETS'])
-
-                # 5. 对每个通道的原始 CSV 应用偏移，写入 0_channel_alignment/
-                for ch in routing_cfg_align:
-                    cid = ch['id']
-                    dx, dy, dz = shifts.get(cid, (0, 0, 0))
-                    in_csv  = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_{cid}_result.csv")
-                    out_csv = os.path.join(derived['pATH_ALIGN_OFFSETS'], f"{tile_name}_{cid}_result.csv")
-                    if os.path.isfile(in_csv) and not os.path.isfile(out_csv):
-                        apply_shift_to_csv(in_csv, dx, dy, dz, out_csv, slice_names=slice_names)
-
-                    if ch.get('double_exposure'):
-                        second_id = ch['second_intensity_id']
-                        dx2, dy2, dz2 = shifts.get(second_id, (0, 0, 0))
-                        in_csv2  = os.path.join(derived['pATH_DET_RES'], f"{tile_name}_{second_id}_result.csv")
-                        out_csv2 = os.path.join(derived['pATH_ALIGN_OFFSETS'], f"{tile_name}_{second_id}_result.csv")
-                        if os.path.isfile(in_csv2) and not os.path.isfile(out_csv2):
-                            apply_shift_to_csv(in_csv2, dx2, dy2, dz2, out_csv2, slice_names=slice_names)
+            # 已完成的 tile 直接跳过（offsets JSON 是最后写的完成标记，另核对 CSV 行数）
+            todo = [p for p in pATHTILE
+                    if not tile_alignment_done(os.path.basename(p), derived['pATH_DET_RES'],
+                                               derived['pATH_ALIGN_OFFSETS'], routing_cfg_align)]
+            n_workers = align_worker_count(pre_align_cfg, len(todo))
+            logging.info(f"  [2.5] {len(pATHTILE) - len(todo)} 个 tile 已完成，剩余 {len(todo)} 个，"
+                         f"{n_workers} 个 CPU 进程并行（纯 CPU 计算，不占 GPU）")
+            missing_csvs = run_align_pool(todo, n_workers, derived['pATH_DET_RES'],
+                                          derived['pATH_ALIGN_OFFSETS'], routing_cfg_align, align_settings)
 
             if missing_csvs:
                 raise RuntimeError(
@@ -680,155 +675,47 @@ if __name__ == '__main__':
         logging.info("阶段 3: 开始合并 Tile 并运行 Z-Linker (先独立 3D 追踪，再 3D 共定位)...")
 
         routing_config = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
-
-        per_ch_matrices = {}   # ch_id -> np.array, global 2D with marker applied
-        metadata_registry = []
         num_tiles = len(pATHTILE_all)
         BOX_COLS  = ["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]
 
-        # ====== Checkpoint 2a: 若 2_global_2d_raw 已有内容，直接加载，跳过 Tile 拼接 ======
-        global_2d_paths = {
-            ch['id']: os.path.join(derived['pATH_GLOBAL_2D'], f"{ch['id']}_2d_global.csv")
-            for ch in routing_config
+        # ====== 1+2. 各通道独立：全局 2D 拼接 → Z-Link，每个通道一个进程 ======
+        # checkpoint 与以前相同：2_global_2d_raw/<ch>_2d_global.csv、3_channel_3d/<ch>_3d_tracked.pkl
+        zl      = config.get('z_linker', {})
+        zl_soma = zl.get('soma', {})
+        zl_tf   = zl.get('tf', {})
+        zl_params = {
+            'soma': dict(iou_thresh=zl_soma.get('iou_thresh', 0.35),
+                         min_z_layers=zl_soma.get('min_z_layers', 1),
+                         max_cell_z_span=zl_soma.get('max_cell_z_span', 5),
+                         max_z_gap=zl_soma.get('max_z_gap', 0)),
+            'tf':   dict(iou_thresh=zl_tf.get('iou_thresh', 0.25),
+                         min_z_layers=zl_tf.get('min_z_layers', 1),
+                         max_cell_z_span=zl_tf.get('max_cell_z_span', 3),
+                         max_z_gap=zl_tf.get('max_z_gap', 0)),
         }
-        if routing_config and all(os.path.exists(p) for p in global_2d_paths.values()):
-            logging.info("✔️ Checkpoint 2a 达成: 直接加载已有的全局 2D 结果，跳过 Tile 拼接。")
-            for ch_id, p in global_2d_paths.items():
-                per_ch_matrices[ch_id] = pd.read_csv(p)[BOX_COLS].values
-        else:
-            # 按通道跳过：已存在 global_2d CSV 的通道直接加载，只重新拼接缺失的通道
-            _ch_cached = [ch for ch in routing_config if os.path.exists(global_2d_paths[ch['id']])]
-            _ch_todo   = [ch for ch in routing_config if not os.path.exists(global_2d_paths[ch['id']])]
-            if _ch_cached:
-                logging.info(f"✔️ Checkpoint 2a (按通道): {[c['id'] for c in _ch_cached]} 已存在，直接加载。")
-                for ch in _ch_cached:
-                    per_ch_matrices[ch['id']] = pd.read_csv(global_2d_paths[ch['id']])[BOX_COLS].values
+        geom = {'dir_dict': dir_dict, 'disp_mat_fin': disp_mat_fin, 'z_start': z_start, 'Z': Z,
+                'H': H, 'W': W, 'tile_size': tile_size, 'num_tiles': num_tiles}
+        ch_results = run_stage3_channel_pool(
+            routing_config, stage3_worker_count(config, len(routing_config)),
+            pATH_SRC_CSV, derived['pATH_GLOBAL_2D'], derived['pATH_CHANNEL_3D'], geom, zl_params,
+            base_res_path)
 
-            # ====== 1. 逐通道独立拼接全局 2D，每个通道单独保存 ======
-            for ch in _ch_todo:
-                ch_id     = ch['id']
-                ch_type   = ch.get('type', 'soma')
-                # class 标签用规范化 marker（"GFP_3" → "GFP"），文件名仍用原始 ch_id
-                ch_marker = channel_marker(ch_id)
-                logging.info(f" -> 正在拼接通道 2D 框: [{ch_id}] (类型: {ch_type})")
+        # tile 元数据（给最终细胞找回 tile/slice 名）按通道顺序拼起来，与以前逐通道追加的顺序一致
+        meta_chunks = [ch_results[ch['id']]['metadata'] for ch in routing_config
+                       if ch_results[ch['id']]['metadata'] is not None]
 
-                current_ch_global_2d = []
-
-                if num_tiles > 1:
-                    stitched_predictions = [[np.empty((0, 8)) for _ in range(2)] for _ in range(Z)]
-                    for dir_name in dir_dict:
-                        tile_name = os.path.split(dir_name)[-1]
-                        csv_tile  = os.path.join(pATH_SRC_CSV, f"{tile_name}_{ch_id}_result.csv")
-                        if os.path.isfile(csv_tile):
-                            with open(csv_tile, newline='', encoding='utf-8') as tile_file:
-                                next(tile_file, None)
-                                stitched_predictions = combine_predictions(
-                                    stitched_predictions, csv.reader(tile_file), None, z_start, Z,
-                                    dir_dict[dir_name], disp_mat_fin, (H, W),
-                                    metadata_registry, tile_name, tILESIZE=tile_size,
-                                )
-                    for layer in stitched_predictions:
-                        for group in layer:
-                            if group.size > 0: current_ch_global_2d.append(group)
-                else:
-                    csv_list = [f for f in os.listdir(pATH_SRC_CSV) if f.endswith(f'_{ch_id}_result.csv')]
-                    if csv_list:
-                        tile_name = csv_list[0].split(f"_{ch_id}_")[0]
-                        with open(os.path.join(pATH_SRC_CSV, csv_list[0]), 'r', encoding='utf-8') as f:
-                            next(f, None)
-                            temp_list = []
-                            for r in csv.reader(f):
-                                if len(r) > 8 and r[0] != 'tile_id':
-                                    x1, y1, x2, y2 = float(r[1]), float(r[2]), float(r[3]), float(r[4])
-                                    score, mean, c, z = float(r[6]), float(r[7]), str(r[5]), int(float(r[8]))
-                                    temp_list.append([x1, y1, x2, y2, score, mean, c, z])
-                                    metadata_registry.append([(x1+x2)/2, (y1+y2)/2, z, tile_name, r[0]])
-                            if temp_list:
-                                current_ch_global_2d.append(np.array(temp_list, dtype=object))
-
-                if current_ch_global_2d:
-                    ch_matrix = np.concatenate(current_ch_global_2d, axis=0)
-                    for row in ch_matrix:
-                        row[6] = f"{row[6]}_{ch_marker}"   # "neuron" → "neuron_RFP"
-                    per_ch_matrices[ch_id] = ch_matrix
-                    out_2d = os.path.join(derived['pATH_GLOBAL_2D'], f"{ch_id}_2d_global.csv")
-                    pd.DataFrame(ch_matrix, columns=BOX_COLS).to_csv(out_2d, index=False)
-                    logging.info(f"✔️ [{ch_id}] 全局2D: {len(ch_matrix)} 框 → {out_2d}")
-
-        # ====== 2. 独立 Z-Link 每个 channel ======
         soma_ch_ids = [ch['id'] for ch in routing_config
                        if ch.get('type', 'soma') == 'soma' and ch.get('active', True)]
         tf_ch_ids   = [ch['id'] for ch in routing_config
                        if ch.get('type', 'tf')   == 'tf'   and ch.get('active', True)]
 
-        zl      = config.get('z_linker', {})
-        zl_soma = zl.get('soma', {})
-        zl_tf   = zl.get('tf', {})
-
         soma_vol_by_ch = {}   # ch_id → volumetric_list (for 3D coloc)
         tf_vol_by_ch   = {}
-
-        # ====== Checkpoint 2b: 若 3_channel_3d pkl 已有内容，直接加载，跳过 Z-Linker ======
-        all_ch_ids = soma_ch_ids + tf_ch_ids
-        pkl_paths = {
-            cid: os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.pkl")
-            for cid in all_ch_ids
-        }
-        if all_ch_ids and all(os.path.exists(p) for p in pkl_paths.values()):
-            logging.info("✔️ Checkpoint 2b 达成: 直接加载已有的 3D 追踪结果，跳过 Z-Linker。")
-            for cid in soma_ch_ids:
-                with open(pkl_paths[cid], 'rb') as pf:
-                    soma_vol_by_ch[cid] = pickle.load(pf)
-            for cid in tf_ch_ids:
-                with open(pkl_paths[cid], 'rb') as pf:
-                    tf_vol_by_ch[cid] = pickle.load(pf)
-        else:
-            # 按通道跳过：已存在 pkl 的通道直接加载，只对缺失的通道重新跑 Z-Linker
-            for cid in soma_ch_ids:
-                if os.path.exists(pkl_paths[cid]):
-                    with open(pkl_paths[cid], 'rb') as pf:
-                        soma_vol_by_ch[cid] = pickle.load(pf)
-                    logging.info(f"✔️ [{cid}] 已存在 3D 追踪结果，直接加载（跳过 Z-Linker）。")
-                    continue
-                ch_mat = per_ch_matrices.get(cid)
-                if ch_mat is None or len(ch_mat) == 0:
-                    continue
-                summary, vol_list = run_z_linker(
-                    ch_mat,
-                    iou_thresh=zl_soma.get('iou_thresh', 0.35),
-                    min_z_layers=zl_soma.get('min_z_layers', 1),
-                    max_cell_z_span=zl_soma.get('max_cell_z_span', 5),
-                    max_z_gap=zl_soma.get('max_z_gap', 0),
-                )
-                soma_vol_by_ch[cid] = vol_list
-                out_3d = os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.csv")
-                pd.DataFrame(summary, columns=BOX_COLS).to_csv(out_3d, index=False)
-                with open(os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.pkl"), 'wb') as pf:
-                    pickle.dump(vol_list, pf)
-                logging.info(f"✔️ [{cid}] Z-Link soma: {len(vol_list)} 个细胞 → {out_3d}")
-
-            for cid in tf_ch_ids:
-                if os.path.exists(pkl_paths[cid]):
-                    with open(pkl_paths[cid], 'rb') as pf:
-                        tf_vol_by_ch[cid] = pickle.load(pf)
-                    logging.info(f"✔️ [{cid}] 已存在 3D 追踪结果，直接加载（跳过 Z-Linker）。")
-                    continue
-                ch_mat = per_ch_matrices.get(cid)
-                if ch_mat is None or len(ch_mat) == 0:
-                    continue
-                summary, vol_list = run_z_linker(
-                    ch_mat,
-                    iou_thresh=zl_tf.get('iou_thresh', 0.25),
-                    min_z_layers=zl_tf.get('min_z_layers', 1),
-                    max_cell_z_span=zl_tf.get('max_cell_z_span', 3),
-                    max_z_gap=zl_tf.get('max_z_gap', 0),
-                )
-                tf_vol_by_ch[cid] = vol_list
-                out_3d = os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.csv")
-                pd.DataFrame(summary, columns=BOX_COLS).to_csv(out_3d, index=False)
-                with open(os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.pkl"), 'wb') as pf:
-                    pickle.dump(vol_list, pf)
-                logging.info(f"✔️ [{cid}] Z-Link TF: {len(vol_list)} 个细胞 → {out_3d}")
+        for cid in soma_ch_ids + tf_ch_ids:
+            pkl_path = os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.pkl")
+            if os.path.exists(pkl_path):   # 没有检测结果的通道不会生成 pkl，与以前一样跳过
+                with open(pkl_path, 'rb') as pf:
+                    (soma_vol_by_ch if cid in soma_ch_ids else tf_vol_by_ch)[cid] = pickle.load(pf)
 
         # ====== 3. 3D Colocalization ======
         # Phase A: soma × soma 3D IoU（逐对匹配，依次合并到主列表）
@@ -917,9 +804,8 @@ if __name__ == '__main__':
         if final_results is not None and len(final_results) > 0:
             df = pd.DataFrame(final_results, columns=BOX_COLS)
 
-            if len(metadata_registry) > 0:
-                meta_np     = np.array(metadata_registry, dtype=object)
-                meta_coords = meta_np[:, :3].astype(float)
+            if meta_chunks:
+                meta_coords = np.concatenate([m['coords'] for m in meta_chunks])
                 meta_coords[:, 2] *= 10.0
                 tree = cKDTree(meta_coords)
                 final_coords = np.column_stack((
@@ -928,8 +814,17 @@ if __name__ == '__main__':
                     final_results[:, 7].astype(float) * 10.0
                 ))
                 _, indices = tree.query(final_coords)
-                df['tile_name']  = meta_np[indices, 3]
-                df['slice_name'] = meta_np[indices, 4]
+                # 各通道的 tile/slice 名是编码后传回的，这里只解码被查到的那些
+                bounds = np.cumsum([0] + [len(m['coords']) for m in meta_chunks])
+                chunk_of = np.searchsorted(bounds, indices, side='right') - 1
+                tiles, slices = np.empty(len(indices), dtype=object), np.empty(len(indices), dtype=object)
+                for k, m in enumerate(meta_chunks):
+                    sel = chunk_of == k
+                    local = indices[sel] - bounds[k]
+                    tiles[sel] = m['tile_u'][m['tile_c'][local]]
+                    slices[sel] = m['slice_u'][m['slice_c'][local]]
+                df['tile_name']  = tiles
+                df['slice_name'] = slices
             else:
                 df['tile_name']  = 'Unknown'
                 df['slice_name'] = 'Unknown'

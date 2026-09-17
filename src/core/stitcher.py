@@ -673,6 +673,9 @@ def annotate_soma_with_tf_gmm(soma_vol_list, tf_vol_list, p_thresh=0.5):
     return soma_vol_list
 
 
+_TF_CHUNK = 100_000   # 3B 每块处理的 TF 数；候选对数组的内存随块大小线性增长
+
+
 def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_margin=0,
                                        max_center_dist_ratio=0.5):
     """
@@ -694,43 +697,57 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
     max_radius = float(soma_radii.max())
 
     tree = cKDTree(soma_arr)
+    s_box = np.array([[s['x1_3d'], s['y1_3d'], s['x2_3d'], s['y2_3d']] for s in soma_vol_list],
+                     dtype=float)
+    s_zmin = np.array([s['z_min'] for s in soma_vol_list])
+    s_zmax = np.array([s['z_max'] for s in soma_vol_list])
 
+    # 分块批量处理：一次查询一整块 TF 的候选 soma，包含判断用数组运算（与逐个比较逐位相同）；
+    # 只有通过包含判断的配对才进入原来的逐对距离判定，候选顺序与单点查询相同，
+    # 所以「最近者胜、并列取先出现者」的结果与逐个处理完全一致。
+    marker_of = {}
     soma_markers = defaultdict(set)
-    for tf in tf_vol_list:
-        tf_pt = np.array([tf['cx'], tf['cy'], tf['cz']], dtype=float)
-        tf_base, tf_mk = split_class(tf['class'])
-        tf_marker = tf_mk[-1] if tf_mk else tf_base
+    for c0 in range(0, len(tf_vol_list), _TF_CHUNK):
+        chunk = tf_vol_list[c0:c0 + _TF_CHUNK]
+        tf_pts = np.array([[t['cx'], t['cy'], t['cz']] for t in chunk], dtype=float)
+        t_box = np.array([[t['x1_3d'], t['y1_3d'], t['x2_3d'], t['y2_3d']] for t in chunk], dtype=float)
+        t_zmin = np.array([t['z_min'] for t in chunk])
+        t_zmax = np.array([t['z_max'] for t in chunk])
 
-        candidate_idxs = tree.query_ball_point(tf_pt, r=max_radius * 2)
+        cands = tree.query_ball_point(tf_pts, r=max_radius * 2, return_sorted=False, workers=-1)
+        counts = np.fromiter((len(c) for c in cands), dtype=np.int64, count=len(cands))
+        if counts.sum() == 0:
+            continue
+        ti = np.repeat(np.arange(len(chunk)), counts)
+        si = np.fromiter((j for c in cands for j in c), dtype=np.int64, count=int(counts.sum()))
+        sb, tb = s_box[si], t_box[ti]
+        contained_xy = ((sb[:, 0] - xy_margin <= tb[:, 0]) & (tb[:, 2] <= sb[:, 2] + xy_margin) &
+                        (sb[:, 1] - xy_margin <= tb[:, 1]) & (tb[:, 3] <= sb[:, 3] + xy_margin))
+        # z_pad slices of tolerance on exactly one side only, never both at once
+        # (padding both sides simultaneously lets a truncated box balloon into
+        # an oversized capture window) — applies the same way to single- and
+        # multi-layer soma boxes.
+        zmin_t, zmax_t, zmin_s, zmax_s = t_zmin[ti], t_zmax[ti], s_zmin[si], s_zmax[si]
+        contained_z = (((zmin_t >= zmin_s - z_pad) & (zmax_t <= zmax_s)) |
+                       ((zmin_t >= zmin_s) & (zmax_t <= zmax_s + z_pad)))
+        keep = np.flatnonzero(contained_xy & contained_z)
 
-        best_dist, best_idx = float('inf'), None
-        for idx in candidate_idxs:
-            s = soma_vol_list[idx]
-            contained_xy = (
-                s['x1_3d'] - xy_margin <= tf['x1_3d'] and
-                tf['x2_3d'] <= s['x2_3d'] + xy_margin and
-                s['y1_3d'] - xy_margin <= tf['y1_3d'] and
-                tf['y2_3d'] <= s['y2_3d'] + xy_margin
-            )
-            # z_pad slices of tolerance on exactly one side only, never both at once
-            # (padding both sides simultaneously lets a truncated box balloon into
-            # an oversized capture window) — applies the same way to single- and
-            # multi-layer soma boxes.
-            contained_z = (
-                (tf['z_min'] >= s['z_min'] - z_pad and tf['z_max'] <= s['z_max']) or
-                (tf['z_min'] >= s['z_min']          and tf['z_max'] <= s['z_max'] + z_pad)
-            )
-            if not (contained_xy and contained_z):
-                continue
-            dist = float(np.linalg.norm(soma_arr[idx] - tf_pt))
+        best = {}   # tf 在块内的下标 → (best_dist, best_idx)
+        for k in keep:
+            t, idx = int(ti[k]), int(si[k])
+            dist = float(np.linalg.norm(soma_arr[idx] - tf_pts[t]))
             # Hard gate: nucleus centroid must be near soma center, not just inside bbox
             if dist > max_center_dist_ratio * soma_radii[idx]:
                 continue
-            if dist < best_dist:
-                best_dist, best_idx = dist, idx
+            if dist < best.get(t, (float('inf'), None))[0]:
+                best[t] = (dist, idx)
 
-        if best_idx is not None:
-            soma_markers[best_idx].add(tf_marker)
+        for t, (_, best_idx) in best.items():
+            cls = chunk[t]['class']
+            if cls not in marker_of:
+                tf_base, tf_mk = split_class(cls)
+                marker_of[cls] = tf_mk[-1] if tf_mk else tf_base
+            soma_markers[best_idx].add(marker_of[cls])
 
     for idx, soma in enumerate(soma_vol_list):
         if idx in soma_markers:
@@ -810,6 +827,10 @@ def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, d
     z0 = z_start - ABS_Z
     z1 = z0 + Z
 
+    # 先按 (层, 类别) 收集成列表，tile 读完后每组只 concatenate 一次。
+    # 以前每个框都把整层数组复制一遍，稠密核通道（每层上万个框）耗时按平方增长。
+    # 行的先后顺序与逐个追加时完全相同。
+    new_rows = {}
     for row_data in csv_reader:
         slice_name, x1, y1, x2, y2, class_name, score, mean, z = row_data[:9]
         z    = int(float(z))
@@ -820,14 +841,16 @@ def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, d
             cx_local = min(max(int((x1 + x2) // 2), 0), tILESIZE - 1)
             x1 += ABS_X; x2 += ABS_X; y1 += ABS_Y; y2 += ABS_Y; z = z - z0
             cell_type_index = 0 if 'glia' in class_name.lower() else 1
-            new_box = np.array([[x1, y1, x2, y2, score, mean, class_name, z]], dtype=object)
 
             if not mask[cy_local, cx_local]:
-                # 非重叠区：直接写入
-                all_predictions[z - 1][cell_type_index] = np.concatenate(
-                    (all_predictions[z - 1][cell_type_index], new_box)
-                )
+                # 非重叠区：写入
+                new_rows.setdefault((z - 1, cell_type_index), []).append(
+                    [x1, y1, x2, y2, score, mean, class_name, z])
                 metadata_registry.append([(x1 + x2) / 2, (y1 + y2) / 2, z, tile_name, slice_name])
             # 重叠区：丢弃（保留左/上方 tile 的结果，右/下方 tile 的重叠区检测一律舍弃）
+
+    for (zi, ti), rows in new_rows.items():
+        all_predictions[zi][ti] = np.concatenate(
+            (all_predictions[zi][ti], np.array(rows, dtype=object)))
 
     return all_predictions

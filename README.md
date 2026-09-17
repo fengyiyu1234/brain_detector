@@ -18,7 +18,8 @@ brain_detector/
 │   └── 2D_versatile_fluo/        # StarDist TF nucleus detector
 ├── scripts/
 │   ├── run_inference.py          # Main pipeline entrypoint
-│   └── validate_align_shifts.py  # Pre-align QC: overlap-vs-offset curves on held-out subvolumes
+│   ├── validate_align_shifts.py  # Pre-align QC: overlap-vs-offset curves on held-out subvolumes
+│   └── compare_stitching.py      # Stitching QC: TeraStitcher self-report, seam residuals, XML cross-check
 ├── src/
 │   ├── config/
 │   │   └── loader.py             # JSON config loader (strips // comments)
@@ -96,6 +97,28 @@ Candidate offsets are applied to cell coordinates *before* voxelization (pixel-e
 **Output** → `5_analysis_report/align_validation/`: `<sample>_curves.csv` (one row per tile × region × channel × axis × Δ), `<sample>_summary.csv` (peak location, half-width, edge drop per curve), and a 3-panel PNG per channel × metric (thin lines = individual regions, thick = mean). The console summary's two key columns are `peak_hit` (fraction of regions whose peak lands on Δ=0) and `drop` (relative fall at the sweep edges).
 
 Expect ~2 min/tile, dominated by z-linking dense TF channels — use `--workers`. Pass `--no-plots` where matplotlib is broken; CSVs are written before plotting, so a failure there never costs data.
+
+#### Comparing stitchings / stitching reference ≠ alignment reference
+
+Cell global coordinates are `XML tile position + tile-local coordinate in the alignment reference frame`, which is only right when the XML was stitched on the alignment reference channel. When the two differ (e.g. stitch on 488nm/Olig2 because its signal is dense, align on 640nm/GFP because that is the soma channel), the per-tile channel shift between them has to be accounted for. `scripts/compare_stitching.py` measures how well each candidate stitching — and that chain — actually lines up:
+
+```bash
+# before the second stitching exists: self-report + seam residuals of the 640 one
+python scripts/compare_stitching.py --sample Y:/Fengyi/EGFR_brain/T4 --xml 640nm:GFP
+# both stitchings + GFP cells carried into the 488 frame through the Stage 2.5 offsets
+python scripts/compare_stitching.py --sample Y:/Fengyi/EGFR_brain/T4 \
+    --xml 640nm:GFP --xml 488nm:Olig2 --also GFP --workers 4
+```
+
+`--xml NAME[:CHANNEL][=PATH]`: `NAME` labels the stitching and defaults its directory to `<sample>/<NAME>`; `CHANNEL` is the `channels_routing` id whose raw images were stitched. Each part runs as soon as its inputs exist:
+
+| Part | Needs | Measures |
+|------|-------|----------|
+| A. self-report | TeraStitcher XMLs | per adjacent pair: fraction of axes replaced by the mechanical default (`xml_displthres`), spread of the per-subblock displacements (`xml_displcomp`), and `placed − pair displacement` in `xml_merging` (loop inconsistency). NCC/reliability values depend on image content, so don't compare their absolute level across channels |
+| B. seam residual | + `1_tile_2d_raw` | independent of TeraStitcher: the same cells detected by both tiles of an overlap are z-linked, placed with the XML, and matched; the median `B − A` is that seam's error (ideal 0). `--also CH` first moves `CH` into the XML channel's frame (`raw + s_CH − s_frame`), i.e. the error cells will actually have on that stitched image |
+| C. cross-check | two XMLs with channels + Stage 2.5 offsets | `pos_A(t) − pos_B(t)` should equal `s_a(t) − s_b(t)` up to a constant; a residual std well below the position-difference std means stitching and channel alignment corroborate each other, and flagged tiles are where one of them is wrong |
+
+B uses the raw (unshifted) detection CSVs, so it can run while detection is still in progress — seams whose CSVs are missing are reported as `missing_csv`. Output → `5_analysis_report/stitch_compare/` (`<NAME>_pairs.csv`, `seams.csv`, `cross_<A>_vs_<B>.csv`, and grid/scatter PNGs). Plots are drawn only after every CSV is written; use the `antsreg` env for plotting or pass `--no-plots`.
 
 ---
 
@@ -183,6 +206,11 @@ Use `3` to re-run only colocalization and downstream steps without re-running de
 ### `ENABLE_Z_LINKER`
 `true` (default) = run Z-axis tracking. `false` = output raw 2D detections only.
 
+### `stage3_n_workers`
+Stage 3 stitches and z-links every channel in its own process; this caps how many run at once (default: all channels, limited by `$SLURM_CPUS_PER_TASK`). Dense TF channels hold several GB each while they run, so lower it if the job runs out of memory. Cross-channel colocalization (3A/3B/3C) stays in the main process.
+
+**Z-linker solver.** Each slice's Hungarian matching is solved separately inside every connected group of boxes with IoU > 0 (`run_z_linker(..., solver='sparse')`, the default) instead of on one whole-brain cost matrix. This is the same optimum — the number of forced cross-type pairs doesn't depend on which positive-IoU pairs are chosen — so results only differ where two assignments have exactly equal cost. On sample18, soma channels came out identical and Sox9 differed in 2 of 3.69 M cells; Sox9 z-linking went from 56 min to ~3.5 min. `solver='dense'` keeps the original for comparison.
+
 ### `pre_align_params` *(pre_align mode only)*
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -195,6 +223,9 @@ Use `3` to re-run only colocalization and downstream steps without re-running de
 | `xy_fine_search_px` | 8 | Fine-search XY range around FFT peak (px) |
 | `z_fine_search_slices` | 2 | Fine-search Z range around FFT peak (slices) |
 | `tile_overlap_pct` | 15 | Tile overlap % (fallback grid calculation when TeraStitcher XML is absent) |
+| `n_workers` | `$SLURM_CPUS_PER_TASK`, else CPU count | Stage 2.5 CPU processes, one tile each. Stage 2.5 never uses a GPU, so run it in a CPU job (`scripts/inference_cpu.slurm`) rather than holding GPUs. Not part of `_align_settings.json` — changing it never invalidates finished tiles |
+
+Stage 2.5 resumes per tile: a tile counts as finished when its `_offsets.json` exists (written last) and every aligned CSV has as many lines as its raw CSV. A killed or timed-out job just needs resubmitting.
 
 ### `z_linker`
 Parameters are split by channel type (`soma` / `tf`):
@@ -302,6 +333,7 @@ pATHRESULT/
 └── 5_analysis_report/
     ├── global_summary_statistics.csv
     ├── align_validation/            # [optional] validate_align_shifts.py: curves CSV + summary + PNGs
+    ├── stitch_compare/              # [optional] compare_stitching.py: pair / seam / cross-check CSVs + PNGs
     └── cell_centroids/
         └── <class>_centroids.csv         # Physical centroids (µm) per cell class
 ```

@@ -661,8 +661,9 @@ def apply_shift_to_csv(in_csv_path, dx, dy, dz, out_csv_path, slice_names=None):
         return
 
     df = pd.read_csv(in_csv_path)
+    os.makedirs(os.path.dirname(out_csv_path), exist_ok=True)
     if df.empty:
-        df.to_csv(out_csv_path, index=False)
+        _atomic_to_csv(df, out_csv_path)
         return
 
     for col in ['x1', 'x2']:
@@ -677,8 +678,14 @@ def apply_shift_to_csv(in_csv_path, dx, dy, dz, out_csv_path, slice_names=None):
             n = len(slice_names)
             df['slice_name'] = [slice_names[z - 1] if 1 <= z <= n else '' for z in df['z']]
 
-    os.makedirs(os.path.dirname(out_csv_path), exist_ok=True)
-    df.to_csv(out_csv_path, index=False)
+    _atomic_to_csv(df, out_csv_path)
+
+
+def _atomic_to_csv(df, path):
+    """先写 .part 再改名：进程中途被杀不会留下半截 CSV 被当成已完成。"""
+    tmp = path + '.part'
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -696,9 +703,122 @@ def save_tile_offsets(tile_name, shifts, scores, out_dir):
     }
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{tile_name}_offsets.json")
-    with open(out_path, 'w', encoding='utf-8') as f:
+    with open(out_path + '.part', 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2)
+    os.replace(out_path + '.part', out_path)
     return out_path
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 9b. One tile end to end (Stage 2.5 runs this in a CPU process pool)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _aligned_channel_ids(routing):
+    """每个 tile 要写对齐 CSV 的通道 id（含 double_exposure 的第二曝光）。"""
+    ids = []
+    for ch in routing:
+        ids.append(ch['id'])
+        if ch.get('double_exposure'):
+            ids.append(ch['second_intensity_id'])
+    return ids
+
+
+def _count_lines(path):
+    with open(path, 'rb') as f:
+        return sum(buf.count(b'\n') for buf in iter(lambda: f.read(1 << 20), b''))
+
+
+def tile_alignment_done(tile_name, det_dir, align_dir, routing):
+    """
+    offsets JSON 最后写，是完成标记；另外核对每个通道的对齐 CSV 与原始 CSV 行数一致
+    （apply_shift_to_csv 不增删行），防止旧版本流程先写 JSON、CSV 写到一半被杀的情况被当成已完成。
+    """
+    if not os.path.isfile(os.path.join(align_dir, f"{tile_name}_offsets.json")):
+        return False
+    primary = {ch['id'] for ch in routing}
+    for cid in _aligned_channel_ids(routing):
+        in_csv = os.path.join(det_dir, f"{tile_name}_{cid}_result.csv")
+        out_csv = os.path.join(align_dir, f"{tile_name}_{cid}_result.csv")
+        if not os.path.isfile(in_csv):
+            if cid in primary:
+                return False   # 让 align_tile 重跑并把缺失报出来，而不是悄悄当成已完成
+            continue
+        if not os.path.isfile(out_csv) or _count_lines(in_csv) != _count_lines(out_csv):
+            return False
+    return True
+
+
+def align_tile(tile_path, det_dir, align_dir, routing, settings):
+    """
+    Stage 2.5 的单 tile 流程：各通道轻量 z-link → 两步对齐 → 写对齐 CSV → 最后写 offsets JSON。
+    返回缺失的检测 CSV 路径列表。只做 CPU 计算，参数全可 pickle，供进程池直接调用。
+    """
+    from src.core.z_linker import run_z_linker   # 局部导入：z_linker 与本模块互不依赖，避免加载顺序问题
+
+    tile_name = os.path.basename(tile_path)
+    # 与 worker 相同的切片排序：CSV 里的 z（从 1 开始）对应 slice_names[z-1]，
+    # apply_shift_to_csv 施加 dz 时据此同步更新 slice_name
+    slice_names = [os.path.splitext(f)[0] for f in sorted(
+        f for f in os.listdir(tile_path)
+        if f.lower().endswith(('.tif', '.tiff')) and not f.startswith('.'))]
+
+    # 1. 对每个通道轻量 z-link，得到 per-tile 3D vol_list
+    per_ch_vol_lists, z_counts, missing = {}, [], []
+    for ch in routing:
+        cid, ctype = ch['id'], ch.get('type', 'soma')
+        csv_path = os.path.join(det_dir, f"{tile_name}_{cid}_result.csv")
+        per_ch_vol_lists[cid] = []
+        if not os.path.isfile(csv_path):
+            missing.append(csv_path)
+            continue
+        df_tile = pd.read_csv(csv_path)
+        if df_tile.empty:
+            continue
+        mat = df_tile[["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]].values
+        mat[:, 6] = np.array([f"{v}_{cid}" for v in mat[:, 6]])
+        _, vol_list = run_z_linker(mat, **settings['z_link']['soma' if ctype == 'soma' else 'tf'])
+        per_ch_vol_lists[cid] = vol_list
+        z_counts.extend(c.get('cz', 0) for c in vol_list)
+
+    # 2. 估计 tile z 中心；3. 两步体素对齐
+    z_center = float(np.median(z_counts)) if z_counts else 0.0
+    shifts, scores = compute_tile_channel_shifts(
+        per_ch_vol_lists,
+        soma_ch_ids=settings['soma_ch_ids'],
+        tf_ch_ids=settings['tf_ch_ids'],
+        z_center=z_center,
+        z_half_window=settings['sample_z_center_count'] // 2,
+        bin_size=settings['voxel_bin_size_px'],
+        xy_res_um=settings['xy_resolution_um'],
+        z_res_um=settings['z_resolution_um'],
+        xy_range_px=settings['xy_search_range_px'],
+        z_range_slices=settings['z_search_range_slices'],
+        fine_xy_px=settings['xy_fine_search_px'],
+        fine_z_slices=settings['z_fine_search_slices'],
+        max_center_dist_ratio=settings['max_center_dist_ratio'],
+        containment_z_pad=settings['containment_z_pad'],
+        tf_align_mode=settings['tf_align_mode'],
+    )
+
+    # 3b. double_exposure 通道的第二曝光复用主曝光的偏移量
+    # （同一物理通道/视野，只是曝光不同，无需独立点云配准）。
+    for ch in routing:
+        if ch.get('double_exposure'):
+            second_id = ch['second_intensity_id']
+            shifts[second_id] = shifts.get(ch['id'], (0, 0, 0))
+            scores[second_id] = scores.get(ch['id'], 0.0)
+
+    # 4. 对每个通道的原始 CSV 应用偏移（覆盖写：设置已由 check_align_settings 保证一致，
+    #    偏移是确定性的，重算的结果与上次相同）
+    for cid in _aligned_channel_ids(routing):
+        dx, dy, dz = shifts.get(cid, (0, 0, 0))
+        apply_shift_to_csv(os.path.join(det_dir, f"{tile_name}_{cid}_result.csv"), dx, dy, dz,
+                           os.path.join(align_dir, f"{tile_name}_{cid}_result.csv"),
+                           slice_names=slice_names)
+
+    # 5. 最后写 offsets JSON，作为该 tile 的完成标记
+    save_tile_offsets(tile_name, shifts, scores, align_dir)
+    return missing
 
 
 # ──────────────────────────────────────────────────────────────────────────────
