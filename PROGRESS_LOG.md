@@ -107,3 +107,84 @@
 - git：1–4 以及 5 之前的改动已在 `abb1cb4 pipeline update` 提交；之后的改动（`containment_coarse` 粗搜索、
   溯源修复、`compare_stitching.py` C 部分结论修正、README、本日志）尚未提交。
   `config_EGFR_t4.json`、`inference_cpu.slurm` 被 .gitignore 忽略，不在版本库里。
+
+---
+
+## 2026-09-17（下午）
+
+问题：Olig2/Sox9 这类核通道怎么做 channel alignment。想法：不用 TeraStitcher 的 merging XML 做全局坐标转换，
+tile 名字已经是台面坐标、tile 间有 15% 重叠，可以直接用相邻 tile 重叠区里的检测配对求 tile 间位移。
+T4 四个通道的检测都已完成，可以用来检验。
+
+### 做了什么
+
+**1. 在 T4 上验证了这个思路（4 通道 × 76 条接缝）**
+- 用 tile 名字（台面坐标，0.1 µm/单位）当初值，复用 `compare_stitching.py` 的接缝估计
+  （重叠区 z-link → 差值直方图粗对 → 互为最近邻迭代 → 取中位数），逐通道测相邻 tile 位移。
+- 接缝测量本身非常干净（成功接缝 / 配对数中位 / 配对差 MAD(x,y,z)）：
+  GFP 64/76, 648, (1.7,1.2,0.5)；RFP 65/76, 422, (1.8,1.0,0.5)；
+  Olig2 66/76, 5218, (1.3,0.8,0.5)；Sox9 66/76, 14926, (1.5,1.2,0.5)。
+  位移中位数的标准误：稠密核通道 0.02–0.03 px，soma 通道 0.07–0.15 px。
+- 失败的 10–12 条/通道全部集中在同一批没有细胞的边角 tile，四通道一致，不是算法问题。
+- 名义网格本身不够用：解出来的位置相对名义网格 p50 (19, 41, 3.3)、max (74, 124, 8)，
+  所以接缝求解这一步必须做，但**不需要 TeraStitcher**。
+
+**2. 关键发现：通道之间不是一个平移，而是一个倍率 / 倾斜场**
+- 把 `P_Olig2(t) − P_GFP(t)` 和两份 XML 的 `pos_488(t) − pos_640(t)` 逐 tile 比（方法完全独立：
+  细胞质心配对 vs 图像 NCC）：x corr +0.72、y corr +0.84、**z corr +0.98**（差的 std 0.64 层，
+  两边各自离散度 ±3 层）。通道间的逐 tile 位移是真实存在的物理量。
+- 它随位置线性变化：`dy` 随行号从 +19 px 走到 −21 px，`dz` 随列号从 −4 层走到 +5 层。
+- 用「共用 tile 位置 + 每通道仿射通道场」联合拟合出的斜率（相对 GFP/640）：
+  | 通道 | x (px/列) | y (px/行) | z (层/列) |
+  |---|---|---|---|
+  | Olig2 (488) | +4.43 | +5.25 | −2.09 |
+  | RFP (561) | +0.09 | +0.96 | −1.02 |
+  | Sox9 (730) | −0.07 | −0.03 | +0.25 |
+  z 斜率按波长单调、在参考通道 640 附近过零、730 变号 —— 色差（放大率差 + 光片焦面倾斜差）该有的样子。
+  y 的 5.25 px/行 = 5.25/1738 ≈ **0.30% 放大率差**，全脑累计约 40 px。
+  这解释了 9-16 记录里「第 1 列 tile 的 Olig2 偏移一致偏 +4~+9」——那是场，不是噪声。
+- 顺带发现**纯平移拼接模型本身的天花板**：`337500 → 348800` 那条行边界上，各通道 x 残差一致地
+  随列号从 +24 px 走到 −21 px，对应两排 tile 之间约 0.4° 的相对旋转。TeraStitcher 同样表达不了。
+  每通道各解各的时候，这个不自洽被各通道分摊得不一样，会冒充成 8–13 px 的"通道位移"。
+
+**3. 新脚本 `scripts/solve_tile_positions.py`**
+- 输入只有 `1_tile_2d_raw/` 和 tile 名字，不需要任何 XML。
+- 模型 `joint`（默认）：`P_c(t) = P(t) + delta_c(t)`，`delta_c(t) = a_c + b_c*行 + c_c*列`，参考通道 delta ≡ 0。
+  所有通道的接缝一起约束共用的 `P(t)`（旋转那类不自洽被它统一吸收），每通道只留 2 个斜率/轴。
+  拟合残差 p50 x 1.9 / y 0.74 / z 0.19 px，与每通道独立解（`--model free`，1.2 / 0.53 / 0.16）相当。
+  没有接缝的 tile 由「拉回名义网格」的弱先验撑住；joint 模式下只要该 tile 在**任一**通道有接缝就能定位。
+- 权重 = 位移中位数的标准误倒数（1.4826·MAD/√n），IRLS + Huber 鲁棒化。
+- 输出 `5_analysis_report/tile_positions/`：`seams.csv`（可复用，`--redo-seams` 重测）、
+  `tile_positions.csv`、`solution.json`、`report.txt`；`--write-xml` 出各通道 merging XML
+  （561/730 没有自己的 XML，借用参考通道的模板改写 `stacks_dir`/`mdata_bin`，仍需先 `--import` 生成 mdata.bin）；
+  `--write-aligned` 写成 `0_channel_alignment` 格式（offsets JSON + 平移后的 CSV），默认写到
+  `0_channel_alignment_solved/`，不覆盖原结果。
+- 生成的 XML 用 `src/utils/io.loadTeraxml` 复核可正常解析。
+
+### 关键决定
+- 逐 tile 的几何由**同通道**接缝匹配决定（每条几百到上万个配对），不再依赖 GFP 与 Olig2 标记同一批细胞。
+- 跨通道匹配只剩每通道 3 个常数 `a_c`（接缝只约束 delta 的差，Olig2 那个 dz≈−7 层就在这里面）。
+  这 3 个数应当拿全脑所有 tile 汇总来估，而不是每个 tile 各求一次。
+- `solve_tile_positions.py` 暂时用旧 Stage 2.5 偏移的中位数当 `a_c`（`--const-from offsets`，
+  报告里会打印「旧偏移减掉通道场后的离散度」）。T4 上 RFP (2.3,3.4,1.5)、Sox9 (3.1,3.0,0.7) 尚可，
+  Olig2 (23.3,25.2,6.1) 说明旧 Olig2 偏移基本是噪声，这个常数必须换更好的估计。
+- 不改配置、不删已有的 `0_channel_alignment/`：新脚本独立跑，输出到新目录，要用时再顶替。
+
+### 遇到的问题
+- 原型里一开始把接缝残差的符号弄反了（残差是"摆放误差"，要**减**不要加）。表现很隐蔽：
+  图的自洽性（拟合残差）不受影响，只有和 XML 对比时符号相反才暴露。已在脚本里注释清楚。
+- brain_detector 环境里 `np.corrcoef` / `np.polyfit` 会直接崩进程（和 matplotlib 崩溃同源，疑似 BLAS），
+  无 traceback、退出码 127。脚本里避免用这些，改手写协方差；`scipy.sparse.linalg.lsqr` 正常。
+- 稀疏通道（GFP）检测 CSV 的最大 z 远小于真实层数（485 vs 813），拿它当切片数会把 z 末段的细胞全剔掉。
+  `count_slices` 改为优先数 tile 目录里的 TIFF，退而取**所有通道**的最大 z。
+
+### 进行中 / 下一步
+- **全局常数 `a_c`（最要紧的一项）**：在 `point_cloud_aligner` 里加"全脑汇总"模式——各 tile 先按
+  `delta_c(t)` 归位，再把 soma−核的质心位移合并成一个直方图 / 包含度打分，一次求 3 个数。
+  数据量比现在的逐 tile 大几十倍，而未知数只有 3 个。
+- 空 tile（T4 有 5 个角落 tile 一条接缝都没有）：目前落在名义网格上。它们几乎没有细胞，
+  暂不做 intensity 相位相关兜底，只在报告里标出来。
+- 验证：`validate_align_shifts.py` 的 held-out 思路；新旧偏移下 GFP soma 被 TF 核包含的比例对比。
+- Stage 2.5 的逐 tile 包含搜索在新方案下只用于估常数，`z_search_range_slices: 10` 那条改动可以不做了。
+- T10 检测：计划在 gpu14 上用 4 块 L40。
+- git：`solve_tile_positions.py` 与本日志尚未提交（连同上一条记录里未提交的改动）。
