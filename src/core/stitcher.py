@@ -810,7 +810,11 @@ def non_max_suppression_iou(boxes, overlapThresh=0.45, sort_idx=4, containment_t
     return boxes[pick]
 
 
-def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, disp_mat, size, metadata_registry, tile_name, tILESIZE=2048, file_z0=None):
+def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, disp_mat, size, metadata_registry, tile_name, tILESIZE=2048, file_z0=None, row_meta=None):
+    """
+    row_meta: 可选 dict，(层, 类别) → [(tile_name, slice_name), ...]，与写进
+              all_predictions[层][类别] 的行一一对应、顺序相同（用于把溯源信息存进全局 2D CSV）。
+    """
     row, col = pos
     ABS_X, ABS_Y, ABS_Z = disp_mat[pos]
     # 重叠区判定只涉及当前 tile 自身的局部范围，用 tile 大小的局部 mask
@@ -846,6 +850,8 @@ def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, d
                 # 非重叠区：写入
                 new_rows.setdefault((z - 1, cell_type_index), []).append(
                     [x1, y1, x2, y2, score, mean, class_name, z])
+                if row_meta is not None:
+                    row_meta.setdefault((z - 1, cell_type_index), []).append((tile_name, slice_name))
                 metadata_registry.append([(x1 + x2) / 2, (y1 + y2) / 2, z, tile_name, slice_name])
             # 重叠区：丢弃（保留左/上方 tile 的结果，右/下方 tile 的重叠区检测一律舍弃）
 

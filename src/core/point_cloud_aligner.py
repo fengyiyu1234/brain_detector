@@ -10,7 +10,8 @@ Workflow per tile:
   5. _voxel_iou()               – voxel-level IoU at a given bin shift
   6. find_shift()               – coarse FFT + fine voxel-IoU search (intra-soma / intra-TF)
   7. _containment_score()       – soma-TF containment count at a given pixel shift
-  8. find_shift_containment()   – coarse FFT + fine containment search (soma↔TF cross-group)
+  7a. _displacement_peaks()    – soma−TF centroid displacement histogram → coarse candidates
+  8. find_shift_containment()   – coarse candidates + fine containment search (soma↔TF cross-group)
   9. compute_tile_channel_shifts() – two-step alignment strategy
   10. apply_shift_to_csv()       – applies (dx, dy, dz) to a detection CSV
   11. save_tile_offsets()        – writes per-tile offset JSON for traceability
@@ -429,6 +430,66 @@ def _containment_score(soma_idx, tf_arrays, dx, dy, dz,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 7a.  Containment-aware coarse search: displacement histogram
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _displacement_peaks(soma_idx, tf_arrays, xy_range_px, z_range_slices,
+                        max_center_dist_ratio, n_peaks=3, bin_px=2):
+    """
+    Coarse soma<->TF shift candidates from the histogram of (soma centroid - TF centroid).
+
+    A TF nucleus contributes to the containment count at shift s only when some
+    soma centroid lies within the gate radius of (TF centroid + s), i.e. when
+    s ~= soma - TF. Histogramming those displacements over the search window and
+    smoothing with the gate radius therefore approximates the containment count
+    for every candidate shift at once, from a single KD-tree query. The 3D FFT
+    of occupancy grids used by find_shift() does not: large soma boxes and dense
+    small nuclei give correlation peaks unrelated to containment, and the fine
+    search that follows only looks +/-fine_xy_px around whatever FFT returned.
+
+    Returns up to n_peaks (dx, dy, dz) candidates, strongest first, separated by
+    at least the smoothing radius.
+    """
+    from scipy.ndimage import uniform_filter
+
+    soma_c = soma_idx['centroids']
+    tf_c = tf_arrays[0]
+    if len(soma_c) == 0 or len(tf_c) == 0:
+        return [(0, 0, 0)]
+    r_xy, r_z = float(xy_range_px), max(int(z_range_slices), 0)
+    scale = np.array([1.0, 1.0, r_xy / max(r_z, 0.5)])
+    groups = cKDTree(soma_c * scale).query_ball_point(tf_c * scale, r=r_xy, p=np.inf, workers=-1)
+    counts = np.fromiter((len(g) for g in groups), dtype=np.int64, count=len(groups))
+    if counts.sum() == 0:
+        return [(0, 0, 0)]
+    ti = np.repeat(np.arange(len(tf_c)), counts)
+    si = np.fromiter((j for g in groups for j in g), dtype=np.int64, count=int(counts.sum()))
+    d = soma_c[si] - tf_c[ti]
+
+    n_xy = int(np.ceil(r_xy / bin_px))
+    edges_xy = (np.arange(-n_xy, n_xy + 2) - 0.5) * bin_px
+    edges_z = np.arange(-r_z, r_z + 2) - 0.5
+    hist, _ = np.histogramdd(d, bins=(edges_xy, edges_xy, edges_z))
+    gate = max_center_dist_ratio * float(np.median(soma_idx['radii']))
+    k_xy = 2 * int(np.ceil(gate / bin_px)) + 1
+    hist = uniform_filter(hist, size=(k_xy, k_xy, 3), mode='constant')
+
+    centers_xy = (edges_xy[:-1] + edges_xy[1:]) / 2
+    centers_z = (edges_z[:-1] + edges_z[1:]) / 2
+    sup_xy = max(k_xy, int(np.ceil(4 / bin_px)))
+    peaks = []
+    work = hist.copy()
+    for _ in range(n_peaks):
+        if work.max() <= 0:
+            break
+        i, j, k = np.unravel_index(np.argmax(work), work.shape)
+        peaks.append((int(round(centers_xy[i])), int(round(centers_xy[j])), int(round(centers_z[k]))))
+        work[max(i - sup_xy, 0):i + sup_xy + 1, max(j - sup_xy, 0):j + sup_xy + 1,
+             max(k - 1, 0):k + 2] = 0
+    return peaks or [(0, 0, 0)]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 7b.  Full find_shift_containment: voxelize → 3D FFT → fine containment search
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -436,15 +497,21 @@ def find_shift_containment(cells_ref_soma, cells_tf, z_lo, z_hi,
                            bin_size=4, xy_res_um=0.65, z_res_um=8.0,
                            xy_range_px=30, z_range_slices=5,
                            fine_xy_px=8, fine_z_slices=2,
-                           max_center_dist_ratio=0.3, xy_margin=0, z_pad=0):
+                           max_center_dist_ratio=0.3, xy_margin=0, z_pad=0,
+                           coarse='displacement_hist'):
     """
     Find (dx, dy, dz) that maximises soma-TF containment count (see module
     docstring for why this replaces voxel-IoU for the soma<->TF cross-group
     alignment step).
 
     Strategy:
-      1. Coarse: same 3D-FFT cross-correlation as find_shift() (unchanged),
-         to get near the true peak even for large shifts.
+      1. Coarse, within +/-xy_range_px / +/-z_range_slices:
+           'displacement_hist' (default) - histogram of soma-TF centroid
+             displacements (_displacement_peaks); the top candidates are each
+             checked with a small containment search and the best one is kept.
+           'fft' - the 3D-FFT occupancy cross-correlation of find_shift(). Kept
+             for reproducing old results only: on a dense TF channel (Olig2 vs a
+             GFP soma reference) it locked onto spurious peaks in most tiles.
       2. Fine: instead of voxel-IoU, score each candidate pixel/slice shift
          by how many TF cells satisfy strict containment inside a soma cell
          (same test as stitcher.annotate_soma_with_tf_containment).
@@ -468,35 +535,54 @@ def find_shift_containment(cells_ref_soma, cells_tf, z_lo, z_hi,
     """
     if not cells_ref_soma or not cells_tf:
         return 0, 0, 0, 0.0
+    if coarse not in ('displacement_hist', 'fft'):
+        raise ValueError(f"coarse 只能是 'displacement_hist' 或 'fft'，收到 {coarse!r}")
 
-    all_cells = cells_ref_soma + cells_tf
-    x_min = min(c.get('x1_3d', c.get('cx', 0)) for c in all_cells)
-    x_max = max(c.get('x2_3d', c.get('cx', 0)) for c in all_cells)
-    y_min = min(c.get('y1_3d', c.get('cy', 0)) for c in all_cells)
-    y_max = max(c.get('y2_3d', c.get('cy', 0)) for c in all_cells)
-
-    pad = xy_range_px + fine_xy_px
-    x_min -= pad;  x_max += pad
-    y_min -= pad;  y_max += pad
-
-    grid_ref = _voxelize_to_grid(cells_ref_soma, z_lo, z_hi,
-                                  x_min, x_max, y_min, y_max,
-                                  bin_size, xy_res_um, z_res_um)
-    grid_tgt = _voxelize_to_grid(cells_tf, z_lo, z_hi,
-                                  x_min, x_max, y_min, y_max,
-                                  bin_size, xy_res_um, z_res_um)
-
-    if grid_ref.sum() == 0 or grid_tgt.sum() == 0:
-        return 0, 0, 0, 0.0
-
-    # Coarse: 3D FFT (identical to find_shift)
-    dx_fft, dy_fft, dz_fft = _fft_3d_shifts(
-        grid_ref, grid_tgt, xy_range_px, z_range_slices, bin_size
-    )
-
-    # Fine search in pixel/slice space around FFT peak, scored by containment
     soma_idx  = _prepare_soma_containment_index(cells_ref_soma)
     tf_arrays = _cell_arrays(cells_tf)
+
+    def _score(dx, dy, dz):
+        return _containment_score(soma_idx, tf_arrays, dx, dy, dz,
+                                  max_center_dist_ratio, xy_margin, z_pad)
+
+    if coarse == 'fft':
+        all_cells = cells_ref_soma + cells_tf
+        x_min = min(c.get('x1_3d', c.get('cx', 0)) for c in all_cells)
+        x_max = max(c.get('x2_3d', c.get('cx', 0)) for c in all_cells)
+        y_min = min(c.get('y1_3d', c.get('cy', 0)) for c in all_cells)
+        y_max = max(c.get('y2_3d', c.get('cy', 0)) for c in all_cells)
+
+        pad = xy_range_px + fine_xy_px
+        x_min -= pad;  x_max += pad
+        y_min -= pad;  y_max += pad
+
+        grid_ref = _voxelize_to_grid(cells_ref_soma, z_lo, z_hi,
+                                      x_min, x_max, y_min, y_max,
+                                      bin_size, xy_res_um, z_res_um)
+        grid_tgt = _voxelize_to_grid(cells_tf, z_lo, z_hi,
+                                      x_min, x_max, y_min, y_max,
+                                      bin_size, xy_res_um, z_res_um)
+
+        if grid_ref.sum() == 0 or grid_tgt.sum() == 0:
+            return 0, 0, 0, 0.0
+
+        dx_fft, dy_fft, dz_fft = _fft_3d_shifts(
+            grid_ref, grid_tgt, xy_range_px, z_range_slices, bin_size
+        )
+    else:
+        # 每个候选峰先在 ±2 px / ±1 层内做小范围包含打分，取最好的作为精搜索中心
+        best_c, best_c_score = (0, 0, 0), (-1, -1.0)
+        for cx, cy, cz in _displacement_peaks(soma_idx, tf_arrays, xy_range_px, z_range_slices,
+                                              max_center_dist_ratio):
+            for ddx in range(-2, 3):
+                for ddy in range(-2, 3):
+                    for ddz in range(-1, 2):
+                        sc = _score(cx + ddx, cy + ddy, cz + ddz)
+                        if sc > best_c_score:
+                            best_c_score, best_c = sc, (cx + ddx, cy + ddy, cz + ddz)
+        dx_fft, dy_fft, dz_fft = best_c
+
+    # Fine search in pixel/slice space around the coarse peak, scored by containment
 
     # (count, margin_sum) compared lexicographically: count is the primary
     # objective, margin_sum breaks ties toward the best-centered shift when
@@ -510,10 +596,7 @@ def find_shift_containment(cells_ref_soma, cells_tf, z_lo, z_hi,
                 dx_c = dx_fft + ddx
                 dy_c = dy_fft + ddy
                 dz_c = dz_fft + ddz
-                score = _containment_score(
-                    soma_idx, tf_arrays, dx_c, dy_c, dz_c,
-                    max_center_dist_ratio, xy_margin, z_pad
-                )
+                score = _score(dx_c, dy_c, dz_c)
                 if score > best_score:
                     best_score = score
                     best_dx, best_dy, best_dz = dx_c, dy_c, dz_c
@@ -533,7 +616,8 @@ def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
                                 xy_range_px=30, z_range_slices=5,
                                 fine_xy_px=8, fine_z_slices=2,
                                 max_center_dist_ratio=0.3, xy_margin=0,
-                                containment_z_pad=0, tf_align_mode='chain'):
+                                containment_z_pad=0, tf_align_mode='chain',
+                                containment_coarse='displacement_hist'):
     """
     Compute final (dx, dy, dz) per channel for one tile using two-step strategy.
 
@@ -561,6 +645,7 @@ def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
                              see stitcher.annotate_soma_with_tf_containment
     xy_margin, containment_z_pad : containment tolerance for Step 2, see
                              stitcher.annotate_soma_with_tf_containment
+    containment_coarse : str coarse search of the soma<->TF step, see find_shift_containment
 
     Returns
     -------
@@ -606,7 +691,7 @@ def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
             dx, dy, dz, sc = find_shift_containment(
                 boxes_ref_soma, _boxes(cid),
                 max_center_dist_ratio=max_center_dist_ratio,
-                xy_margin=xy_margin, z_pad=containment_z_pad,
+                xy_margin=xy_margin, z_pad=containment_z_pad, coarse=containment_coarse,
                 **align_kwargs
             )
             shifts[cid] = (dx, dy, dz)
@@ -626,7 +711,7 @@ def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
         cx, cy, cz, sc_cross = find_shift_containment(
             boxes_ref_soma, boxes_ref_tf,
             max_center_dist_ratio=max_center_dist_ratio,
-            xy_margin=xy_margin, z_pad=containment_z_pad,
+            xy_margin=xy_margin, z_pad=containment_z_pad, coarse=containment_coarse,
             **align_kwargs
         )
         shifts[ref_tf] = (cx, cy, cz)
@@ -798,6 +883,7 @@ def align_tile(tile_path, det_dir, align_dir, routing, settings):
         max_center_dist_ratio=settings['max_center_dist_ratio'],
         containment_z_pad=settings['containment_z_pad'],
         tf_align_mode=settings['tf_align_mode'],
+        containment_coarse=settings.get('containment_coarse', 'fft'),
     )
 
     # 3b. double_exposure 通道的第二曝光复用主曝光的偏移量
@@ -870,6 +956,7 @@ def resolve_align_settings(config, routing_config):
         'z_resolution_um': dp.get('z_resolution_um', 8.0),
         'max_center_dist_ratio': zl_tf.get('max_center_dist_ratio', 0.3),
         'containment_z_pad': zl_tf.get('containment_z_pad', 0),
+        'containment_coarse': pa.get('containment_coarse', 'displacement_hist'),
     }
 
 
@@ -887,6 +974,8 @@ def check_align_settings(align_dir, settings):
     if os.path.isfile(path):
         with open(path, encoding='utf-8') as f:
             saved = json.load(f)
+        # 这个键出现之前的对齐结果都是用 FFT 粗搜索算的
+        saved.setdefault('containment_coarse', 'fft')
         current = json.loads(json.dumps(settings))
         if saved != current:
             changed = sorted(k for k in set(saved) | set(current) if saved.get(k) != current.get(k))
@@ -894,6 +983,8 @@ def check_align_settings(align_dir, settings):
             raise ValueError(
                 f"❌ 对齐设置与 {align_dir} 里已有的结果不一致（{details}）。"
                 f"已有的对齐 CSV 不会被覆盖，请删除该目录后重跑 Stage 2.5。"
+                + ('（只想沿用旧结果的话，在 pre_align_params 里设 "containment_coarse": "fft"。）'
+                   if changed == ['containment_coarse'] else "")
             )
         return True
     if os.path.isdir(align_dir) and any(f.endswith(('_result.csv', '_offsets.json'))

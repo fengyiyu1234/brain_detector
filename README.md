@@ -70,7 +70,9 @@ Final offsets:
   Olig2: containment shift → GFP
 ```
 
-Z-search is soft-capped at ±5 slices (warning if exceeded) and hard-capped at ±10 (forced to 0).
+Search windows: the coarse step covers ±`xy_search_range_px` / ±`z_search_range_slices`, the fine step ±`xy_fine_search_px` / ±`z_fine_search_slices` around the coarse result, so a shift outside the sum of the two can never be found. There is no cap beyond that — check `validate_align_shifts.py` for shifts that sit at the edge.
+
+The soma↔TF (containment) step finds its coarse candidates from a histogram of soma−TF centroid displacements (`containment_coarse: "displacement_hist"`, default): a nucleus only counts at shift *s* when a soma centroid lies within the gate radius of nucleus + *s*, so the histogram peak is where containment peaks. The previous coarse step (`"fft"`, 3D-FFT correlation of occupancy grids, still used by the intra-soma / intra-TF steps) locked onto spurious peaks for a dense nuclear channel against a GFP soma reference on T4, and the ±8 px fine search never reached the real one. `_align_settings.json` files written before this option existed count as `"fft"`, so re-running a sample aligned with the old code stops with a settings mismatch: delete `0_channel_alignment/` to re-align, or set `"containment_coarse": "fft"` to keep the old offsets.
 
 #### Validating the computed offsets
 
@@ -222,6 +224,7 @@ Stage 3 stitches and z-links every channel in its own process; this caps how man
 | `z_search_range_slices` | 5 | FFT coarse-search Z range (±slices); soft cap 5, hard cap 10 |
 | `xy_fine_search_px` | 8 | Fine-search XY range around FFT peak (px) |
 | `z_fine_search_slices` | 2 | Fine-search Z range around FFT peak (slices) |
+| `containment_coarse` | `"displacement_hist"` | Coarse search of the soma↔TF containment step; `"fft"` reproduces results aligned before this option existed (see [pre_align](#pre_align)) |
 | `tile_overlap_pct` | 15 | Tile overlap % (fallback grid calculation when TeraStitcher XML is absent) |
 | `n_workers` | `$SLURM_CPUS_PER_TASK`, else CPU count | Stage 2.5 CPU processes, one tile each. Stage 2.5 never uses a GPU, so run it in a CPU job (`scripts/inference_cpu.slurm`) rather than holding GPUs. Not part of `_align_settings.json` — changing it never invalidates finished tiles |
 

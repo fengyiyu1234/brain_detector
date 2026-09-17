@@ -766,7 +766,14 @@ def main():
             tag = f"{sa['name']}_vs_{sb['name']}"
             df.to_csv(os.path.join(out_dir, f"cross_{tag}.csv"), index=False)
             _print_df(summ, f"C. {sa['name']}({sa['channel']}) vs {sb['name']}({sb['channel']})")
-            print("  std_residual 明显小于 std_pos_diff → 两份拼接的差异能被逐 tile 通道偏移解释，互相印证")
+            ratio = (summ['std_residual'] / summ['std_pos_diff'].replace(0, np.nan)).to_numpy()
+            if np.nanmax(ratio) < 0.5:
+                print("  ✔️ std_residual 明显小于 std_pos_diff → 两份拼接的差异能被逐 tile 通道偏移解释，互相印证")
+            elif np.nanmin(ratio) >= 1.0:
+                print("  ❌ std_residual 不小于 std_pos_diff → 逐 tile 通道偏移解释不了两份拼接的差异，"
+                      "至少有一方（通道对齐或拼接）不可信")
+            else:
+                print("  ⚠️ 部分轴能被通道偏移解释、部分不能，逐轴看 std_residual / std_pos_diff")
             flagged = df[df['flagged']]
             if not flagged.empty:
                 print(f"⚠️  {len(flagged)} 个 tile 残差超阈值：{flagged['tile'].tolist()}")
