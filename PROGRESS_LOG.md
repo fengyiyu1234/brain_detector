@@ -169,6 +169,23 @@ T4 四个通道的检测都已完成，可以用来检验。
   报告里会打印「旧偏移减掉通道场后的离散度」）。T4 上 RFP (2.3,3.4,1.5)、Sox9 (3.1,3.0,0.7) 尚可，
   Olig2 (23.3,25.2,6.1) 说明旧 Olig2 偏移基本是噪声，这个常数必须换更好的估计。
 - 不改配置、不删已有的 `0_channel_alignment/`：新脚本独立跑，输出到新目录，要用时再顶替。
+- `paths.pATHXML` **保留**，但角色反过来了：不再是 TeraStitcher 算出来的输入，而是我们解出来、
+  同时喂给 `teraconverter` merge 和 Stage 3 的那一份。理由：teraconverter 只认 merging XML，
+  而「细胞坐标和 merge 出配准图的 XML 必须是同一份」这条不变式（`run_inference.py` 里已有的注释）
+  最好靠**同一个文件**来保证，别再多一份 CSV 各算各的。而且 pATHXML 不显式指定的话，流程会退回去
+  捡 `anchor_dir/xml_merging.xml`，也就是旧的 TeraStitcher 结果——所以现在更得写死。
+- **两个「参考」拆开**（脚本里是 `--ref` 和 `--frame`）：
+  - `--ref`（通道对齐参考）= **GFP**。通道场 `delta_c` 和常数 `a_c` 都相对它测量。理由：Stage 3B
+    判的是「GFP 细胞体里有没有 TF 核」，要让 GFP↔各核通道成为直接测量的那一对，误差才落在最该准的地方。
+  - `--frame`（全局坐标系）= **Olig2**。细胞和配准用的全脑图都落在 488 的几何上，配准图最干净。
+  - 两者的换算是精确的规范变换，不重测任何东西：`s_c(t) = [delta_c + a_c] − [delta_frame + a_frame]`。
+    T4 上已跑出 `--ref GFP --frame Olig2` 的结果（`s_Olig2 ≡ 0`，GFP 拿到 ±20 px / ±4 层的逐 tile 偏移）。
+  - 代价：GFP 细胞坐标不再是"原样不动"，会带上 Olig2 通道场和取整（≤0.5 px）；
+    而且 GFP 的 `dz ≠ 0`，**GFP 细胞的 `slice_name` 也变成坐标系通道的层号**，回原图查看要减 dz。
+    （T4 四个通道的层名和层数完全一致，所以只是层号语义问题，不会指到别的文件。）
+- Stage 3 不读 `reference_channel`（只有 Stage 2.5 和 `validate_align_shifts.py` 读），
+  所以 frame 换成 Olig2 没有阻碍；但 `validate_align_shifts.py` 会按 config 里的 GFP 解读偏移，
+  用它检验新结果前要注意这一点。
 
 ### 遇到的问题
 - 原型里一开始把接缝残差的符号弄反了（残差是"摆放误差"，要**减**不要加）。表现很隐蔽：
@@ -188,3 +205,119 @@ T4 四个通道的检测都已完成，可以用来检验。
 - Stage 2.5 的逐 tile 包含搜索在新方案下只用于估常数，`z_search_range_slices: 10` 那条改动可以不做了。
 - T10 检测：计划在 gpu14 上用 4 块 L40。
 - git：`solve_tile_positions.py` 与本日志尚未提交（连同上一条记录里未提交的改动）。
+
+---
+
+## 2026-09-17（晚）常数估计写进脚本；整条思路定型
+
+### 思路总览（新会话先看这段）
+
+细胞的全局坐标 = `tile 位置 + tile 内坐标`，而每个通道有自己的一套 tile 位置
+`P_c(t) = P(t) + delta_c(t)`。整条链子拆成三段，每段用它最可靠的数据来定：
+
+1. **tile 之间的相对位置** ← 同通道接缝配对。相邻 tile 重叠 15%，同一个细胞被两个 tile 各检测
+   一次，配上就得到位移。稠密核通道每条接缝几千上万个配对，位移中位数标准误 0.02 px。
+   **不需要 TeraStitcher 的位移计算。**
+2. **通道之间随位置变化的部分** `delta_c(t)` ← 由两个通道各自的接缝解之差得到，用仿射场
+   （行/列一次项）表达。这是真实的色差（倍率差 + 光片倾斜差），T4 上全脑累计约 40 px / 9 层。
+3. **每通道一个整体平移** `a_c`（3 个数）← 只能靠跨通道匹配。接缝对它完全无约束：把某通道所有
+   tile 一起平移，每条接缝依然精确自洽。所以把**全脑所有 tile 的细胞按解出来的位置摆进同一套
+   坐标，一次估这 3 个数**，而不是像旧 Stage 2.5 那样每个 tile 各估一次。
+
+两个「参考」分开：`--ref GFP`（通道对齐的测量基准，MADM 细胞是主角，Stage 3B 判的也是
+「GFP 细胞体里有没有 TF 核」）、`--frame Olig2`（全局坐标系，配准图用 488 最干净）。
+两者之间是精确的规范变换：`s_c(t) = [delta_c + a_c] − [delta_frame + a_frame]`。
+
+TeraStitcher 从此只做 merge，XML 从**输入**变成**输出**（`paths.pATHXML` 指向我们生成的那份）。
+
+### 本次代码改动
+
+**1. `src/core/point_cloud_aligner.py` 重构（不改变 Stage 2.5 行为）**
+- 从 `find_shift_containment` 里抽出三个函数：`_coarse_from_peaks`（位移直方图粗搜索）、
+  `_fine_containment`（包含度精搜索）、`containment_shift_from_arrays`（数组版入口，
+  给 solve_tile_positions.py 用汇总点云调用）。
+- `_fine_containment` 顺带优化：候选 (soma, TF) 对**只从 KD 树取一次**，半径放大到覆盖整个精搜索窗，
+  之后每个候选位移只做纯 numpy 判断。这是精确等价而非近似——包含关系本身就要求两个质心的距离
+  不超过 soma 的半对角线（≤ max_radius），所以放大半径只会多出必然判不过的对。
+  取候选对（每个 TF 细胞一个 Python list）原本占了绝大部分时间：单 tile 405 个候选位移
+  **73 s → 12 s**；汇总点云（8 万核）上这一步是能不能跑的分界线。
+
+**2. `scripts/solve_tile_positions.py`**
+- `--const-from pooled`（默认）：并行把每个 tile 每个通道的中心 z 窗 z-link 成紧凑数组、
+  加上该通道解出的 tile 位置，拼成全脑点云，然后
+  soma↔TF 用包含度打分（与 Stage 3B 同一判据）、同类型通道用质心位移直方图 + 互为最近邻。
+  另有 `--const`（直接给死）和 `--const-from offsets`（取旧结果中位数）两条路。
+- `--ref` / `--frame` 分离（见上）。`s_*` 列是搬到 frame 的量，`field_*`/常数仍相对 ref。
+- 报告里同时打印旧 Stage 2.5 的中位数与逐 tile 离散度作对照，`solution.json` 存常数来源、
+  包含率/配对数、抽样参数，可追溯。
+- 抽样参数：`--const-max-cells`（精搜索，默认 8 万）、`--const-coarse-cells`（粗搜索，默认 2.5 万）、
+  `--const-z-window`（默认 `sample_z_center_count`）、`--const-win-xy/z`、`--const-fine-xy/z`。
+
+**3. T4 上的汇总规模**（中心 ±25 层，45 个 tile）
+GFP 48165 soma / RFP 32081 / Olig2 494716 核 / Sox9 1144307 核。
+旧 Stage 2.5 每个 tile 只有约 1–3 千 GFP soma 可用——这就是 45 倍的差别。
+
+**3b. held-out 对照（新方法 vs 旧 Stage 2.5，唯一公平的"哪个更好"）**
+- 求解完成后，脚本另取每个 tile 中心窗**外**、隔开半个窗（`--holdout-gap`，默认 1.5 个窗厚）的
+  同样厚度 z 段，在这段没参与任何估计的数据上，用**同一批细胞、同一判据**（Stage 3B 的包含度）
+  给两套摆放各打一次分：新方法（通道场 + 3 个常数）vs 旧的逐 tile 偏移。
+- 为什么必须 held-out：旧方法是逐 tile 直接最大化这个分数的（45×3 = 135 个自由参数），
+  在它自己用过的 z 窗上必然占便宜。新方法每通道只有 3 个常数 + 2 个斜率/轴，
+  要在没见过的数据上赢才算真赢。
+- 抽样对两套摆放抽**同一批行**（行序来自同一个 parts 字典），`--holdout-max-cells` 默认 30 万。
+- 记住：结论对常数的估计质量极其敏感。抽样太小时常数本身是噪声，这个对照只反映那一点。
+
+**4. HPC 上跑的两个入口（本机太慢，正式计算搬过去）**
+- `scripts/check_containment_equivalence.py`（新增）：重构等价性检验，做两件事——
+  A 穷举精搜索（逐候选调用 `_containment_score`）vs 新的 `_fine_containment`；
+  B 重构前的整个 `find_shift_containment` 函数体（原样抄在脚本里作参照）vs 现在的实现，
+  `displacement_hist` / `fft` 两种粗搜索都测。有不一致就非零退出。
+  参数从 `runtime_config.json` 解析，与 Stage 2.5 同源；默认按 CSV 大小自动挑细胞多的 tile。
+- `scripts/solve_tile_positions.slurm`（新增）：纯 CPU 作业，16 核 / 120G / 8 小时。
+  `CHECK=1` 先跑等价性检验（不通过就直接退出，不出求解结果）；
+  `WRITE_ALIGNED=1` 才写 `0_channel_alignment_solved/`；`REDO_SEAMS=1` 重测接缝。
+  `SAMPLE/REF/FRAME/WORKERS` 都可用 `--export` 覆盖。
+
+### 验证状态
+- ✅ 新 `_fine_containment` 与穷举调用 `_containment_score`：合成数据上 argmax 与计数完全一致。
+- ✅ 真实数据（T4）上也一致，本机已过的样本点：
+  - `303600_327300` Olig2（soma 392 / 核 6046）：A 两者都给 (2, 10, −2)、33 个包含，新版快 26×；
+    B `displacement_hist` 旧 = 新 = (2, 10, −2, 0.00546)。
+  - `326200_338600` Olig2（soma 2695 / 核 20967）：B `displacement_hist` 旧 = 新 =
+    (2, −7, 2, 0.00692)；A 精搜索 405 个候选位移 73 s → 12 s。
+- ⏳ 完整的一轮（多 tile × Sox9/Olig2 × 含 `fft` 粗搜索）改在 HPC 上跑：`CHECK=1`。
+- ⏳ T4 的三个常数改在 HPC 上跑（本机 Y: 盘 I/O 被其他任务占满，进程 CPU 时间远小于墙钟）。
+- 本机用**故意调小的抽样**（每边 4000 个细胞、精搜索 ±1 px）跑通了汇总 + held-out 全流程：
+  汇总 33 s、held-out 汇总 33 s。这一轮的数值**不能用来判方法**——包含率只有 0.002
+  （匹配到的核只有个位数），常数本身就是噪声，held-out 对照因此显示"旧方法更好"
+  （Sox9 12851 vs 2852、Olig2 3577 vs 1579）。**正式跑（默认抽样）之后才看这两行。**
+  唯一一个这轮就可信的数是 RFP 的常数：(+2.6, −1.9, −2.4)，9914 个配对、MAD (1.8, 2.0, 0.7)，
+  与旧 Stage 2.5 的中位数 (+2.4, −3.5, −2.4) 只差 (0.2, 1.6, 0.0)——soma↔soma 的质心配对
+  这条路本来就好定，两种方法互相印证。
+
+### 遇到的问题
+- 本机同时有别的 python 任务在跑（4 个进程各 25 CPU-小时），CPU 占 ~26/56 核、Y: 盘 I/O 饱和，
+  本会话的脚本因此明显变慢（进程 CPU 时间远小于墙钟时间，是 I/O 等待）。跑正式的求解建议在 HPC 上，
+  或等本机空下来。
+
+### 下一步（按顺序，都在 HPC 上）
+0. **等价性检验 + 求解一次跑完**（`cd .../brain_detector/scripts`）：
+   `sbatch --export=ALL,CHECK=1 solve_tile_positions.slurm`
+   检验不通过会直接退出、不产出求解结果。以后重跑不用再带 `CHECK=1`。
+1. **看报告**：`5_analysis_report/tile_positions/report.txt`——三个常数的包含率/配对数、
+   与旧 Stage 2.5 中位数的差、接缝拟合残差、通道场斜率。
+2. **写对齐结果**：`sbatch --export=ALL,WRITE_ALIGNED=1 solve_tile_positions.slurm`
+   （接缝会复用已有的 `seams.csv`，只重算常数和输出），写到 `0_channel_alignment_solved/`。
+3. **顶替**：`0_channel_alignment` 改名备份 → `0_channel_alignment_solved` 改名顶上 →
+   删 `1_tile_2d_filtered/`（它是按旧偏移生成的；`1_tile_2d_fused`、`2_global_2d_raw`、
+   `3_channel_3d`、`4_colocalization` 现在都是空的）。
+4. **merge 配准用的全脑图**：用 `tile_positions/xml_merging_Olig2.xml` 跑 teraconverter merge。
+5. **config**：`paths.pATHXML` 指到同一份 XML，`stop_before_stitching` 改 `false`，跑 Stage 3+。
+6. **评估**（我来做，需要 1–5 的产物）：
+   - 接缝拟合残差、通道场斜率是否仍符合色差的物理预期；
+   - 三个常数的包含率 vs 旧偏移下的包含率（同一判据，可直接比）；
+   - `compare_stitching.py` 的 B 部分用新 XML 测接缝残差，应显著优于原 640/488 XML
+     （原来算出来的接缝中位误差 1.3–1.9 µm，被替换成机械默认的 8.9–14.3 µm）；
+   - Stage 3 之后：coloc_result 里 GFP soma 带 TF 核的比例、各类别计数，与 sample18 对比；
+   - `validate_align_shifts.py` 的 held-out 检验（注意它按 config 的 `reference_channel` 解读偏移，
+     frame=Olig2 时会误判，用前要么改 config 要么给它加参数）。

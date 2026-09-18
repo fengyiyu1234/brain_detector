@@ -541,10 +541,6 @@ def find_shift_containment(cells_ref_soma, cells_tf, z_lo, z_hi,
     soma_idx  = _prepare_soma_containment_index(cells_ref_soma)
     tf_arrays = _cell_arrays(cells_tf)
 
-    def _score(dx, dy, dz):
-        return _containment_score(soma_idx, tf_arrays, dx, dy, dz,
-                                  max_center_dist_ratio, xy_margin, z_pad)
-
     if coarse == 'fft':
         all_cells = cells_ref_soma + cells_tf
         x_min = min(c.get('x1_3d', c.get('cx', 0)) for c in all_cells)
@@ -570,40 +566,139 @@ def find_shift_containment(cells_ref_soma, cells_tf, z_lo, z_hi,
             grid_ref, grid_tgt, xy_range_px, z_range_slices, bin_size
         )
     else:
-        # 每个候选峰先在 ±2 px / ±1 层内做小范围包含打分，取最好的作为精搜索中心
-        best_c, best_c_score = (0, 0, 0), (-1, -1.0)
-        for cx, cy, cz in _displacement_peaks(soma_idx, tf_arrays, xy_range_px, z_range_slices,
-                                              max_center_dist_ratio):
-            for ddx in range(-2, 3):
-                for ddy in range(-2, 3):
-                    for ddz in range(-1, 2):
-                        sc = _score(cx + ddx, cy + ddy, cz + ddz)
-                        if sc > best_c_score:
-                            best_c_score, best_c = sc, (cx + ddx, cy + ddy, cz + ddz)
-        dx_fft, dy_fft, dz_fft = best_c
+        dx_fft, dy_fft, dz_fft = _coarse_from_peaks(
+            soma_idx, tf_arrays, xy_range_px, z_range_slices,
+            max_center_dist_ratio, xy_margin, z_pad)
 
-    # Fine search in pixel/slice space around the coarse peak, scored by containment
+    best_dx, best_dy, best_dz, best_count = _fine_containment(
+        soma_idx, tf_arrays, (dx_fft, dy_fft, dz_fft), fine_xy_px, fine_z_slices,
+        max_center_dist_ratio, xy_margin, z_pad)
+    return (best_dx, best_dy, best_dz, float(best_count) / max(1, len(cells_tf)))
 
-    # (count, margin_sum) compared lexicographically: count is the primary
-    # objective, margin_sum breaks ties toward the best-centered shift when
-    # several nearby candidates all achieve the same containment count.
+
+def _coarse_from_peaks(soma_idx, tf_arrays, xy_range_px, z_range_slices,
+                       max_center_dist_ratio, xy_margin=0, z_pad=0):
+    """每个候选峰先在 ±2 px / ±1 层内做小范围包含打分，取最好的作为精搜索中心。"""
+    best_c, best_c_score = (0, 0, 0), (-1, -1.0)
+    for cx, cy, cz in _displacement_peaks(soma_idx, tf_arrays, xy_range_px, z_range_slices,
+                                          max_center_dist_ratio):
+        for ddx in range(-2, 3):
+            for ddy in range(-2, 3):
+                for ddz in range(-1, 2):
+                    sc = _containment_score(soma_idx, tf_arrays, cx + ddx, cy + ddy, cz + ddz,
+                                            max_center_dist_ratio, xy_margin, z_pad)
+                    if sc > best_c_score:
+                        best_c_score, best_c = sc, (cx + ddx, cy + ddy, cz + ddz)
+    return best_c
+
+
+def _fine_containment(soma_idx, tf_arrays, center, fine_xy_px, fine_z_slices,
+                      max_center_dist_ratio, xy_margin=0, z_pad=0):
+    """
+    Fine search in pixel/slice space around the coarse peak, scored by containment.
+
+    (count, margin_sum) compared lexicographically: count is the primary
+    objective, margin_sum breaks ties toward the best-centered shift when
+    several nearby candidates all achieve the same containment count.
+
+    The candidate (soma, TF) pairs are gathered from the KD-tree **once**, with the
+    radius grown to cover the whole fine window, instead of re-querying for every
+    candidate shift as _containment_score() does. That is exact, not an approximation:
+    bbox containment already implies the two centroids are within the soma's
+    half-diagonal (<= max_radius), so the radius filter never removes a pair that
+    could match — a wider radius only adds pairs that fail the tests anyway.
+    Gathering the pairs is what dominates the cost (one Python list per TF cell), so
+    hoisting it out of the loop is what makes a pooled whole-brain estimate feasible.
+
+    Returns (dx, dy, dz, count).
+    """
+    tf_centroids, t_x1, t_y1, t_x2, t_y2, t_z1, t_z2 = tf_arrays
+    n_tf = len(tf_centroids)
+    dx0, dy0, dz0 = (int(v) for v in center)
+    if n_tf == 0 or len(soma_idx['centroids']) == 0:
+        return dx0, dy0, dz0, 0
+
+    span = float(np.sqrt(2.0) * fine_xy_px + fine_z_slices)
+    radius = soma_idx['max_radius'] * 2 + span
+    base = tf_centroids + np.array([dx0, dy0, dz0], dtype=float)
+    lists = soma_idx['tree'].query_ball_point(base, r=radius, workers=-1)
+    counts = np.fromiter((len(c) for c in lists), dtype=np.int64, count=n_tf)
+    total = int(counts.sum())
+    if total == 0:
+        return dx0, dy0, dz0, 0
+
+    i_arr = np.repeat(np.arange(n_tf, dtype=np.int64), counts)
+    j_arr = np.fromiter((j for c in lists for j in c), dtype=np.int64, count=total)
+    del lists
+
+    # 与 shift 无关的量，先取好
+    tx1, tx2 = t_x1[i_arr], t_x2[i_arr]
+    ty1, ty2 = t_y1[i_arr], t_y2[i_arr]
+    tz1, tz2 = t_z1[i_arr], t_z2[i_arr]
+    tc = tf_centroids[i_arr]
+    sx1, sx2 = soma_idx['x1'][j_arr], soma_idx['x2'][j_arr]
+    sy1, sy2 = soma_idx['y1'][j_arr], soma_idx['y2'][j_arr]
+    sz1, sz2 = soma_idx['z1'][j_arr], soma_idx['z2'][j_arr]
+    sc = soma_idx['centroids'][j_arr]
+    gate_radius = max_center_dist_ratio * soma_idx['radii'][j_arr]
+
     best_score = (-1, -1.0)
-    best_dx, best_dy, best_dz = dx_fft, dy_fft, dz_fft
-
+    best_dx, best_dy, best_dz = dx0, dy0, dz0
     for ddx in range(-fine_xy_px, fine_xy_px + 1):
         for ddy in range(-fine_xy_px, fine_xy_px + 1):
             for ddz in range(-fine_z_slices, fine_z_slices + 1):
-                dx_c = dx_fft + ddx
-                dy_c = dy_fft + ddy
-                dz_c = dz_fft + ddz
-                score = _score(dx_c, dy_c, dz_c)
+                dx_c, dy_c, dz_c = dx0 + ddx, dy0 + ddy, dz0 + ddz
+                ok = ((sx1 - xy_margin <= tx1 + dx_c) & (tx2 + dx_c <= sx2 + xy_margin) &
+                      (sy1 - xy_margin <= ty1 + dy_c) & (ty2 + dy_c <= sy2 + xy_margin))
+                z1c, z2c = tz1 + dz_c, tz2 + dz_c
+                ok &= (((z1c >= sz1 - z_pad) & (z2c <= sz2)) |
+                       ((z1c >= sz1) & (z2c <= sz2 + z_pad)))
+                if not ok.any():
+                    continue
+                d = sc[ok] - (tc[ok] + np.array([dx_c, dy_c, dz_c], dtype=float))
+                dist = np.sqrt((d * d).sum(axis=1))
+                gate = gate_radius[ok]
+                matched = dist <= gate
+                if not matched.any():
+                    continue
+                m_i = i_arr[ok][matched]
+                m_margin = gate[matched] - dist[matched]
+                order = np.argsort(m_i)
+                m_i_sorted, m_margin_sorted = m_i[order], m_margin[order]
+                _uniq, start_idx = np.unique(m_i_sorted, return_index=True)
+                score = (int(_uniq.size),
+                         float(np.maximum.reduceat(m_margin_sorted, start_idx).sum()))
                 if score > best_score:
                     best_score = score
                     best_dx, best_dy, best_dz = dx_c, dy_c, dz_c
 
-    best_count = best_score[0]
-    return (int(best_dx), int(best_dy), int(best_dz),
-            float(best_count) / max(1, len(cells_tf)))
+    return int(best_dx), int(best_dy), int(best_dz), max(best_score[0], 0)
+
+
+def containment_shift_from_arrays(soma_idx, tf_arrays, xy_range_px, z_range_slices,
+                                  fine_xy_px, fine_z_slices, max_center_dist_ratio,
+                                  xy_margin=0, z_pad=0, coarse_tf_arrays=None):
+    """
+    find_shift_containment 的数组版入口（粗搜索固定用位移直方图）。
+
+    soma_idx / tf_arrays 由 _prepare_soma_containment_index / _cell_arrays 生成，
+    不必来自同一个 tile —— solve_tile_positions.py 用它把全脑所有 tile 的细胞汇总起来，
+    一次只估 3 个常数，而不是每个 tile 各估一次。
+
+    coarse_tf_arrays : 粗搜索阶段改用的（通常更小的）TF 数组。粗搜索只要把中心定到
+                       ±2 px 以内，用抽样点云就够，而它的候选数比精搜索还多。
+
+    Returns (dx, dy, dz, matched_fraction)。
+    """
+    n_tf = len(tf_arrays[0])
+    if n_tf == 0 or len(soma_idx['centroids']) == 0:
+        return 0, 0, 0, 0.0
+    center = _coarse_from_peaks(soma_idx, coarse_tf_arrays if coarse_tf_arrays is not None
+                                else tf_arrays, xy_range_px, z_range_slices,
+                                max_center_dist_ratio, xy_margin, z_pad)
+    dx, dy, dz, count = _fine_containment(soma_idx, tf_arrays, center, fine_xy_px, fine_z_slices,
+                                          max_center_dist_ratio, xy_margin, z_pad)
+    return dx, dy, dz, float(count) / max(1, n_tf)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

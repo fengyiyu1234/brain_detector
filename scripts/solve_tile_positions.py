@@ -28,11 +28,25 @@ T4 上 GFP 稀疏、Olig2/Sox9 稠密且标记的是不同细胞群，这个匹�
 - delta_c(t)：通道之间真实存在的倍率差 / 光片倾斜差（色差）。T4 实测 Olig2 相对
   GFP 是 +5.25 px/行（y，约 0.30% 的放大率差）、−2.10 层/列（z）；RFP、Sox9 的
   斜率按波长单调排序，730 的 z 斜率变号——是光学量，不是噪声。
-- 接缝只约束 delta 的**差**，常数项 a_c 解不出来（Olig2 那个 dz≈−7 层就在里面）。
-  a_c 仍然要靠跨通道匹配来定，但只是每通道 3 个数，可以拿全脑所有 tile 一起估，
-  不必每个 tile 单独求一次。本脚本用 --const / --const-from 接收它。
+- 接缝只约束 delta 的**差**，常数项 a_c 解不出来（Olig2 那个 dz≈−7 层就在里面）：
+  把某个通道所有 tile 的位置整体平移，每条接缝约束依然精确成立，数据看不出区别。
+  a_c 只能靠跨通道匹配定，但每通道只有 3 个数，所以本脚本把**全脑所有 tile 的细胞按解出来
+  的位置摆进同一套坐标后一次估出来**（--const-from pooled，默认），而不是像旧 Stage 2.5
+  那样每个 tile 各估一次：数据量大几十倍，未知数少十几倍。
+  soma↔TF 用包含度打分（和 Stage 3B 判共定位同一个判据），同类型通道用质心配对。
+  也可以用 --const 直接给死，或 --const-from offsets 取旧 Stage 2.5 结果的中位数。
 
 model='free' 则是每个通道各解各的（不加平滑约束），留作对照。
+
+两个「参考」是分开的
+------------------
+--ref   通道对齐的参考通道：通道场 delta_c 和常数 a_c 都相对它，也就是真正**测量**出来的量。
+        MADM 流程里它应当是 GFP——下游 Stage 3B 的共定位判的就是「GFP 细胞体里有没有 TF 核」，
+        所以要让 GFP↔各核通道 成为直接测量的那一对，误差才落在最该准的地方。
+--frame 全局坐标系用哪个通道的几何：细胞和配准用的全脑图都落在它上面（例如用 488 做配准就给
+        Olig2）。它只是换个规范，不重测任何东西：
+            s_c(t) = [delta_c(t) + a_c] − [delta_frame(t) + a_frame]
+        缺省 --frame = --ref，就是原来的行为。
 
 输入
 ----
@@ -82,11 +96,13 @@ import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from scipy.sparse import coo_matrix, vstack
 from scipy.sparse.linalg import lsqr
+from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 import scripts.compare_stitching as cs
 from src.config.loader import load_config
-from src.core.point_cloud_aligner import apply_shift_to_csv, resolve_align_settings
+from src.core.point_cloud_aligner import (apply_shift_to_csv, resolve_align_settings,
+                                          containment_shift_from_arrays, _containment_score)
 from src.utils.io import STAGE_UNIT_UM
 
 AXES = ('x', 'y', 'z')
@@ -341,6 +357,193 @@ def seam_support(seams, tiles, channels):
 # 4.  通道常数 a_c
 # ──────────────────────────────────────────────────────────────────────────────
 
+CELL_COLS = ('cx', 'cy', 'cz', 'x1_3d', 'y1_3d', 'x2_3d', 'y2_3d', 'z_min', 'z_max')
+
+
+def tile_cell_arrays(job):
+    """
+    一个 (tile, 通道)：读检测 CSV → 取指定 z 窗 → z-link → 返回 (N, 9) 数组，列见 CELL_COLS。
+    坐标保持 tile 局部原始坐标，由调用方决定加哪一套 tile 位置（要比较不同的位置方案）。
+    参数全可 pickle，供进程池调用。
+    """
+    from src.core.z_linker import run_z_linker
+    empty = (job['channel'], job['tile'], np.empty((0, 9)))
+    df = cs._read_dets(job['csv'])
+    if df is None:
+        return empty
+    df = df[(df['z'] >= job['z_lo']) & (df['z'] <= job['z_hi'])]
+    if df.empty:
+        return empty
+    mat = df[cs.BOX_COLS].values.copy()
+    mat[:, 6] = np.array([f"{v}_{job['channel']}" for v in mat[:, 6]])
+    _, vol = run_z_linker(mat, **job['z_link'])
+    if not vol:
+        return empty
+    arr = np.array([[c.get(k, 0) for k in CELL_COLS] for c in vol], dtype=float)
+    return job['channel'], job['tile'], arr
+
+
+def shift_arrays(arr, offset):
+    """给 (N, 9) 细胞数组整体加一个 (dx, dy, dz)。"""
+    out = arr.copy()
+    out[:, [0, 3, 5]] += offset[0]      # cx, x1, x2
+    out[:, [1, 4, 6]] += offset[1]      # cy, y1, y2
+    out[:, [2, 7, 8]] += offset[2]      # cz, z_min, z_max
+    return out
+
+
+def pool_cells(tiles, channels, det_dir, z_window, ch_types, settings, offsets, workers, desc):
+    """
+    把每个 tile、每个通道的一段 z 窗 z-link 成紧凑数组，返回 {通道: {tile: (N, 9) 局部坐标}}。
+
+    z_window : {tile: (全局 z 下界, 全局 z 上界)}
+    offsets  : {(通道, tile): (dx, dy, dz)}，只用来把全局 z 窗换算成该通道的局部 z 窗
+    """
+    jobs = []
+    for ch in channels:
+        zl = settings['z_link']['soma' if ch_types.get(ch, 'soma') == 'soma' else 'tf']
+        for t in tiles:
+            lo, hi = z_window[t]
+            dz = offsets[(ch, t)][2]
+            jobs.append({'csv': os.path.join(det_dir, f"{t}_{ch}_result.csv"),
+                         'channel': ch, 'tile': t, 'z_link': zl,
+                         'z_lo': lo - dz, 'z_hi': hi - dz})
+    parts = {ch: {} for ch in channels}
+    if workers > 1 and len(jobs) > 1:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context('spawn')) as pool:
+            futs = [pool.submit(tile_cell_arrays, j) for j in jobs]
+            for fut in tqdm(as_completed(futs), total=len(futs), desc=desc):
+                ch, t, arr = fut.result()
+                parts[ch][t] = arr
+    else:
+        for j in tqdm(jobs, desc=desc):
+            ch, t, arr = tile_cell_arrays(j)
+            parts[ch][t] = arr
+    return parts
+
+
+def stack_cloud(parts_ch, offsets_ch):
+    """{tile: 局部数组} + {tile: 偏移} → 一整块全局坐标点云。"""
+    chunks = [shift_arrays(arr, offsets_ch[t]) for t, arr in parts_ch.items() if len(arr)]
+    return np.vstack(chunks) if chunks else np.empty((0, 9))
+
+
+def _soma_index(arr):
+    """由 (N, 9) 数组直接拼出 _prepare_soma_containment_index 的等价结构。"""
+    centroids = arr[:, 0:3].copy()
+    x1, y1, x2, y2 = arr[:, 3], arr[:, 4], arr[:, 5], arr[:, 6]
+    radii = np.maximum(np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) / 2, 1.0)
+    return dict(centroids=centroids, x1=x1, y1=y1, x2=x2, y2=y2,
+                z1=arr[:, 7], z2=arr[:, 8], radii=radii,
+                max_radius=float(radii.max()) if len(radii) else 1.0,
+                tree=cKDTree(centroids))
+
+
+def _tf_arrays(arr):
+    """_cell_arrays 的等价结构。"""
+    return (arr[:, 0:3].copy(), arr[:, 3], arr[:, 4], arr[:, 5], arr[:, 6], arr[:, 7], arr[:, 8])
+
+
+def estimate_constants_pooled(clouds, channels, ref, ch_types, settings, p, rng):
+    """
+    全脑汇总估计每个通道的常数 a_c：把所有 tile 的细胞按解出来的位置摆进同一套全局坐标后，
+    a_c = 让通道 c 的细胞与参考通道对上所需要的平移（同一个物理结构 G_ref − G_c）。
+
+    soma↔TF 用包含度打分（和 Stage 3B 判共定位是同一个判据）；
+    同类型通道（都是 soma / 都是 TF）用质心的位移直方图 + 互为最近邻，和接缝估计同一套。
+
+    返回 {ch: (a, info)}，info 里有得分和参与的细胞数。
+    """
+    out = {}
+    ref_arr = clouds.get(ref, np.empty((0, 9)))
+    for ch in channels:
+        if ch == ref or len(clouds.get(ch, [])) == 0 or len(ref_arr) == 0:
+            continue
+        arr = clouds[ch]
+        same_type = ch_types.get(ch, 'soma') == ch_types.get(ref, 'soma')
+        if same_type:
+            A, B = arr[:, 0:3], ref_arr[:, 0:3]     # median(B − A) = a_c
+            res = cs.estimate_seam_error(A, B, {
+                'win_xy': p['win_xy'], 'win_z': p['win_z'], 'bin_xy': p['bin_xy'],
+                'r_xy': p['r_xy'], 'r_z': p['r_z'], 'min_matches': p['min_matches']})
+            out[ch] = ((res['dx'], res['dy'], res['dz']),
+                       {'method': 'point_match', 'n_match': res['n_match'],
+                        'n_ref': len(ref_arr), 'n_ch': len(arr),
+                        'mad': (res['mad_x'], res['mad_y'], res['mad_z'])})
+            continue
+        # soma ↔ TF：谁是 soma 谁当索引；包含度打分求的是「加到 TF 上」的平移
+        tf_is_ch = ch_types.get(ch, 'soma') == 'tf'
+        soma_arr, tf_arr = (ref_arr, arr) if tf_is_ch else (arr, ref_arr)
+        if len(tf_arr) > p['max_cells']:
+            tf_arr = tf_arr[rng.choice(len(tf_arr), p['max_cells'], replace=False)]
+        if len(soma_arr) > p['max_cells']:
+            soma_arr = soma_arr[rng.choice(len(soma_arr), p['max_cells'], replace=False)]
+        # 粗搜索的候选点比精搜索还多，用更小的抽样跑（只需把中心定到 ±2 px 内）
+        n_coarse = min(p['coarse_cells'], len(tf_arr))
+        coarse_arr = tf_arr[rng.choice(len(tf_arr), n_coarse, replace=False)] \
+            if n_coarse < len(tf_arr) else tf_arr
+        dx, dy, dz, score = containment_shift_from_arrays(
+            _soma_index(soma_arr), _tf_arrays(tf_arr),
+            xy_range_px=p['win_xy'], z_range_slices=p['win_z'],
+            fine_xy_px=p['fine_xy'], fine_z_slices=p['fine_z'],
+            max_center_dist_ratio=settings['max_center_dist_ratio'],
+            xy_margin=0, z_pad=settings.get('containment_z_pad', 0),
+            coarse_tf_arrays=_tf_arrays(coarse_arr))
+        sign = 1.0 if tf_is_ch else -1.0
+        out[ch] = ((sign * dx, sign * dy, sign * dz),
+                   {'method': 'containment', 'score': score,
+                    'n_soma': len(soma_arr), 'n_tf': len(tf_arr)})
+    return out
+
+
+def containment_count(soma_arr, tf_arr, settings):
+    """在给定摆放下，有多少 TF 核落在某个 soma 内（判据与 Stage 3B 相同）。不搜索。"""
+    if len(soma_arr) == 0 or len(tf_arr) == 0:
+        return 0, 0.0
+    count, _margin = _containment_score(
+        _soma_index(soma_arr), _tf_arrays(tf_arr), 0, 0, 0,
+        settings['max_center_dist_ratio'], 0, settings.get('containment_z_pad', 0))
+    return int(count), float(count) / max(1, len(tf_arr))
+
+
+def compare_offsets_holdout(parts, tiles, channels, ref, ch_types, settings,
+                            off_new, off_old, max_cells=None, rng=None):
+    """
+    在**没参与估计**的 z 段上，用同一批细胞、同一判据给两套偏移各打一次分：
+    新方法（通道场 + 全局常数）vs 旧 Stage 2.5（逐 tile 各自搜出来的偏移）。
+
+    这是唯一公平的"哪个更好"：旧方法是逐 tile 直接最大化这个分数的（45×3 个自由参数），
+    在它自己用过的 z 窗上必然占便宜；换到没用过的 z 段，过拟合就不再免费。
+
+    两点要记住：
+    - 新方法的 tile 位置 P(t) 来自接缝求解，而接缝用的是整个 z 范围，所以它间接"见过"
+      held-out 那一段的 xy/z 摆放。被检验的是**通道偏移**能不能外推，这一点两边对等。
+    - 结论对常数的估计质量非常敏感：抽样太小（比如几千个核）时常数本身就是噪声，
+      这个对照只会反映那一点，不能用来判方法。看 report 里常数那一行的包含率/配对数。
+
+    返回 {ch: {'new': (count, rate), 'old': (count, rate), 'n_tf': N}}
+    """
+    out = {}
+    soma = stack_cloud(parts[ref], {t: off_new[(ref, t)] for t in tiles})
+    for ch in channels:
+        if ch == ref or ch_types.get(ch, 'soma') != 'tf':
+            continue
+        if any((ch, t) not in off_old for t in tiles):
+            continue
+        tf_new = stack_cloud(parts[ch], {t: off_new[(ch, t)] for t in tiles})
+        tf_old = stack_cloud(parts[ch], {t: off_old[(ch, t)] for t in tiles})
+        # 两套摆放的行序完全一致（都来自同一个 parts[ch]），所以抽样抽同一批行，
+        # 两边比的是**同一批细胞**，对照才公平
+        n_all = len(tf_new)
+        if max_cells and n_all > max_cells:
+            idx = (rng or np.random.default_rng(0)).choice(n_all, max_cells, replace=False)
+            tf_new, tf_old = tf_new[idx], tf_old[idx]
+        out[ch] = {'new': containment_count(soma, tf_new, settings),
+                   'old': containment_count(soma, tf_old, settings),
+                   'n_tf': len(tf_new), 'n_tf_all': n_all, 'n_soma': len(soma)}
+    return out
+
+
 def parse_const(specs):
     """--const CH=dx,dy,dz（可重复）→ {CH: (dx, dy, dz)}。"""
     out = {}
@@ -353,16 +556,24 @@ def parse_const(specs):
     return out
 
 
+def load_old_offsets(align_dir):
+    """读已有的 0_channel_alignment 逐 tile 偏移 → {tile: {ch: {dx, dy, dz, ...}}}。"""
+    old = {}
+    if not align_dir or not os.path.isdir(align_dir):
+        return old
+    for f in os.listdir(align_dir):
+        if f.endswith('_offsets.json'):
+            with open(os.path.join(align_dir, f), encoding='utf-8') as fh:
+                old[f[:-len('_offsets.json')]] = json.load(fh)
+    return old
+
+
 def const_from_offsets(align_dir, tiles, field, channels, ref):
     """
     用已有的 0_channel_alignment 逐 tile 偏移定常数：a_c = median(旧偏移 − 通道场)。
     返回 ({CH: (dx, dy, dz)}, {CH: 各轴的离散度})。旧偏移越可信，离散度越小。
     """
-    old = {}
-    for f in os.listdir(align_dir):
-        if f.endswith('_offsets.json'):
-            with open(os.path.join(align_dir, f), encoding='utf-8') as fh:
-                old[f[:-len('_offsets.json')]] = json.load(fh)
+    old = load_old_offsets(align_dir)
     const, spread = {}, {}
     for ch in channels:
         if ch == ref:
@@ -460,7 +671,12 @@ def parse_args():
     ap.add_argument('--out-dir', default=None,
                     help='默认 <results_dir>/5_analysis_report/tile_positions')
     ap.add_argument('--channels', default=None, help='逗号分隔；默认 config 里所有 active 通道')
-    ap.add_argument('--ref', default=None, help='参考通道；默认 pre_align_params.reference_channel')
+    ap.add_argument('--ref', default=None,
+                    help='通道对齐的参考通道（通道场和常数都相对它，MADM 流程里就是 GFP）；'
+                         '默认 pre_align_params.reference_channel')
+    ap.add_argument('--frame', default=None,
+                    help='全局坐标系用哪个通道的几何（细胞和配准用的全脑图都落在它上面）；'
+                         '默认与 --ref 相同。换成别的通道只是换个规范，不影响测量')
     ap.add_argument('--model', choices=['joint', 'free'], default='joint',
                     help="joint=共用 tile 位置 + 每通道平滑通道场（默认）；free=每通道各解各的")
     ap.add_argument('--workers', type=int, default=1, help='接缝测量的并行进程数')
@@ -483,9 +699,26 @@ def parse_args():
     # 通道常数
     ap.add_argument('--const', action='append', metavar='CH=dx,dy,dz',
                     help='通道相对参考通道的全局常数偏移，可重复；接缝解不出这一项')
-    ap.add_argument('--const-from', choices=['none', 'offsets'], default='offsets',
-                    help="没给 --const 的通道怎么定常数：offsets=用已有 0_channel_alignment 的中位数"
-                         "（默认，只是权宜之计）；none=当作 0")
+    ap.add_argument('--const-from', choices=['pooled', 'offsets', 'none'], default='pooled',
+                    help="没给 --const 的通道怎么定常数：pooled=把全脑所有 tile 的细胞汇总起来"
+                         "一次估 3 个数（默认）；offsets=取已有 0_channel_alignment 的中位数；none=当作 0")
+    ap.add_argument('--const-z-window', type=int, default=None,
+                    help='汇总估计取每个 tile 中心多少层；默认 pre_align_params.sample_z_center_count')
+    ap.add_argument('--const-win-xy', type=float, default=60, help='常数粗搜索 XY 半径（px）')
+    ap.add_argument('--const-win-z', type=int, default=15, help='常数粗搜索 Z 半径（层）')
+    ap.add_argument('--const-fine-xy', type=int, default=3, help='包含度精搜索 XY 半径（px）')
+    ap.add_argument('--const-fine-z', type=int, default=2, help='包含度精搜索 Z 半径（层）')
+    ap.add_argument('--const-max-cells', type=int, default=80000,
+                    help='包含度精搜索时每个点云最多用多少细胞（随机抽样，只为控制耗时）')
+    ap.add_argument('--const-coarse-cells', type=int, default=25000,
+                    help='包含度粗搜索用多少细胞；粗搜索候选多、精度要求低，用更小的抽样')
+    ap.add_argument('--const-seed', type=int, default=0, help='上面那个抽样的随机种子')
+    ap.add_argument('--no-compare-old', action='store_true',
+                    help='不做 held-out 对照（默认只要有 0_channel_alignment 就做）')
+    ap.add_argument('--holdout-gap', type=float, default=1.5,
+                    help='held-out z 段离中心窗多远，单位是窗厚；1.5 = 隔开半个窗（默认）')
+    ap.add_argument('--holdout-max-cells', type=int, default=300000,
+                    help='held-out 对照最多用多少个核（两套偏移抽同一批，只为控制耗时/内存）')
     # 可选输出
     ap.add_argument('--write-xml', action='store_true', help='每通道写一份 xml_merging.xml')
     ap.add_argument('--xml-template', default=None,
@@ -526,6 +759,9 @@ def main():
     ref = args.ref or settings['reference_channel']
     if ref not in channels:
         raise SystemExit(f"❌ 参考通道 {ref} 不在 --channels {channels} 里")
+    frame = args.frame or ref
+    if frame not in channels:
+        raise SystemExit(f"❌ 坐标系通道 {frame} 不在 --channels {channels} 里")
 
     det_dir = args.det_dir or os.path.join(results_dir, '1_tile_2d_raw')
     out_dir = args.out_dir or os.path.join(results_dir, '5_analysis_report', 'tile_positions')
@@ -538,8 +774,10 @@ def main():
     n_row = max(d['rc'][0] for d in grid.values()) + 1
     n_col = max(d['rc'][1] for d in grid.values()) + 1
     ch_dirs = channel_image_dirs(config, routing, sample_dir)
-    ref_img_dir = ch_dirs.get(ref, '')
-    tile_dirs = {t: (os.path.join(ref_img_dir, t.split('_')[0], t) if ref_img_dir else None)
+    # 对齐后的 z 用的是坐标系通道的层号，所以 slice_name 也从它的 tile 目录取
+    # （T4 上四个通道的层名和层数完全一致，这里只是让语义对上）
+    frame_img_dir = ch_dirs.get(frame, '')
+    tile_dirs = {t: (os.path.join(frame_img_dir, t.split('_')[0], t) if frame_img_dir else None)
                  for t in tiles}
     if args.n_slices:
         n_slices, z_src = args.n_slices, '--n-slices'
@@ -554,7 +792,8 @@ def main():
 
     say(f"样本     : {os.path.basename(sample_dir.rstrip(os.sep))}  ({sample_dir})")
     say(f"结果目录 : {results_dir}")
-    say(f"通道     : {', '.join(channels)}   参考 = {ref}")
+    say(f"通道     : {', '.join(channels)}   对齐参考 = {ref}"
+        + (f"   坐标系 = {frame}（细胞和配准图都落在它上面）" if frame != ref else ""))
     say(f"网格     : {n_row} 行 × {n_col} 列，{len(tiles)} 个 tile，每 tile {n_slices} 层（{z_src}）")
     if partial:
         say(f"⚠️  {len(partial)} 个 tile 缺部分通道的 CSV，已跳过：{partial[:5]}")
@@ -620,46 +859,136 @@ def main():
     field = {ch: np.array([[sol[ax]['P_ch'][ch][k] - sol[ax]['P_ch'][ref][k] for ax in AXES]
                            for k in range(len(tiles))]) for ch in channels}
 
-    # ── 通道常数 ──
+    # ── 通道常数 a_c ──
+    # 接缝只约束通道场的差，常数解不出来，必须靠跨通道匹配。这里把全脑所有 tile 的细胞
+    # 按解出来的位置摆进同一套全局坐标，一次只估 3 个数（旧 Stage 2.5 是每个 tile 各估一次）。
     const = parse_const(args.const)
     const_src = {ch: 'cli' for ch in const}
+    const_info = {}
+    solution_cmp = {}
     align_dir = os.path.join(results_dir, '0_channel_alignment')
-    if args.const_from == 'offsets' and os.path.isdir(align_dir):
-        auto, spread = const_from_offsets(align_dir, tiles, field, channels, ref)
+    todo = [ch for ch in channels if ch != ref and ch not in const]
+
+    if args.const_from == 'pooled' and todo:
+        z_half = (args.const_z_window or settings['sample_z_center_count']) / 2.0
+        say(f"\n全脑汇总估常数：每个 tile 取中心 ±{z_half:.0f} 层，"
+            f"粗搜索 ±{args.const_win_xy:.0f} px / ±{args.const_win_z} 层")
+        pooled_chs = [ref] + todo
+        # 每个 tile 的中心 z（参考通道检测的中位数）→ 换成全局 z；各通道的局部窗由 pool_cells 换算
+        z_center = {}
+        for k, t in enumerate(tiles):
+            z = pd.read_csv(os.path.join(det_dir, f"{t}_{ref}_result.csv"), usecols=['z'])['z']
+            z_center[t] = (float(z.median()) if len(z) else 0.0) + sol['z']['P_ch'][ref][k]
+        # 解出来的 tile 位置（各通道各一套）
+        off_P = {(ch, t): np.array([sol[ax]['P_ch'][ch][k] for ax in AXES])
+                 for ch in pooled_chs for k, t in enumerate(tiles)}
+        win_fit = {t: (z_center[t] - z_half, z_center[t] + z_half) for t in tiles}
+        parts = pool_cells(tiles, pooled_chs, det_dir, win_fit, ch_types, settings,
+                           off_P, args.workers, "Pooling")
+        clouds = {ch: stack_cloud(parts[ch], {t: off_P[(ch, t)] for t in tiles})
+                  for ch in pooled_chs}
+        say("  汇总到的细胞数：" + "，".join(f"{ch} {len(clouds[ch])}" for ch in pooled_chs))
+        est = estimate_constants_pooled(
+            clouds, pooled_chs, ref, ch_types, settings,
+            {'win_xy': args.const_win_xy, 'win_z': args.const_win_z, 'bin_xy': args.bin_xy,
+             'r_xy': args.match_xy_soma, 'r_z': args.match_z, 'min_matches': args.min_matches,
+             'fine_xy': args.const_fine_xy, 'fine_z': args.const_fine_z,
+             'max_cells': args.const_max_cells, 'coarse_cells': args.const_coarse_cells},
+            np.random.default_rng(args.const_seed))
+        for ch, (v, info) in est.items():
+            const[ch], const_src[ch], const_info[ch] = v, 'pooled', info
+
+        # ── held-out 对照：新方法 vs 旧 Stage 2.5，同一批细胞、同一判据 ──
+        old_off = load_old_offsets(align_dir)
+        if not args.no_compare_old and old_off:
+            shift = z_half * 2 * args.holdout_gap
+            win_hold = {t: (z_center[t] + shift - z_half, z_center[t] + shift + z_half)
+                        for t in tiles}
+            say(f"\nheld-out 对照：另取每个 tile 中心 +{shift:.0f} 层处的同样厚度 z 段"
+                f"（没参与估计），给两套偏移各打一次包含度")
+            parts_h = pool_cells(tiles, pooled_chs, det_dir, win_hold, ch_types, settings,
+                                 off_P, args.workers, "Holdout")
+            # 新方法：各通道用自己的 tile 位置；旧方法：参考通道的位置 + 旧的逐 tile 偏移
+            off_new = {k: v for k, v in off_P.items()}
+            off_old = {}
+            for ch in pooled_chs:
+                for k, t in enumerate(tiles):
+                    o = old_off.get(t, {})
+                    if ch == ref or (ch in o and ref in o):
+                        d = np.zeros(3) if ch == ref else np.array(
+                            [o[ch][f'd{ax}'] - o[ref][f'd{ax}'] for ax in AXES], dtype=float)
+                        off_old[(ch, t)] = off_P[(ref, t)] + d
+            cmp_res = compare_offsets_holdout(parts_h, tiles, pooled_chs, ref, ch_types,
+                                              settings, off_new, off_old,
+                                              max_cells=args.holdout_max_cells,
+                                              rng=np.random.default_rng(args.const_seed))
+            for ch, r in cmp_res.items():
+                n, rate = r['new']
+                o, orate = r['old']
+                verdict = '新方法更好' if n > o else ('旧方法更好' if o > n else '打平')
+                say(f"  {ch:<8}新方法 {n:6d} 个核落在 soma 内（{rate:.4f}）   "
+                    f"旧 Stage2.5 {o:6d}（{orate:.4f}）   {verdict}"
+                    f"   [用了 {r['n_tf']}/{r['n_tf_all']} 核 vs {r['n_soma']} soma]")
+            say("  注：旧方法是逐 tile 直接最大化这个分数的（45×3 个自由参数），"
+                "在它自己用过的 z 窗上必然占便宜；换到没用过的 z 段才公平。")
+            solution_cmp = {ch: {k: (list(v) if isinstance(v, tuple) else v)
+                                 for k, v in r.items()} for ch, r in cmp_res.items()}
+        else:
+            solution_cmp = {}
+    elif args.const_from == 'offsets' and os.path.isdir(align_dir) and todo:
+        auto, _ = const_from_offsets(align_dir, tiles, field, channels, ref)
         for ch, v in auto.items():
             if ch not in const:
-                const[ch] = v
-                const_src[ch] = 'old_offsets_median'
-        say("\n通道常数 a_c（接缝解不出这一项，必须靠跨通道匹配定）")
-        for ch in channels:
-            if ch == ref:
-                continue
-            v = const.get(ch, (0.0, 0.0, 0.0))
-            sp = spread.get(ch)
-            extra = (f"   旧逐 tile 偏移减掉通道场后的离散度 "
-                     f"({sp[0]:.1f}, {sp[1]:.1f}, {sp[2]:.1f})" if sp else "")
-            say(f"  {ch:<8}({v[0]:+6.1f}, {v[1]:+6.1f}, {v[2]:+6.1f})  来源={const_src.get(ch, 'zero')}{extra}")
-        say("  ⚠️  来源=old_offsets_median 的常数取自旧 Stage 2.5 结果的中位数，只是权宜之计；"
-            "离散度大说明旧偏移本身噪声大。")
-    elif not const:
-        say("\n⚠️  没有通道常数（--const-from none 或找不到 0_channel_alignment），"
-            "通道场只有相对变化，绝对位移按 0 处理。")
+                const[ch], const_src[ch] = v, 'old_offsets_median'
+
+    say("\n通道常数 a_c（相对对齐参考 %s；接缝解不出这一项）" % ref)
+    old_auto, old_spread = ({}, {})
+    if os.path.isdir(align_dir):
+        old_auto, old_spread = const_from_offsets(align_dir, tiles, field, channels, ref)
+    for ch in channels:
+        if ch == ref:
+            continue
+        v = const.get(ch, (0.0, 0.0, 0.0))
+        info = const_info.get(ch, {})
+        detail = ''
+        if info.get('method') == 'containment':
+            detail = f"  包含率 {info['score']:.3f}（{info['n_tf']} 核 vs {info['n_soma']} soma）"
+        elif info.get('method') == 'point_match':
+            m = info['mad']
+            detail = (f"  配对 {info['n_match']}，配对差 MAD "
+                      f"({m[0]:.1f}, {m[1]:.1f}, {m[2]:.1f})")
+        say(f"  {ch:<8}({v[0]:+6.1f}, {v[1]:+6.1f}, {v[2]:+6.1f})  "
+            f"来源={const_src.get(ch, 'zero')}{detail}")
+        if ch in old_auto:
+            o, sp = old_auto[ch], old_spread[ch]
+            say(f"  {'':<8}对照旧 Stage 2.5：中位数 ({o[0]:+6.1f}, {o[1]:+6.1f}, {o[2]:+6.1f})"
+                f"  逐 tile 离散度 ({sp[0]:.1f}, {sp[1]:.1f}, {sp[2]:.1f})"
+                f"  与本次差 ({v[0] - o[0]:+.1f}, {v[1] - o[1]:+.1f}, {v[2] - o[2]:+.1f})")
+    if not const:
+        say("  ⚠️  没有任何常数（--const-from none），通道场只有相对变化，绝对位移按 0 处理。")
 
     # ── 逐 tile 结果表 ──
+    # field_/const 都是相对对齐参考 ref（= 实际测量出来的量）；
+    # s_ 是把该通道的原始 tile 坐标搬到**坐标系通道 frame** 上要加的量：
+    #     s_c(t) = [delta_c(t) + a_c] − [delta_frame(t) + a_frame]
+    # frame == ref 时后一项为 0，就是原来的定义。换 frame 只是换个规范，不重测任何东西。
     deg = seam_support(ok, tiles, channels)
+    zero3 = (0.0, 0.0, 0.0)
     rows = []
     for k, t in enumerate(tiles):
         row = {'tile': t, 'grid_row': grid[t]['rc'][0], 'grid_col': grid[t]['rc'][1]}
         for a, ax in enumerate(AXES):
             row[f'nom_{ax}'] = grid[t]['pos'][a]
             row[f'P_{ax}'] = sol[ax]['P'][k]
+        c_frame = const.get(frame, zero3)
         for ch in channels:
             row[f'n_seams_{ch}'] = deg[ch][t]
-            c = const.get(ch, (0.0, 0.0, 0.0))
+            c = const.get(ch, zero3)
             for a, ax in enumerate(AXES):
                 row[f'P_{ch}_{ax}'] = sol[ax]['P_ch'][ch][k]
                 row[f'field_{ch}_{ax}'] = field[ch][k][a]
-                row[f's_{ch}_{ax}'] = field[ch][k][a] + (0.0 if ch == ref else c[a])
+                row[f's_{ch}_{ax}'] = ((field[ch][k][a] + c[a])
+                                       - (field[frame][k][a] + c_frame[a]))
         rows.append(row)
     pos_df = pd.DataFrame(rows)
     pos_df.to_csv(os.path.join(out_dir, 'tile_positions.csv'), index=False)
@@ -677,6 +1006,7 @@ def main():
     solution = {
         'created': datetime.now().isoformat(timespec='seconds'),
         'sample': sample_dir, 'model': args.model, 'reference_channel': ref,
+        'frame_channel': frame,
         'channels': channels, 'n_tiles': len(tiles), 'grid': [n_row, n_col],
         'xy_resolution_um': xy_um, 'z_resolution_um': z_um, 'tile_size': tile_size,
         'seam_params': {k: getattr(args, k) for k in
@@ -687,6 +1017,14 @@ def main():
                    if args.model == 'joint' else None),
         'const': {ch: list(v) for ch, v in const.items()},
         'const_source': const_src,
+        'const_info': {ch: {k: (list(v) if isinstance(v, tuple) else v) for k, v in info.items()}
+                       for ch, info in const_info.items()},
+        'holdout_compare': solution_cmp,
+        'const_params': {'z_window': args.const_z_window or settings['sample_z_center_count'],
+                         'win_xy': args.const_win_xy, 'win_z': args.const_win_z,
+                         'fine_xy': args.const_fine_xy, 'fine_z': args.const_fine_z,
+                         'max_cells': args.const_max_cells,
+                         'coarse_cells': args.const_coarse_cells, 'seed': args.const_seed},
         'seam_fit_resid_p50': {ax: float(np.nanpercentile(np.abs(sol[ax]['resid']), 50))
                                for ax in AXES},
         'tiles_without_seams': unsupported,
@@ -697,7 +1035,7 @@ def main():
     # ── 可选：各通道 XML ──
     if args.write_xml:
         say("\n写各通道 xml_merging.xml")
-        common_origin = np.array([pos_df[f'P_{ref}_{ax}'].min() for ax in AXES])
+        common_origin = np.array([pos_df[f'P_{frame}_{ax}'].min() for ax in AXES])
         ref_tmpl = args.xml_template
         if not ref_tmpl:
             for cand in ('xml_merging.xml', 'xml_import.xml'):
@@ -725,6 +1063,13 @@ def main():
                 f"{'（借用 ' + ref + ' 的）' if tmpl == ref_tmpl and ch != ref else ''}{note}")
         say("  注意：TeraStitcher merge 会按各自 XML 的最小 ABS 再归一化一次，"
             "细胞坐标必须和图像用同一份 XML 推。")
+        say(f"  细胞落在 {frame} 的坐标系里"
+            + (f"（通道对齐仍以 {ref} 为参考，只是最后换算过去）" if frame != ref else "") + "，所以：")
+        say(f"    1) 配准用的全脑图必须用 xml_merging_{frame}.xml merge（哪怕图像本身是别的通道）；")
+        say(f"    2) config 的 paths.pATHXML 指到同一份，否则流程会退回去捡通道目录里的旧 XML：")
+        say(f'       "pATHXML": "{os.path.join(out_dir, f"xml_merging_{frame}.xml")}"')
+        if frame == ref:
+            say(f"    想换个通道的几何当坐标系（比如拿 488 做配准），重跑时加 --frame <通道>。")
 
     # ── 可选：写 0_channel_alignment 格式 ──
     if args.write_aligned:
@@ -737,7 +1082,7 @@ def main():
                              f"用 --const 指定，或 --const-from offsets。")
         shifts = {t: {ch: tuple(pos_df.loc[k, f's_{ch}_{ax}'] for ax in AXES) for ch in channels}
                   for k, t in enumerate(tiles)}
-        say(f"\n写对齐结果到 {aligned_dir}")
+        say(f"\n写对齐结果到 {aligned_dir}（偏移是搬到 {frame} 坐标系的量，{frame} 自身为 0）")
         write_aligned(aligned_dir, tiles, shifts, det_dir, tile_dirs, routing, args.mark_done)
         say(f"  {len(tiles)} 个 tile × {len(channels)} 通道"
             + ("，已写 _align_done.flag" if args.mark_done else
