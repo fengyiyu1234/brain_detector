@@ -35,6 +35,17 @@ T4 上 GFP 稀疏、Olig2/Sox9 稠密且标记的是不同细胞群，这个匹�
   那样每个 tile 各估一次：数据量大几十倍，未知数少十几倍。
   soma↔TF 用包含度打分（和 Stage 3B 判共定位同一个判据），同类型通道用质心配对。
   也可以用 --const 直接给死，或 --const-from offsets 取旧 Stage 2.5 结果的中位数。
+- 逐 tile 精修 delta_c(t) += r_c(t)（--refine-per-tile，默认开）：上面的「仿射场 + 一个常数」
+  在 T4 上**打不过**旧 Stage 2.5 的逐 tile 偏移——而且是在它自己的拟合数据上就输 1.6–2.1×，
+  held-out 上比值几乎不变。两边都不怎么掉分，说明逐 tile 位移里有仿射场表达不了的真实成分，
+  不是旧方法过拟合。所以全局解只当先验，再用**该 tile 自己的细胞**在它附近搜 ±6 px / ±2 层
+  （--refine-xy/--refine-z），判据仍是 Stage 3B 的包含度。
+  和旧 Stage 2.5 的区别在搜索范围：旧的每个 tile 从零搜 ±60 px，得分面又平，容易停在错峰
+  （T4 手工扫过的 5 个 tile 有 3 个搜错）；这里的中心是物理上说得通的量，窗口只够修掉
+  场表达不了的那几个 px，跳不出去。细胞太少 / 包含数太低 / 结果顶到窗边的 tile 会退回全局解，
+  原因记在 tile_positions.csv 的 refine_status_<通道> 和 report 里。
+  精修只作用在**细胞坐标**上（s_ 那几列），不进各通道的 merging XML——XML 摆的是图像 tile，
+  它的几何由同通道接缝决定，掺进跨通道的逐 tile 修正会破坏接缝自洽。
 
 model='free' 则是每个通道各解各的（不加平滑约束），留作对照。
 
@@ -56,6 +67,7 @@ model='free' 则是每个通道各解各的（不加平滑约束），留作对�
 输出（默认 <results_dir>/5_analysis_report/tile_positions/）
   seams.csv            每条 (通道, 接缝) 的实测位移与配对质量；再次运行时直接复用
   tile_positions.csv   每个 tile 的共用位置、各通道位置、各通道相对参考通道的偏移
+                       （field_ = 通道场，refine_ = 逐 tile 精修增量，s_ = 搬到 frame 的总量）
   solution.json        通道场系数、常数来源、残差统计（可追溯）
   report.txt           屏幕摘要的副本
 
@@ -496,6 +508,90 @@ def estimate_constants_pooled(clouds, channels, ref, ch_types, settings, p, rng)
     return out
 
 
+def _refine_job(job):
+    """
+    一个 (通道, tile) 的局部精修：以全局解给出的先验位移为中心，只在小窗里搜。
+
+    为什么是局部搜索：旧 Stage 2.5 每个 tile 从零搜 ±60 px，得分面又平，容易停在错峰
+    （T4 上手工扫过的 5 个 tile 有 3 个搜错）。这里的中心来自接缝解出的通道场 + 全脑汇总
+    的常数，是物理上说得通的量，窗口只够修掉仿射场表达不了的那几个 px，跳不出去。
+
+    job['center'] 是「加到本通道 tile 局部坐标上、落到参考通道局部坐标」的先验位移。
+    返回的增量是**相对 center** 的。
+    """
+    from src.core.point_cloud_aligner import _fine_containment
+    ch, t = job['channel'], job['tile']
+    ref_arr, arr = job['ref_arr'], job['arr']
+    center = np.asarray(job['center'], dtype=float)
+    info = {'n_ref': int(len(ref_arr)), 'n_ch': int(len(arr))}
+    zero = (0.0, 0.0, 0.0)
+    if len(ref_arr) < job['min_cells'] or len(arr) < job['min_cells']:
+        return ch, t, zero, dict(info, status='too_few_cells')
+    if job['same_type']:
+        # 同类型通道（都是 soma / 都是核）：按先验摆过去，再用互为最近邻测剩下的残差
+        res = cs.estimate_seam_error(arr[:, 0:3] + center, ref_arr[:, 0:3], job['seam_params'])
+        if res['n_match'] < job['seam_params']['min_matches'] or not np.isfinite(res['dx']):
+            return ch, t, zero, dict(info, status='too_few_matches', n_match=int(res['n_match']))
+        d = np.array([res['dx'], res['dy'], res['dz']], dtype=float)
+        info.update(n_match=int(res['n_match']),
+                    mad=[float(res['mad_x']), float(res['mad_y']), float(res['mad_z'])])
+    else:
+        # soma ↔ TF：包含度打分，判据与 Stage 3B 相同。谁是 soma 谁当索引；打分求的是
+        # 「加到 TF 上」的平移，所以本通道是 soma（参考通道是 TF）时整体反号。
+        sign = 1.0 if job['tf_is_ch'] else -1.0
+        soma_arr, tf_arr = (ref_arr, arr) if job['tf_is_ch'] else (arr, ref_arr)
+        c0 = tuple(int(v) for v in np.round(sign * center))
+        soma_idx, tf_arrays = _soma_index(soma_arr), _tf_arrays(tf_arr)
+        base = _containment_score(soma_idx, tf_arrays, c0[0], c0[1], c0[2],
+                                  job['max_center_dist_ratio'], 0, job['z_pad'])[0]
+        dx, dy, dz, cnt = _fine_containment(
+            soma_idx, tf_arrays, c0, job['fine_xy'], job['fine_z'],
+            job['max_center_dist_ratio'], 0, job['z_pad'])
+        info.update(count=int(cnt), count_prior=int(base))
+        # 匹配数太少时 argmax 是噪声（旧 Stage 2.5 在空 tile 上给出 (-10,-10,-3) 就是这么来的）
+        if cnt < job['min_count']:
+            return ch, t, zero, dict(info, status='low_score')
+        d = sign * (np.array([dx, dy, dz], dtype=float) - sign * center)
+    edge = bool(abs(d[0]) >= job['fine_xy'] or abs(d[1]) >= job['fine_xy']
+                or abs(d[2]) >= job['fine_z'])
+    return ch, t, tuple(float(v) for v in d), dict(info, status='edge' if edge else 'ok')
+
+
+def refine_per_tile(parts, tiles, channels, ref, ch_types, settings, prior, p, workers):
+    """
+    逐 tile 局部精修。prior[(ch, t)] = 通道场 + 常数（加到该通道 tile 局部坐标上）。
+    返回 {(通道, tile): (相对 prior 的增量, info)}。
+    """
+    jobs = []
+    for ch in channels:
+        if ch == ref:
+            continue
+        same = ch_types.get(ch, 'soma') == ch_types.get(ref, 'soma')
+        for t in tiles:
+            jobs.append({'channel': ch, 'tile': t,
+                         'ref_arr': parts[ref].get(t, np.empty((0, 9))),
+                         'arr': parts[ch].get(t, np.empty((0, 9))),
+                         'center': tuple(prior[(ch, t)]), 'same_type': same,
+                         'tf_is_ch': ch_types.get(ch, 'soma') == 'tf',
+                         'fine_xy': p['fine_xy'], 'fine_z': p['fine_z'],
+                         'min_cells': p['min_cells'], 'min_count': p['min_count'],
+                         'max_center_dist_ratio': settings['max_center_dist_ratio'],
+                         'z_pad': settings.get('containment_z_pad', 0),
+                         'seam_params': p['seam_params']})
+    out = {}
+    if workers > 1 and len(jobs) > 1:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context('spawn')) as pool:
+            futs = [pool.submit(_refine_job, j) for j in jobs]
+            for fut in tqdm(as_completed(futs), total=len(futs), desc="Refining"):
+                ch, t, d, info = fut.result()
+                out[(ch, t)] = (d, info)
+    else:
+        for j in tqdm(jobs, desc="Refining"):
+            ch, t, d, info = _refine_job(j)
+            out[(ch, t)] = (d, info)
+    return out
+
+
 def containment_count(soma_arr, tf_arr, settings):
     """在给定摆放下，有多少 TF 核落在某个 soma 内（判据与 Stage 3B 相同）。不搜索。"""
     if len(soma_arr) == 0 or len(tf_arr) == 0:
@@ -506,42 +602,57 @@ def containment_count(soma_arr, tf_arr, settings):
     return int(count), float(count) / max(1, len(tf_arr))
 
 
-def compare_offsets_holdout(parts, tiles, channels, ref, ch_types, settings,
-                            off_new, off_old, max_cells=None, rng=None):
+def score_placements(parts, tiles, channels, ref, ch_types, settings, placements,
+                     max_cells=None, rng=None):
     """
-    在**没参与估计**的 z 段上，用同一批细胞、同一判据给两套偏移各打一次分：
-    新方法（通道场 + 全局常数）vs 旧 Stage 2.5（逐 tile 各自搜出来的偏移）。
+    同一批细胞、同一判据（与 Stage 3B 判共定位相同的包含度），给若干套摆放各打一次分。
 
-    这是唯一公平的"哪个更好"：旧方法是逐 tile 直接最大化这个分数的（45×3 个自由参数），
-    在它自己用过的 z 窗上必然占便宜；换到没用过的 z 段，过拟合就不再免费。
+    placements : {名字: {(通道, tile): (dx, dy, dz)}}。各套的参考通道偏移必须一致——
+                 soma 的摆放固定，被比较的只是各 TF 通道的偏移。
+    抽样对每套摆放抽**同一批行**（行序都来自同一个 parts[ch]），对照才公平。
 
-    两点要记住：
-    - 新方法的 tile 位置 P(t) 来自接缝求解，而接缝用的是整个 z 范围，所以它间接"见过"
-      held-out 那一段的 xy/z 摆放。被检验的是**通道偏移**能不能外推，这一点两边对等。
-    - 结论对常数的估计质量非常敏感：抽样太小（比如几千个核）时常数本身就是噪声，
-      这个对照只会反映那一点，不能用来判方法。看 report 里常数那一行的包含率/配对数。
-
-    返回 {ch: {'new': (count, rate), 'old': (count, rate), 'n_tf': N}}
+    返回 {通道: {'scores': {名字: (count, rate)}, 'n_tf':…, 'n_tf_all':…, 'n_soma':…}}
     """
+    names = list(placements)
+    if not names:
+        return {}
+    soma = stack_cloud(parts[ref], {t: placements[names[0]][(ref, t)] for t in tiles})
     out = {}
-    soma = stack_cloud(parts[ref], {t: off_new[(ref, t)] for t in tiles})
     for ch in channels:
         if ch == ref or ch_types.get(ch, 'soma') != 'tf':
             continue
-        if any((ch, t) not in off_old for t in tiles):
+        if any((ch, t) not in placements[n] for n in names for t in tiles):
             continue
-        tf_new = stack_cloud(parts[ch], {t: off_new[(ch, t)] for t in tiles})
-        tf_old = stack_cloud(parts[ch], {t: off_old[(ch, t)] for t in tiles})
-        # 两套摆放的行序完全一致（都来自同一个 parts[ch]），所以抽样抽同一批行，
-        # 两边比的是**同一批细胞**，对照才公平
-        n_all = len(tf_new)
+        clouds = {n: stack_cloud(parts[ch], {t: placements[n][(ch, t)] for t in tiles})
+                  for n in names}
+        n_all = len(clouds[names[0]])
         if max_cells and n_all > max_cells:
             idx = (rng or np.random.default_rng(0)).choice(n_all, max_cells, replace=False)
-            tf_new, tf_old = tf_new[idx], tf_old[idx]
-        out[ch] = {'new': containment_count(soma, tf_new, settings),
-                   'old': containment_count(soma, tf_old, settings),
-                   'n_tf': len(tf_new), 'n_tf_all': n_all, 'n_soma': len(soma)}
+            clouds = {n: c[idx] for n, c in clouds.items()}
+        out[ch] = {'scores': {n: containment_count(soma, c, settings)
+                              for n, c in clouds.items()},
+                   'n_tf': len(clouds[names[0]]), 'n_tf_all': n_all, 'n_soma': len(soma)}
     return out
+
+
+def say_scores(say, res, names, baseline, labels):
+    """打印 score_placements 的结果，并报出每套相对 baseline 的倍数。
+    names 是 ASCII 键（也写进 solution.json），labels 只管屏幕上怎么显示。"""
+    for ch, r in res.items():
+        txt = [f"{labels[n]} {r['scores'][n][0]:6d}（{r['scores'][n][1]:.4f}）" for n in names]
+        base = r['scores'][baseline][0]
+        rel = "，".join(f"{labels[n]} {r['scores'][n][0] / base:.2f}×"
+                        for n in names if n != baseline) if base else ""
+        say(f"  {ch:<8}" + "   ".join(txt)
+            + (f"   相对「{labels[baseline]}」：{rel}" if rel else "")
+            + f"   [{r['n_tf']}/{r['n_tf_all']} 核 vs {r['n_soma']} soma]")
+
+
+def json_scores(res):
+    """score_placements 的结果 → 可写进 solution.json 的形状。"""
+    return {ch: {'scores': {n: list(v) for n, v in r['scores'].items()},
+                 'n_tf': r['n_tf'], 'n_tf_all': r['n_tf_all'], 'n_soma': r['n_soma']}
+            for ch, r in res.items()}
 
 
 def parse_const(specs):
@@ -724,6 +835,16 @@ def parse_args():
     ap.add_argument('--xml-template', default=None,
                     help='XML 模板；默认找各通道目录下的 xml_merging.xml / xml_import.xml，'
                          '找不到就用参考通道的模板改写路径')
+    ap.add_argument('--refine-per-tile', dest='refine_per_tile', action='store_true',
+                    default=True, help='在全局解（通道场 + 常数）附近做逐 tile 局部精修（默认开）')
+    ap.add_argument('--no-refine-per-tile', dest='refine_per_tile', action='store_false',
+                    help='关掉逐 tile 精修，只用「仿射场 + 一个常数」的全局解')
+    ap.add_argument('--refine-xy', type=int, default=6, help='精修的 xy 搜索半径（px，默认 6）')
+    ap.add_argument('--refine-z', type=int, default=2, help='精修的 z 搜索半径（层，默认 2）')
+    ap.add_argument('--refine-min-cells', type=int, default=100,
+                    help='精修时 tile 每边至少要有这么多细胞，否则退回全局解')
+    ap.add_argument('--refine-min-count', type=int, default=5,
+                    help='精修得到的包含数低于此值就当没信息，退回全局解')
     ap.add_argument('--write-aligned', action='store_true',
                     help='写 0_channel_alignment 格式的偏移 JSON + 平移后的 CSV')
     ap.add_argument('--aligned-dir', default=None,
@@ -866,8 +987,11 @@ def main():
     const_src = {ch: 'cli' for ch in const}
     const_info = {}
     solution_cmp = {}
+    solution_insample = {}
     align_dir = os.path.join(results_dir, '0_channel_alignment')
     todo = [ch for ch in channels if ch != ref and ch not in const]
+    # 下面三样在 --const-from pooled 时才有；逐 tile 精修和新旧对照都复用它们
+    parts, off_P, z_center, pooled_chs, z_half = None, {}, {}, [ref], 0.0
 
     if args.const_from == 'pooled' and todo:
         z_half = (args.const_z_window or settings['sample_z_center_count']) / 2.0
@@ -898,43 +1022,6 @@ def main():
         for ch, (v, info) in est.items():
             const[ch], const_src[ch], const_info[ch] = v, 'pooled', info
 
-        # ── held-out 对照：新方法 vs 旧 Stage 2.5，同一批细胞、同一判据 ──
-        old_off = load_old_offsets(align_dir)
-        if not args.no_compare_old and old_off:
-            shift = z_half * 2 * args.holdout_gap
-            win_hold = {t: (z_center[t] + shift - z_half, z_center[t] + shift + z_half)
-                        for t in tiles}
-            say(f"\nheld-out 对照：另取每个 tile 中心 +{shift:.0f} 层处的同样厚度 z 段"
-                f"（没参与估计），给两套偏移各打一次包含度")
-            parts_h = pool_cells(tiles, pooled_chs, det_dir, win_hold, ch_types, settings,
-                                 off_P, args.workers, "Holdout")
-            # 新方法：各通道用自己的 tile 位置；旧方法：参考通道的位置 + 旧的逐 tile 偏移
-            off_new = {k: v for k, v in off_P.items()}
-            off_old = {}
-            for ch in pooled_chs:
-                for k, t in enumerate(tiles):
-                    o = old_off.get(t, {})
-                    if ch == ref or (ch in o and ref in o):
-                        d = np.zeros(3) if ch == ref else np.array(
-                            [o[ch][f'd{ax}'] - o[ref][f'd{ax}'] for ax in AXES], dtype=float)
-                        off_old[(ch, t)] = off_P[(ref, t)] + d
-            cmp_res = compare_offsets_holdout(parts_h, tiles, pooled_chs, ref, ch_types,
-                                              settings, off_new, off_old,
-                                              max_cells=args.holdout_max_cells,
-                                              rng=np.random.default_rng(args.const_seed))
-            for ch, r in cmp_res.items():
-                n, rate = r['new']
-                o, orate = r['old']
-                verdict = '新方法更好' if n > o else ('旧方法更好' if o > n else '打平')
-                say(f"  {ch:<8}新方法 {n:6d} 个核落在 soma 内（{rate:.4f}）   "
-                    f"旧 Stage2.5 {o:6d}（{orate:.4f}）   {verdict}"
-                    f"   [用了 {r['n_tf']}/{r['n_tf_all']} 核 vs {r['n_soma']} soma]")
-            say("  注：旧方法是逐 tile 直接最大化这个分数的（45×3 个自由参数），"
-                "在它自己用过的 z 窗上必然占便宜；换到没用过的 z 段才公平。")
-            solution_cmp = {ch: {k: (list(v) if isinstance(v, tuple) else v)
-                                 for k, v in r.items()} for ch, r in cmp_res.items()}
-        else:
-            solution_cmp = {}
     elif args.const_from == 'offsets' and os.path.isdir(align_dir) and todo:
         auto, _ = const_from_offsets(align_dir, tiles, field, channels, ref)
         for ch, v in auto.items():
@@ -967,28 +1054,145 @@ def main():
     if not const:
         say("  ⚠️  没有任何常数（--const-from none），通道场只有相对变化，绝对位移按 0 处理。")
 
+    # ── 逐 tile 局部精修 ──
+    # T4 的实测：全局模型（仿射场 + 每通道 3 个常数）在**自己的拟合数据**上就输给旧
+    # Stage 2.5 的逐 tile 偏移 1.6–2.1×，held-out 上比值几乎不变。两边都不怎么掉分，
+    # 说明逐 tile 位移里有仿射场表达不了的真实成分，不是过拟合。所以全局解只当先验，
+    # 再用该 tile 自己的细胞在它附近修一次。
+    refine = {ch: np.zeros((len(tiles), 3)) for ch in channels}
+    refine_status = {ch: {t: 'off' for t in tiles} for ch in channels}
+    refine_info = {}
+    zero3 = (0.0, 0.0, 0.0)
+    if args.refine_per_tile and parts is not None:
+        say(f"\n逐 tile 精修：以「通道场 + 常数」为中心搜 ±{args.refine_xy} px / "
+            f"±{args.refine_z} 层，用该 tile 自己的细胞（判据同 Stage 3B）")
+        prior = {(ch, t): np.array(field[ch][k]) + np.array(const.get(ch, zero3))
+                 for ch in pooled_chs if ch != ref for k, t in enumerate(tiles)}
+        rp = {'fine_xy': args.refine_xy, 'fine_z': args.refine_z,
+              'min_cells': args.refine_min_cells, 'min_count': args.refine_min_count,
+              'seam_params': {'win_xy': max(2 * args.refine_xy, 4),
+                              'win_z': max(2 * args.refine_z, 2), 'bin_xy': 1,
+                              'r_xy': args.match_xy_soma, 'r_z': args.match_z,
+                              'min_matches': args.min_matches}}
+        res = refine_per_tile(parts, tiles, [c for c in pooled_chs if c != ref], ref,
+                              ch_types, settings, prior, rp, args.workers)
+        for ch in channels:
+            if ch == ref or (ch, tiles[0]) not in res:
+                continue
+            stats, counts = {}, []
+            for k, t in enumerate(tiles):
+                d, info = res[(ch, t)]
+                refine[ch][k] = d
+                refine_status[ch][t] = info['status']
+                stats[info['status']] = stats.get(info['status'], 0) + 1
+                if 'count' in info:
+                    counts.append((info.get('count_prior', 0), info['count']))
+            a = np.abs(refine[ch])
+            back = {k: v for k, v in stats.items() if k not in ('ok', 'edge')}
+            gain = ''
+            if counts:
+                gain = (f"  包含数中位数 {np.median([c[0] for c in counts]):.0f}"
+                        f" → {np.median([c[1] for c in counts]):.0f}")
+            say(f"  {ch:<8}采纳 {stats.get('ok', 0) + stats.get('edge', 0)}/{len(tiles)}"
+                + (f"（退回 {back}）" if back else "")
+                + f"  |Δ| p50 ({np.median(a[:, 0]):.1f}, {np.median(a[:, 1]):.1f},"
+                  f" {np.median(a[:, 2]):.1f})"
+                + f"  max ({a[:, 0].max():.0f}, {a[:, 1].max():.0f}, {a[:, 2].max():.0f})"
+                + (f"  顶到窗边 {stats['edge']} 个" if stats.get('edge') else "") + gain)
+            refine_info[ch] = {'status_counts': stats,
+                               'abs_p50': [float(np.median(a[:, i])) for i in range(3)],
+                               'abs_max': [float(a[:, i].max()) for i in range(3)]}
+        if any(v['status_counts'].get('edge', 0) > len(tiles) * 0.2 for v in refine_info.values()):
+            say("  ⚠️  有通道超过 1/5 的 tile 顶到搜索窗边界，说明先验本身偏了；"
+                "放大 --refine-xy / --refine-z 再跑一次看结果稳不稳。")
+    elif args.refine_per_tile:
+        say("\n逐 tile 精修：跳过（需要 --const-from pooled 汇总出来的细胞）")
+
+    # 相对参考通道的总偏移 = 通道场 + 常数 + 精修增量（参考通道自身恒为 0）
+    total = {ch: np.array([np.array(field[ch][k]) + np.array(const.get(ch, zero3))
+                           + refine[ch][k] for k in range(len(tiles))]) for ch in channels}
+
+    # ── 新旧对照：in-sample（拟合数据上）+ held-out（没参与估计的 z 段）──
+    # 三套摆放都落在同一套解出来的 tile 位置上，差别只在通道偏移，比的是同一批细胞。
+    old_off = load_old_offsets(align_dir)
+    if parts is not None:
+        G, R, O = 'global', 'refined', 'old'
+        labels = {G: '全局解', R: '精修后', O: '旧Stage2.5'}
+        use_old = bool(old_off) and not args.no_compare_old
+        names = [G, R, O] if use_old else [G, R]
+        pl = {n: {} for n in names}
+        for ch in pooled_chs:
+            for k, t in enumerate(tiles):
+                base = off_P[(ref, t)]
+                g = np.zeros(3) if ch == ref else (np.array(field[ch][k])
+                                                   + np.array(const.get(ch, zero3)))
+                pl[G][(ch, t)] = base + g
+                pl[R][(ch, t)] = base + (np.zeros(3) if ch == ref else total[ch][k])
+                o = old_off.get(t, {})
+                if not use_old:
+                    continue
+                if ch == ref:
+                    pl[O][(ch, t)] = base
+                elif ch in o and ref in o:
+                    pl[O][(ch, t)] = base + np.array(
+                        [o[ch][f'd{ax}'] - o[ref][f'd{ax}'] for ax in AXES], dtype=float)
+        say(f"\nin-sample 对照（就在估常数 / 精修用的那段 z 上，两边都已是各自的最优）")
+        ins = score_placements(parts, tiles, pooled_chs, ref, ch_types, settings, pl,
+                               max_cells=args.holdout_max_cells,
+                               rng=np.random.default_rng(args.const_seed))
+        say_scores(say, ins, names, O if use_old else G, labels)
+        solution_insample = json_scores(ins)
+
+        # held-out：中心窗外、隔开 --holdout-gap 个窗厚的同样厚度 z 段。
+        # 三套摆放的 dz 不同，谁的 dz 离取样窗远谁就被窗口截掉一截、白白吃亏，所以
+        # TF 通道的 z 窗按三套 dz 的最大差额往两边放宽，soma 保持原厚度：三套都完整
+        # 盖住 soma 那一层，计数才可比（分母同样放大，对三边一视同仁）。
+        shift = z_half * 2 * args.holdout_gap
+        win_hold = {t: (z_center[t] + shift - z_half, z_center[t] + shift + z_half)
+                    for t in tiles}
+        say(f"\nheld-out 对照：另取每个 tile 中心 +{shift:.0f} 层处的同样厚度 z 段"
+            f"（没参与任何估计）")
+        parts_h = pool_cells(tiles, [ref], det_dir, win_hold, ch_types, settings,
+                             off_P, args.workers, "Holdout soma")
+        for ch in pooled_chs:
+            if ch == ref:
+                continue
+            dzs = [pl[n][(ch, t)][2] - off_P[(ch, t)][2]
+                   for n in names for t in tiles if (ch, t) in pl[n]]
+            pad = float(np.ceil(max(abs(v) for v in dzs))) if dzs else 0.0
+            win_ch = {t: (lo - pad, hi + pad) for t, (lo, hi) in win_hold.items()}
+            parts_h.update(pool_cells(tiles, [ch], det_dir, win_ch, ch_types, settings,
+                                      off_P, args.workers, f"Holdout {ch}"))
+        hold = score_placements(parts_h, tiles, pooled_chs, ref, ch_types, settings, pl,
+                                max_cells=args.holdout_max_cells,
+                                rng=np.random.default_rng(args.const_seed))
+        say_scores(say, hold, names, O if use_old else G, labels)
+        solution_cmp = json_scores(hold)
+        if use_old:
+            say("  判据：「精修后」要在 held-out 上 ≥「旧Stage2.5」，这套方案才算可以顶替 "
+                "Stage 2.5。「全局解」那一列是不做精修时的水平，用来看精修补回了多少。")
+
     # ── 逐 tile 结果表 ──
     # field_/const 都是相对对齐参考 ref（= 实际测量出来的量）；
     # s_ 是把该通道的原始 tile 坐标搬到**坐标系通道 frame** 上要加的量：
     #     s_c(t) = [delta_c(t) + a_c] − [delta_frame(t) + a_frame]
     # frame == ref 时后一项为 0，就是原来的定义。换 frame 只是换个规范，不重测任何东西。
     deg = seam_support(ok, tiles, channels)
-    zero3 = (0.0, 0.0, 0.0)
     rows = []
     for k, t in enumerate(tiles):
         row = {'tile': t, 'grid_row': grid[t]['rc'][0], 'grid_col': grid[t]['rc'][1]}
         for a, ax in enumerate(AXES):
             row[f'nom_{ax}'] = grid[t]['pos'][a]
             row[f'P_{ax}'] = sol[ax]['P'][k]
-        c_frame = const.get(frame, zero3)
         for ch in channels:
             row[f'n_seams_{ch}'] = deg[ch][t]
-            c = const.get(ch, zero3)
+            row[f'refine_status_{ch}'] = refine_status[ch][t]
             for a, ax in enumerate(AXES):
                 row[f'P_{ch}_{ax}'] = sol[ax]['P_ch'][ch][k]
                 row[f'field_{ch}_{ax}'] = field[ch][k][a]
-                row[f's_{ch}_{ax}'] = ((field[ch][k][a] + c[a])
-                                       - (field[frame][k][a] + c_frame[a]))
+                row[f'refine_{ch}_{ax}'] = refine[ch][k][a]
+                # s_ = 搬到坐标系通道 frame 上要加的量（total 已含场 + 常数 + 精修）
+                row[f's_{ch}_{ax}'] = total[ch][k][a] - total[frame][k][a]
         rows.append(row)
     pos_df = pd.DataFrame(rows)
     pos_df.to_csv(os.path.join(out_dir, 'tile_positions.csv'), index=False)
@@ -1019,7 +1223,12 @@ def main():
         'const_source': const_src,
         'const_info': {ch: {k: (list(v) if isinstance(v, tuple) else v) for k, v in info.items()}
                        for ch, info in const_info.items()},
+        'refine': {'enabled': bool(args.refine_per_tile),
+                   'xy': args.refine_xy, 'z': args.refine_z,
+                   'min_cells': args.refine_min_cells, 'min_count': args.refine_min_count,
+                   'per_channel': refine_info},
         'holdout_compare': solution_cmp,
+        'insample_compare': solution_insample,
         'const_params': {'z_window': args.const_z_window or settings['sample_z_center_count'],
                          'win_xy': args.const_win_xy, 'win_z': args.const_win_z,
                          'fine_xy': args.const_fine_xy, 'fine_z': args.const_fine_z,
