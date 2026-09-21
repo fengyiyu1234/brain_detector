@@ -776,6 +776,9 @@ def write_aligned(out_dir, tiles, shifts, det_dir, tile_dirs, routing, mark_done
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--alignment-from', choices=['solved', 'old-offsets'], default='solved',
+                    help="solved=derive alignment here (default); old-offsets=preserve every "
+                         "per-tile offset from 0_channel_alignment and rebase it to --frame")
     ap.add_argument('--sample', required=True, help='样本根目录（或直接给 detection_results/）')
     ap.add_argument('--config', default=None, help='默认 <results_dir>/runtime_config.json')
     ap.add_argument('--det-dir', default=None, help='原始检测 CSV 目录，默认 1_tile_2d_raw')
@@ -989,7 +992,8 @@ def main():
     solution_cmp = {}
     solution_insample = {}
     align_dir = os.path.join(results_dir, '0_channel_alignment')
-    todo = [ch for ch in channels if ch != ref and ch not in const]
+    use_old_alignment = args.alignment_from == 'old-offsets'
+    todo = [] if use_old_alignment else [ch for ch in channels if ch != ref and ch not in const]
     # 下面三样在 --const-from pooled 时才有；逐 tile 精修和新旧对照都复用它们
     parts, off_P, z_center, pooled_chs, z_half = None, {}, {}, [ref], 0.0
 
@@ -1028,11 +1032,14 @@ def main():
             if ch not in const:
                 const[ch], const_src[ch] = v, 'old_offsets_median'
 
-    say("\n通道常数 a_c（相对对齐参考 %s；接缝解不出这一项）" % ref)
+    if use_old_alignment:
+        say("\n通道对齐：完整复用旧 Stage 2.5 的逐 tile offset；不重新估计或精修")
+    else:
+        say("\n通道常数 a_c（相对对齐参考 %s；接缝解不出这一项）" % ref)
     old_auto, old_spread = ({}, {})
     if os.path.isdir(align_dir):
         old_auto, old_spread = const_from_offsets(align_dir, tiles, field, channels, ref)
-    for ch in channels:
+    for ch in ([] if use_old_alignment else channels):
         if ch == ref:
             continue
         v = const.get(ch, (0.0, 0.0, 0.0))
@@ -1051,7 +1058,7 @@ def main():
             say(f"  {'':<8}对照旧 Stage 2.5：中位数 ({o[0]:+6.1f}, {o[1]:+6.1f}, {o[2]:+6.1f})"
                 f"  逐 tile 离散度 ({sp[0]:.1f}, {sp[1]:.1f}, {sp[2]:.1f})"
                 f"  与本次差 ({v[0] - o[0]:+.1f}, {v[1] - o[1]:+.1f}, {v[2] - o[2]:+.1f})")
-    if not const:
+    if not const and not use_old_alignment:
         say("  ⚠️  没有任何常数（--const-from none），通道场只有相对变化，绝对位移按 0 处理。")
 
     # ── 逐 tile 局部精修 ──
@@ -1063,7 +1070,9 @@ def main():
     refine_status = {ch: {t: 'off' for t in tiles} for ch in channels}
     refine_info = {}
     zero3 = (0.0, 0.0, 0.0)
-    if args.refine_per_tile and parts is not None:
+    if use_old_alignment:
+        refine_status = {ch: {t: 'old_offsets' for t in tiles} for ch in channels}
+    elif args.refine_per_tile and parts is not None:
         say(f"\n逐 tile 精修：以「通道场 + 常数」为中心搜 ±{args.refine_xy} px / "
             f"±{args.refine_z} 层，用该 tile 自己的细胞（判据同 Stage 3B）")
         prior = {(ch, t): np.array(field[ch][k]) + np.array(const.get(ch, zero3))
@@ -1109,12 +1118,55 @@ def main():
         say("\n逐 tile 精修：跳过（需要 --const-from pooled 汇总出来的细胞）")
 
     # 相对参考通道的总偏移 = 通道场 + 常数 + 精修增量（参考通道自身恒为 0）
-    total = {ch: np.array([np.array(field[ch][k]) + np.array(const.get(ch, zero3))
-                           + refine[ch][k] for k in range(len(tiles))]) for ch in channels}
+    old_off = load_old_offsets(align_dir)
+    if use_old_alignment:
+        missing_old = []
+        total = {ch: np.zeros((len(tiles), 3), dtype=float) for ch in channels}
+        for k, t in enumerate(tiles):
+            o = old_off.get(t, {})
+            for ch in channels:
+                if ch not in o or ref not in o:
+                    missing_old.append(f'{t}:{ch}')
+                    continue
+                total[ch][k] = np.array(
+                    [o[ch][f'd{ax}'] - o[ref][f'd{ax}'] for ax in AXES], dtype=float)
+        if missing_old:
+            head = ', '.join(missing_old[:8])
+            more = f' ({len(missing_old) - 8} more)' if len(missing_old) > 8 else ''
+            raise SystemExit(f"Missing old channel-alignment offsets: {head}{more}")
+        say(f"  Loaded old offsets for {len(tiles)} tiles x {len(channels)} channels; "
+            f"rebasing output to {frame}")
+    else:
+        total = {ch: np.array([np.array(field[ch][k]) + np.array(const.get(ch, zero3))
+                               + refine[ch][k] for k in range(len(tiles))]) for ch in channels}
+
+    # In free mode each channel has an independently solved tile geometry.  Old
+    # alignment offsets predict how those geometries should differ spatially:
+    #     P_ch(t) - P_frame(t) = old_ch(t) - old_frame(t) + constant.
+    # The constant is unidentifiable from seams, so remove its median and report
+    # the remaining robust spread.  Dense channels are the useful validators;
+    # sparse channels may simply have weak seam geometry.
+    geometry_alignment_check = {}
+    if args.model == 'free' and use_old_alignment:
+        say("\n独立通道几何 vs 旧 channel offset（一致性残差；已去掉不可辨识的全局常数）")
+        p_frame = np.column_stack([sol[ax]['P_ch'][frame] for ax in AXES])
+        for ch in channels:
+            if ch == frame:
+                continue
+            p_ch = np.column_stack([sol[ax]['P_ch'][ch] for ax in AXES])
+            expected = total[ch] - total[frame]
+            resid = (p_ch - p_frame) - expected
+            center = np.median(resid, axis=0)
+            centered = resid - center
+            mad = 1.4826 * np.median(np.abs(centered), axis=0)
+            p90 = np.percentile(np.abs(centered), 90, axis=0)
+            geometry_alignment_check[ch] = {
+                'constant': center.tolist(), 'mad': mad.tolist(), 'abs_p90': p90.tolist()}
+            say(f"  {ch:<8}MAD ({mad[0]:.1f}, {mad[1]:.1f}, {mad[2]:.1f})"
+                f"  |resid| p90 ({p90[0]:.1f}, {p90[1]:.1f}, {p90[2]:.1f})")
 
     # ── 新旧对照：in-sample（拟合数据上）+ held-out（没参与估计的 z 段）──
     # 三套摆放都落在同一套解出来的 tile 位置上，差别只在通道偏移，比的是同一批细胞。
-    old_off = load_old_offsets(align_dir)
     if parts is not None:
         G, R, O = 'global', 'refined', 'old'
         labels = {G: '全局解', R: '精修后', O: '旧Stage2.5'}
@@ -1210,7 +1262,7 @@ def main():
     solution = {
         'created': datetime.now().isoformat(timespec='seconds'),
         'sample': sample_dir, 'model': args.model, 'reference_channel': ref,
-        'frame_channel': frame,
+        'frame_channel': frame, 'alignment_source': args.alignment_from,
         'channels': channels, 'n_tiles': len(tiles), 'grid': [n_row, n_col],
         'xy_resolution_um': xy_um, 'z_resolution_um': z_um, 'tile_size': tile_size,
         'seam_params': {k: getattr(args, k) for k in
@@ -1228,6 +1280,7 @@ def main():
                    'min_cells': args.refine_min_cells, 'min_count': args.refine_min_count,
                    'per_channel': refine_info},
         'holdout_compare': solution_cmp,
+        'geometry_alignment_check': geometry_alignment_check,
         'insample_compare': solution_insample,
         'const_params': {'z_window': args.const_z_window or settings['sample_z_center_count'],
                          'win_xy': args.const_win_xy, 'win_z': args.const_win_z,
@@ -1285,7 +1338,8 @@ def main():
         aligned_dir = args.aligned_dir or os.path.join(results_dir, '0_channel_alignment_solved')
         if os.path.isdir(aligned_dir) and os.listdir(aligned_dir) and not args.force:
             raise SystemExit(f"❌ {aligned_dir} 非空；换个 --aligned-dir 或加 --force")
-        missing_const = [ch for ch in channels if ch != ref and ch not in const]
+        missing_const = ([] if use_old_alignment else
+                         [ch for ch in channels if ch != ref and ch not in const])
         if missing_const:
             raise SystemExit(f"❌ 通道 {missing_const} 没有常数 a_c，写出来的偏移会差一个整体平移。"
                              f"用 --const 指定，或 --const-from offsets。")

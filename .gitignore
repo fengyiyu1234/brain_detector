@@ -22,6 +22,8 @@ venv/
 *.sh
 *.slurm
 *.h5
+*.md
+*.cmd
 images/
 labels/
 models/
