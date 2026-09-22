@@ -13,11 +13,15 @@ Outputs:
 """
 
 import argparse
+import gc
+import json
 import os
 import sys
 import re
+from dataclasses import dataclass
+from pathlib import Path
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# __file__ is <repo>/src/utils/vis_stitched.py.`nproject_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
@@ -31,6 +35,23 @@ from src.config.loader import load_config
 
 _DEFAULT_CFG = os.path.join(project_root, 'config', 'vis', 'vis_stitched.json')
 
+@dataclass(frozen=True)
+class GlobalToDisplayTransform:
+    scale_x: float; scale_y: float; scale_z: float
+    origin_x: float; origin_y: float; origin_z: float
+    detection_z_1based: bool = True
+    def xyxy(self, x1, y1, x2, y2):
+        return tuple((v - o) * s for v, o, s in ((float(x1), self.origin_x, self.scale_x), (float(y1), self.origin_y, self.scale_y), (float(x2), self.origin_x, self.scale_x), (float(y2), self.origin_y, self.scale_y)))
+    def z(self, z):
+        return ((float(z) - 1 if self.detection_z_1based else float(z)) - self.origin_z) * self.scale_z
+
+def resolve_global_to_display_transform(cfg):
+    required = ('scale_x', 'scale_y', 'scale_z', 'origin_x', 'origin_y', 'origin_z')
+    missing = [name for name in required if name not in cfg]
+    if missing: raise ValueError('display_transform requires explicit ' + ', '.join(missing))
+    values = {name: float(cfg[name]) for name in required}
+    if any(values[n] <= 0 for n in ('scale_x', 'scale_y', 'scale_z')): raise ValueError('display_transform scales must be positive')
+    return GlobalToDisplayTransform(**values, detection_z_1based=bool(cfg.get('detection_z_1based', True)))
 
 # ── Slice discovery ───────────────────────────────────────────────────────────
 

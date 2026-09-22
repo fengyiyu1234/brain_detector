@@ -1716,10 +1716,13 @@ def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
         cid = ch['id']
         if cid in offsets:
             o   = offsets[cid]
+            iou = o.get('iou_score')
             tag = " [REFERENCE]" if (o['dx'] == 0 and o['dy'] == 0
-                                      and o['dz'] == 0 and o['iou_score'] >= 1.0) else ""
-            print(f"  [{cid:8s}]  shift=({o['dx']:+d}, {o['dy']:+d}, {o['dz']:+d})"
-                  f"   iou={o['iou_score']:.4f}{tag}")
+                                      and o['dz'] == 0 and iou is not None
+                                      and iou >= 1.0) else ""
+            shift_str = f"  [{cid:8s}]  shift=({o['dx']:+d}, {o['dy']:+d}, {o['dz']:+d})"
+            iou_str = f"   iou={iou:.4f}{tag}" if iou is not None else "   iou=N/A"
+            print(shift_str + iou_str)
         else:
             print(f"  [{cid:8s}]  (no offset data)")
     print("=================================\n")
@@ -1826,7 +1829,8 @@ def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
     _add_margin_overlay(viewer, canvas_shape, left_m, top_m)
     for ch in routing_config:
         cid     = ch['id']
-        iou_str = (f"  iou={offsets[cid]['iou_score']:.3f}" if cid in offsets else "")
+        iou = offsets.get(cid, {}).get('iou_score')
+        iou_str = f"  iou={iou:.3f}" if iou is not None else "  iou=N/A" if cid in offsets else ""
         aligned_csv = os.path.join(filtered_dir, f"{tile_name}_{cid}_result.csv")
         ch_filt = _get_ch_filter(filter_cfg, ch)
         (shapes_a, colors_a, meta_a), (rej_sa, rej_ca, _) = _load_tile_csv_shapes(

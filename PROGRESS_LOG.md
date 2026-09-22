@@ -462,3 +462,116 @@ Olig2 逐 tile 包含数中位数 54 → 122。
    重取 z 段再估。加了精修之后这一项的重要性下降（只影响搜索中心），暂时没做。
 - git：`solve_tile_positions.py`、`solve_tile_positions.slurm`、本日志的这一轮改动尚未提交
   （连同 9-17 那些未提交的）。
+---
+
+## 2026-09-21 EGFR T4: 488/Olig2 tile frame and downstream handoff
+
+### Completed
+
+- Confirmed the EGFR T4 channel mapping from `config_EGFR_t4.json`:
+  - `GFP` = soma/reference channel for the original Stage 2.5 alignment.
+  - `RFP` = soma channel.
+  - `Sox9` and `Olig2` = TF/nuclear channels.
+  - `Olig2` = 488 channel and final tile-stitching coordinate frame.
+  - `tf_align_mode=direct`.
+- First-round local tile solve completed with `MODEL=free` and `ALIGNMENT_FROM=old-offsets`:
+  - Output: `EGFR_brain/T4/detection_results/5_analysis_report/tile_positions_488_oldalign_local/`.
+  - 45 tiles, 76 grid seams per channel.
+  - Olig2 seams: 66/76 successful, p50 match count 5218, p50 match fraction 0.76.
+  - Olig2 seam MAD: `(1.33, 0.75, 0.50)`; fit residual p50: `(1.22, 0.53, 0.16)` px/slices.
+  - Five tiles had no usable seams and were retained by nominal grid placement; they are edge/low-signal tiles.
+- Second-round rebase completed:
+  - Output: `EGFR_brain/T4/detection_results/0_channel_alignment_488frame/`.
+  - 45 offset JSON files, 180 aligned CSV files (45 tiles x 4 channels), and `_align_done.flag` verified.
+  - Every tile has `Olig2 = (0, 0, 0)`.
+  - Other channel offsets are rebased from the original GFP reference to the Olig2/488 frame.
+- Generated XMLs in the tile-position report directory. The authoritative downstream XML is:
+  - `xml_merging_Olig2.xml`
+- Added local GPU downstream entry points:
+  - `config/config_EGFR_t4_local_gpu.json`
+  - `scripts/run_inference_t4_local_gpu.cmd`
+  - The local config uses `start_from_stage=2`, `stop_before_stitching=false`, local `Y:` paths, and the Olig2 XML.
+
+### HPC submission status
+
+- `inference_t4.slurm` was changed from `4 x L40` to `1 x A30`; memory was reduced from `240G` to `180G` to fit A30 nodes with `188000 MB` RAM.
+- Jobs `906070` and `906117` remained pending with `Reason=QOSGrpGRES` under `Account=lsmsmart_gpu`, `QOS=gpu`, despite idle A30 nodes. This is an account/QOS GPU quota issue, not a node or script resource issue.
+- The local GPU route is preferred until the HPC GPU quota is available.
+
+### Next action
+
+1. Preserve the old `0_channel_alignment` as a GFP-reference backup.
+2. Rename the verified `0_channel_alignment_488frame` to active `0_channel_alignment`.
+3. Rename old offset-derived caches such as `1_tile_2d_filtered` instead of deleting them; the new downstream run must regenerate them.
+4. Run `scripts\run_inference_t4_local_gpu.cmd` from the repository root after confirming that the local GPU environment is active.
+5. Validate Stage 3 outputs (`2_global_2d_raw`, `3_channel_3d`, `4_colocalization`) and compare GFP soma/TF containment results.
+## CODEX_HANDOFF_JSON: EGFR_T4_2026-09-21
+
+```json
+{
+  "record_date": "2026-09-21",
+  "sample": "EGFR_T4",
+  "sample_root_local": "Y:/Fengyi/EGFR_brain/T4",
+  "project_root": "Y:/Fengyi/brain_detector",
+  "channel_mapping": {
+    "488": "Olig2",
+    "561": "RFP",
+    "640": "GFP",
+    "730": "Sox9"
+  },
+  "original_stage_2_5_reference": "GFP",
+  "final_tile_frame": "Olig2",
+  "tf_align_mode": "direct",
+  "tile_solver": {
+    "model": "free",
+    "alignment_source": "old-offsets",
+    "n_tiles": 45,
+    "grid": [9, 5],
+    "first_round_output": "Y:/Fengyi/EGFR_brain/T4/detection_results/5_analysis_report/tile_positions_488_oldalign_local",
+    "authoritative_xml": "Y:/Fengyi/EGFR_brain/T4/detection_results/5_analysis_report/tile_positions_488_oldalign_local/xml_merging_Olig2.xml",
+    "olig2_seams_success": 66,
+    "olig2_seams_total": 76,
+    "olig2_match_count_p50": 5218,
+    "olig2_match_fraction_p50": 0.76,
+    "olig2_seam_mad_xyz": [1.33, 0.75, 0.50],
+    "tiles_without_seams": [
+      "303600_361200",
+      "303600_372500",
+      "314900_372500",
+      "382800_372500",
+      "394100_372500"
+    ]
+  },
+  "rebased_alignment": {
+    "directory": "Y:/Fengyi/EGFR_brain/T4/detection_results/0_channel_alignment_488frame",
+    "offset_json_count": 45,
+    "aligned_csv_count": 180,
+    "align_done_flag": true,
+    "all_olig2_offsets": [0, 0, 0],
+    "meaning": "All channel coordinates were rebased from the original GFP-reference frame to the Olig2/488 frame."
+  },
+  "hpc": {
+    "account": "lsmsmart_gpu",
+    "qos": "gpu",
+    "jobs": [906070, 906117],
+    "reason": "QOSGrpGRES",
+    "status": "blocked_by_gpu_qos_quota"
+  },
+  "local_downstream": {
+    "config": "Y:/Fengyi/brain_detector/config/config_EGFR_t4_local_gpu.json",
+    "runner": "Y:/Fengyi/brain_detector/scripts/run_inference_t4_local_gpu.cmd",
+    "start_from_stage": 2,
+    "stop_before_stitching": false,
+    "device": "cuda",
+    "required_active_alignment_directory": "Y:/Fengyi/EGFR_brain/T4/detection_results/0_channel_alignment",
+    "required_xml": "Y:/Fengyi/EGFR_brain/T4/detection_results/5_analysis_report/tile_positions_488_oldalign_local/xml_merging_Olig2.xml"
+  },
+  "next_steps": [
+    "Preserve old 0_channel_alignment as a GFP-reference backup.",
+    "Rename 0_channel_alignment_488frame to active 0_channel_alignment.",
+    "Rename old 1_tile_2d_filtered and other downstream caches; do not delete them.",
+    "Run scripts/run_inference_t4_local_gpu.cmd from the project root.",
+    "Validate 2_global_2d_raw, 3_channel_3d, and 4_colocalization outputs."
+  ]
+}
+```
