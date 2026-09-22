@@ -35,6 +35,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 import cv2
+from src.utils.coordinate_context import CoordinateContext, CoordinateContextError
 import numpy as np
 import pandas as pd
 import napari
@@ -44,6 +45,7 @@ from src.config.loader import load_config
 from src.utils.io import listTile, compute_grid_fallback_offsets
 from src.utils.markers import channel_marker, class_markers, split_class
 from src.core.z_linker import run_z_linker
+from src.core.detection_filter import FILTER_KEYS, filter_detection_df, resolve_filter_params
 from src.core.stitcher import (
     match_soma_3d_iou, annotate_soma_with_tf_containment,
     suppress_cross_class_overlap, _merge_class,
@@ -93,9 +95,27 @@ def _color(class_str):
 
 
 def _get_ch_filter(filter_cfg, ch):
-    """Look up vis filter by channel type ('soma'/'tf'), fall back to channel id."""
-    return filter_cfg.get(ch.get('type', 'soma')) or filter_cfg.get(ch.get('id', '')) or None
+    """Merge type defaults with a channel-id override; explicit null disables."""
+    inherited = filter_cfg.get(ch.get('type', 'soma'), {}) or {}
+    override = filter_cfg.get(ch.get('id', ''), {}) or {}
+    return {**inherited, **override} if (inherited or override) else None
 
+
+def _pipeline_preview_filters(base_res, fallback):
+    """Use the recorded pipeline config so previews reproduce saved filtering."""
+    runtime_path = os.path.join(base_res, 'runtime_config.json')
+    if not os.path.isfile(runtime_path):
+        return fallback
+    try:
+        with open(runtime_path, encoding='utf-8') as handle:
+            runtime = json.load(handle)
+        return {
+            ch['id']: resolve_filter_params(runtime, ch)
+            for ch in runtime.get('channels_routing', []) if ch.get('active', True)
+        }
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"[preview filter] runtime_config unavailable ({exc}); using vis_config filter")
+        return fallback
 
 def _needs_raw_vol(filter_cfg, ch):
     """True only when a channel's filter needs pixel data, i.e. an intensity threshold.
@@ -211,8 +231,36 @@ def load_raw_volume(tile_dir, z_range=None):
 
 
 
-def _filter_df_by_size_and_intensity(x1, y1, x2, y2, z_col, raw_vol, filt):
+def load_frame_volume(tile_dir, frame_z_range, shift=(0, 0, 0), contrast_pct=(0.1, 99.9)):
+    """Load TIFFs into final-frame Z coordinates, including edge slices."""
+    dx, dy, dz = (int(v) for v in shift)
+    frame_z0, frame_z1 = frame_z_range
+    raw_z0 = max(0, frame_z0 - dz)
+    raw_z1 = min(len(_list_tiffs(tile_dir)), frame_z1 - dz)
+    source, climits = load_volume(tile_dir, (raw_z0, raw_z1), contrast_pct)
+    if source is None:
+        return None, None
+    out = np.zeros((frame_z1 - frame_z0, *source.shape[1:]), dtype=source.dtype)
+    dst_z0 = raw_z0 + dz - frame_z0
+    dst_z1 = dst_z0 + source.shape[0]
+    src_z0 = max(0, -dst_z0)
+    src_z1 = source.shape[0] - max(0, dst_z1 - out.shape[0])
+    dst_z0 = max(0, dst_z0)
+    dst_z1 = min(out.shape[0], dst_z1)
+    if src_z1 > src_z0 and dst_z1 > dst_z0:
+        out[dst_z0:dst_z1] = source[src_z0:src_z1]
+    if dx or dy:
+        out = _shift_volume(out, dx, dy, 0)
+    return out, climits
+
+
+def load_frame_raw_volume(tile_dir, frame_z_range, shift=(0, 0, 0)):
+    """Frame-canvas companion for intensity filtering; retains raw intensities."""
+    return load_frame_volume(tile_dir, frame_z_range, shift)[0]
+
+
     """Return (keep_mask, comp_means_or_None).
+def _filter_df_by_size_and_intensity(x1, y1, x2, y2, z_col, raw_vol, filt):
 
     Filter order (each stage operates on survivors of the previous):
       1. bbox_min / bbox_max  — absolute size bounds (width AND height)
@@ -429,7 +477,11 @@ def _canvas_shape_from_tile(tile_path, z_range):
 
 # ── XML helpers ───────────────────────────────────────────────────────────────
 
-def _get_tile_offset(channel_dir, tile_name, base_res=None, tile_paths=None):
+def _get_runtime_tile_offset(context, tile_name):
+    """Global result ? final-frame tile offset from runtime paths.pATHXML."""
+    pos = context.position(tile_name)
+    return pos.x, pos.y, pos.z
+
     """Return (tile_x0, tile_y0, tile_z0) for coordinate conversion.
 
     Resolution order:
@@ -625,14 +677,20 @@ def _load_tile_csv_shapes(csv_path, z_range=None, raw_vol=None, filt=None,
     _empty = ([], [], [])
     if not os.path.isfile(csv_path):
         return _empty, _empty
-    df = pd.read_csv(
-        csv_path,
-        names=['slice_name', 'x1', 'y1', 'x2', 'y2', 'class', 'score', 'mean', 'z'],
-        skiprows=1,
-    )
+    df = pd.read_csv(csv_path)
     if df.empty:
         return _empty, _empty
+    preview_rejected = None
+    if filt:
+        preview_source = df
+        params = {key: filt.get(key) for key in FILTER_KEYS}
+        df, stats = filter_detection_df(df, params, return_stats=True, context=csv_path)
+        preview_rejected = preview_source.loc[~preview_source.index.isin(df.index)].copy()
+        print(f"  [preview filter] {stats['before']} → {stats['after']} kept; params={params}")
     df['z'] = df['z'].astype(float).astype(int) - 1
+    # Filtering above intentionally precedes z-range cropping: percentile thresholds
+    # are defined on the complete tile, exactly as Stage 2.75 does.
+    filt = None
     if z_range is not None:
         df['z_local'] = df['z'] - z_range[0]
         df = df[(df['z_local'] >= 0) & (df['z_local'] < z_range[1] - z_range[0])]
@@ -680,6 +738,27 @@ def _load_tile_csv_shapes(csv_path, z_range=None, raw_vol=None, filt=None,
     else:
         means    = df['mean'].values.astype(float) if 'mean' in df.columns else np.zeros(n_before)
         rej_data = _empty
+    if preview_rejected is not None and not preview_rejected.empty:
+        rejected = preview_rejected.copy()
+        rejected['z'] = rejected['z'].astype(float).astype(int) - 1
+        if z_range is not None:
+            rejected['z_local'] = rejected['z'] - z_range[0]
+            rejected = rejected[(rejected['z_local'] >= 0) & (rejected['z_local'] < z_range[1] - z_range[0])]
+            rz = rejected['z_local'].to_numpy() if not rejected.empty else np.array([])
+        else:
+            rz = rejected['z'].to_numpy() if not rejected.empty else np.array([])
+        if not rejected.empty:
+            rx1, ry1 = rejected['x1'].to_numpy(float), rejected['y1'].to_numpy(float)
+            rx2, ry2 = rejected['x2'].to_numpy(float), rejected['y2'].to_numpy(float)
+            if left_margin > 0 or top_margin > 0:
+                margin_keep = ((rx1 + rx2) / 2 >= left_margin) & ((ry1 + ry2) / 2 >= top_margin)
+                rejected, rz = rejected.iloc[np.where(margin_keep)[0]], rz[margin_keep]
+                rx1, ry1, rx2, ry2 = rx1[margin_keep], ry1[margin_keep], rx2[margin_keep], ry2[margin_keep]
+            if len(rejected):
+                rarr = np.empty((len(rejected), 4, 3), dtype=np.float64)
+                rarr[:, 0] = np.column_stack([rz, ry1, rx1]); rarr[:, 1] = np.column_stack([rz, ry1, rx2])
+                rarr[:, 2] = np.column_stack([rz, ry2, rx2]); rarr[:, 3] = np.column_stack([rz, ry2, rx1])
+                rej_data = (list(rarr), [_REJECTED_COLOR] * len(rejected), [])
     # Margin filter: hide boxes whose center falls in the left/top tile overlap region
     if left_margin > 0 or top_margin > 0:
         cx = (x1 + x2) / 2; cy = (y1 + y2) / 2
@@ -783,6 +862,27 @@ def _load_global_csv_to_tile_shapes(csv_path, tile_name, tile_x0, tile_y0, tile_
     else:
         means    = df['mean'].values.astype(float) if 'mean' in df.columns else np.zeros(n_before)
         rej_data = _empty
+    if preview_rejected is not None and not preview_rejected.empty:
+        rejected = preview_rejected.copy()
+        rejected['z'] = rejected['z'].astype(float).astype(int) - 1
+        if z_range is not None:
+            rejected['z_local'] = rejected['z'] - z_range[0]
+            rejected = rejected[(rejected['z_local'] >= 0) & (rejected['z_local'] < z_range[1] - z_range[0])]
+            rz = rejected['z_local'].to_numpy() if not rejected.empty else np.array([])
+        else:
+            rz = rejected['z'].to_numpy() if not rejected.empty else np.array([])
+        if not rejected.empty:
+            rx1, ry1 = rejected['x1'].to_numpy(float), rejected['y1'].to_numpy(float)
+            rx2, ry2 = rejected['x2'].to_numpy(float), rejected['y2'].to_numpy(float)
+            if left_margin > 0 or top_margin > 0:
+                margin_keep = ((rx1 + rx2) / 2 >= left_margin) & ((ry1 + ry2) / 2 >= top_margin)
+                rejected, rz = rejected.iloc[np.where(margin_keep)[0]], rz[margin_keep]
+                rx1, ry1, rx2, ry2 = rx1[margin_keep], ry1[margin_keep], rx2[margin_keep], ry2[margin_keep]
+            if len(rejected):
+                rarr = np.empty((len(rejected), 4, 3), dtype=np.float64)
+                rarr[:, 0] = np.column_stack([rz, ry1, rx1]); rarr[:, 1] = np.column_stack([rz, ry1, rx2])
+                rarr[:, 2] = np.column_stack([rz, ry2, rx2]); rarr[:, 3] = np.column_stack([rz, ry2, rx1])
+                rej_data = (list(rarr), [_REJECTED_COLOR] * len(rejected), [])
     # Margin filter: hide boxes whose center falls in the left/top tile overlap region
     # x1/y1/x2/y2 are already tile-local (tile_x0/y0 subtracted above)
     if left_margin > 0 or top_margin > 0:
@@ -1670,7 +1770,7 @@ def _add_second_intensity_layer(viewer, ch, paths, anchor_dir, tile_path, z_rang
 
 # ── Mode: prealign ────────────────────────────────────────────────────────────
 
-def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
+def _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name):
     zl_cfg  = vis_cfg.get('z_linker', {})
     zl_soma = zl_cfg.get('soma', {})
     zl_tf   = zl_cfg.get('tf',   {})
@@ -1709,7 +1809,8 @@ def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
     canvas_z, canvas_h, canvas_w = canvas_shape
     print(f"Z-range: {z_range[0]} – {z_range[1]} ({z_range[1] - z_range[0]} slices)\n")
 
-    offsets = load_offsets(align_dir, tile_name)
+    offsets = context.offsets_for_tile(tile_name)
+    context.print_provenance(tile_name, offsets)
 
     print("=== Channel alignment summary ===")
     for ch in routing_config:
@@ -1804,7 +1905,7 @@ def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
     box_registry = []  # {z, x1, y1, x2, y2, cls, layer_name} — populated below
 
     # ── Load raw volumes for intensity filtering (prealign: apply shift) ──────
-    filter_cfg = vis_cfg.get('filter', {})
+    filter_cfg = _pipeline_preview_filters(base_res, vis_cfg.get('filter', {}))
     raw_vols   = {}
     for ch in routing_config:
         cid = ch['id']
@@ -1831,7 +1932,7 @@ def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
         cid     = ch['id']
         iou = offsets.get(cid, {}).get('iou_score')
         iou_str = f"  iou={iou:.3f}" if iou is not None else "  iou=N/A" if cid in offsets else ""
-        aligned_csv = os.path.join(filtered_dir, f"{tile_name}_{cid}_result.csv")
+        aligned_csv = os.path.join(fused_dir if ch.get('double_exposure') else align_dir, f"{tile_name}_{cid}_result.csv")
         ch_filt = _get_ch_filter(filter_cfg, ch)
         (shapes_a, colors_a, meta_a), (rej_sa, rej_ca, _) = _load_tile_csv_shapes(
             aligned_csv, z_range,
@@ -1931,7 +2032,7 @@ def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
     # ── [coloc] ───────────────────────────────────────────────────────────────
     if show_coloc:
         coloc_csv = os.path.join(base_res, '4_colocalization', 'coloc_result.csv')
-        tile_x0, tile_y0, tile_z0 = _get_tile_offset(anchor_dir, tile_name, base_res=base_res, tile_paths=tile_paths)
+        tile_x0, tile_y0, tile_z0 = _get_runtime_tile_offset(context, tile_name)
         print(f"  [coloc] tile offset: x0={tile_x0}, y0={tile_y0}, z0={tile_z0}")
 
         if os.path.isfile(coloc_csv):
@@ -2112,7 +2213,7 @@ def _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name):
 
 # ── Mode: post (single tile) ──────────────────────────────────────────────────
 
-def _run_post(vis_cfg, paths, routing_config, tile_path, tile_name):
+def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
     zl_cfg  = vis_cfg.get('z_linker', {})
     zl_soma = zl_cfg.get('soma', {})
     zl_tf   = zl_cfg.get('tf',   {})
@@ -2142,7 +2243,9 @@ def _run_post(vis_cfg, paths, routing_config, tile_path, tile_name):
     print(f"Z-range: {z_range[0]} – {z_range[1]} ({z_range[1] - z_range[0]} slices)\n")
 
     # Tile global offset (needed for s3 and coloc coordinate conversion)
-    tile_x0, tile_y0, tile_z0 = _get_tile_offset(anchor_dir, tile_name, base_res=base_res, tile_paths=tile_paths)
+    offsets = context.offsets_for_tile(tile_name)
+    context.print_provenance(tile_name, offsets)
+    tile_x0, tile_y0, tile_z0 = _get_runtime_tile_offset(context, tile_name)
     print(f"Tile global offset: x0={tile_x0}, y0={tile_y0}, z0={tile_z0}\n")
 
     viewer = napari.Viewer(title=f"Post-Pipeline — {tile_name}")
@@ -2150,7 +2253,7 @@ def _run_post(vis_cfg, paths, routing_config, tile_path, tile_name):
     box_registry = []  # {z, x1, y1, x2, y2, cls, layer_name} — populated below
 
     # ── Load raw volumes for intensity filtering ──────────────────────────────
-    filter_cfg = vis_cfg.get('filter', {})
+    filter_cfg = _pipeline_preview_filters(base_res, vis_cfg.get('filter', {}))
     raw_vols   = {}
     for ch in routing_config:
         cid = ch['id']
@@ -2158,7 +2261,8 @@ def _run_post(vis_cfg, paths, routing_config, tile_path, tile_name):
             continue
         ch_base  = os.path.abspath(paths[ch['dir_key']])
         tile_dir = os.path.join(ch_base, os.path.relpath(tile_path, anchor_dir))
-        rv = load_raw_volume(tile_dir, z_range)
+        o = offsets[cid]
+        rv = load_frame_raw_volume(tile_dir, z_range, (o['dx'], o['dy'], o['dz']))
         if rv is not None:
             raw_vols[cid] = rv
             active = [k for k, v in (_get_ch_filter(filter_cfg, ch) or {}).items() if v is not None]
@@ -2172,7 +2276,8 @@ def _run_post(vis_cfg, paths, routing_config, tile_path, tile_name):
             ch_base  = os.path.abspath(paths[ch['dir_key']])
             tile_dir = os.path.join(ch_base, os.path.relpath(tile_path, anchor_dir))
             print(f"[img] Loading {cid}  ({tile_dir}) ...")
-            vol, climits = load_volume(tile_dir, z_range=z_range, contrast_pct=contrast_pct)
+            o = offsets[cid]
+            vol, climits = load_frame_volume(tile_dir, z_range, (o['dx'], o['dy'], o['dz']), contrast_pct)
             if vol is None:
                 print("  → not found, skipping")
                 continue
@@ -2207,7 +2312,7 @@ def _run_post(vis_cfg, paths, routing_config, tile_path, tile_name):
                 raw_vol=raw_vols.get(cid), filt=_get_ch_filter(filter_cfg, ch),
                 left_margin=left_m, top_margin=top_m)
             if shapes:
-                layer_name_s1 = f"[s1] {cid}"
+                layer_name_s1 = f"[source → preview kept] {cid}"
                 _add_labels_layer(
                     viewer, shapes, colors, canvas_shape,
                     name=layer_name_s1, visible=False,
@@ -2219,7 +2324,7 @@ def _run_post(vis_cfg, paths, routing_config, tile_path, tile_name):
             if rej_s:
                 _add_labels_layer(
                     viewer, rej_s, rej_c, canvas_shape,
-                    name=f"[s1 rejected] {cid}", visible=False,
+                    name=f"[preview rejected] {cid}", visible=False,
                     opacity=0.5, outline_width=outline_width,
                 )
                 print(f"[s1 rejected] {cid}: {len(rej_s)} boxes (hidden)")
@@ -2277,9 +2382,10 @@ def _run_post(vis_cfg, paths, routing_config, tile_path, tile_name):
             print(f"[trace] {cid}: loaded {len(vols)} cells from pkl")
             _per_ch_vols[cid] = vols
         else:
+            # Trace fallback reproduces saved Stage 3, so it reads the saved filtered CSV.
             csv_p = os.path.join(filtered_dir, f"{tile_name}_{cid}_result.csv")
             zl_p  = zl_soma if ctype == 'soma' else zl_tf
-            print(f"[trace] {cid}: pkl not found, falling back to CSV re-z-link")
+            print(f"[trace] {cid}: pkl not found, falling back to saved filtered CSV re-z-link")
             _per_ch_vols[cid] = _run_zlink_for_csv(
                 csv_p, z_range,
                 iou_thresh=zl_p.get('iou_thresh', 0.35),
@@ -2452,8 +2558,16 @@ def main():
     if mode not in ('prealign', 'post'):
         sys.exit(f"Unknown mode '{mode}'. Use 'prealign' or 'post'.")
 
-    paths = vis_cfg.get('paths') or {}
-    routing_config = [ch for ch in vis_cfg.get('channels_routing', []) if ch.get('active', True)]
+    display_paths = vis_cfg.get('paths') or {}
+    if not display_paths.get('pATHRESULT'):
+        sys.exit("vis_config must specify paths.pATHRESULT so runtime_config.json can be loaded.")
+    try:
+        context = CoordinateContext.from_result_dir(display_paths['pATHRESULT'])
+    except CoordinateContextError as exc:
+        sys.exit(f"Coordinate context error: {exc}")
+    # Runtime metadata owns coordinate semantics, image routing, and the frame XML.
+    paths = context.paths
+    routing_config = context.routing
 
     anchor_ch  = routing_config[0]
     anchor_dir = os.path.abspath(paths[anchor_ch['dir_key']])
@@ -2468,9 +2582,9 @@ def main():
     for tile_path, tile_name in selected_tiles:
         print(f"\n{'=' * 70}\nTile: {tile_name}\n{'=' * 70}")
         if mode == 'prealign':
-            _run_prealign(vis_cfg, paths, routing_config, tile_path, tile_name)
+            _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name)
         else:
-            _run_post(vis_cfg, paths, routing_config, tile_path, tile_name)
+            _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name)
 
     napari.run()
 

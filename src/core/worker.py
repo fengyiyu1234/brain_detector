@@ -95,132 +95,6 @@ def calculate_ioa(box_nuc, box_soma):
 
 
 
-def _iomin_nms_rows(rows, containment_thresh):
-    """Suppress lower-score boxes whose center is almost fully inside a higher-score box.
-
-    rows: list of [name, x1, y1, x2, y2, class_str, score, mean, z]
-    Only boxes with IoMin > containment_thresh are suppressed (IoMin = inter / min_area).
-    """
-    if len(rows) < 2:
-        return rows
-
-    # group by z so we only compare detections on the same slice
-    z_to_indices = {}
-    for idx, row in enumerate(rows):
-        z = row[8]
-        z_to_indices.setdefault(z, []).append(idx)
-
-    keep_mask = [True] * len(rows)
-
-    for indices in z_to_indices.values():
-        if len(indices) < 2:
-            continue
-        z_rows = [rows[i] for i in indices]
-        n = len(z_rows)
-        x1 = np.array([r[1] for r in z_rows], dtype=np.float32)
-        y1 = np.array([r[2] for r in z_rows], dtype=np.float32)
-        x2 = np.array([r[3] for r in z_rows], dtype=np.float32)
-        y2 = np.array([r[4] for r in z_rows], dtype=np.float32)
-        scores = np.array([r[6] for r in z_rows], dtype=np.float32)
-        areas = (x2 - x1) * (y2 - y1)
-
-        order = np.argsort(-scores)  # highest score first
-        suppressed = np.zeros(n, dtype=bool)
-
-        for i in range(n):
-            ai = order[i]
-            if suppressed[ai]:
-                continue
-            for j in range(i + 1, n):
-                aj = order[j]
-                if suppressed[aj]:
-                    continue
-                ix1 = max(x1[ai], x1[aj])
-                iy1 = max(y1[ai], y1[aj])
-                ix2 = min(x2[ai], x2[aj])
-                iy2 = min(y2[ai], y2[aj])
-                inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-                if inter == 0.0:
-                    continue
-                iomin = inter / (min(areas[ai], areas[aj]) + 1e-6)
-                if iomin > containment_thresh:
-                    suppressed[aj] = True  # suppress lower-score (smaller) box
-
-        for local_idx, global_idx in enumerate(indices):
-            if suppressed[local_idx]:
-                keep_mask[global_idx] = False
-
-    return [row for i, row in enumerate(rows) if keep_mask[i]]
-
-
-def _apply_bbox_filters(rows, model_dp):
-    """Apply size/intensity filters to detection rows at write time.
-
-    rows: list of [name, x1, y1, x2, y2, class, score, mean, z]
-    Filters applied in order: bbox_min/max → aspect_ratio → area_pct → mean_pct → mean_min.
-    Percentile filters are computed over the full tile (all z-slices) so thresholds match
-    what Stage 2.75 would produce.
-    """
-    if not rows or not model_dp:
-        return rows
-    r = np.array(rows, dtype=object)
-    x1 = r[:, 1].astype(float); y1 = r[:, 2].astype(float)
-    x2 = r[:, 3].astype(float); y2 = r[:, 4].astype(float)
-    mean_vals = r[:, 7].astype(float)
-    w = x2 - x1; h = y2 - y1
-    mask = np.ones(len(r), dtype=bool)
-
-    bbox_min = model_dp.get('bbox_min')
-    if bbox_min is not None:
-        mask &= (w >= bbox_min) & (h >= bbox_min)
-    bbox_max = model_dp.get('bbox_max')
-    if bbox_max is not None:
-        mask &= (w <= bbox_max) & (h <= bbox_max)
-    aspect_max = model_dp.get('bbox_max_aspect_ratio')
-    if aspect_max is not None:
-        mask &= np.maximum(w, h) <= aspect_max * np.maximum(np.minimum(w, h), 1e-6)
-
-    areas = w * h
-    area_pct_min = model_dp.get('bbox_area_pct_min')
-    if area_pct_min is not None and mask.any():
-        thresh = float(np.percentile(areas[mask], area_pct_min))
-        mask &= areas >= thresh
-    area_pct_max = model_dp.get('bbox_area_pct_max')
-    if area_pct_max is not None and mask.any():
-        thresh = float(np.percentile(areas[mask], area_pct_max))
-        mask &= areas <= thresh
-    mean_pct_min = model_dp.get('bbox_mean_pct_min')
-    if mean_pct_min is not None and mask.any():
-        thresh = float(np.percentile(mean_vals[mask], mean_pct_min))
-        mask &= mean_vals >= thresh
-    mean_min = model_dp.get('bbox_mean_min') or 0
-    if mean_min > 0:
-        mask &= mean_vals >= mean_min
-
-    return [rows[i] for i in range(len(rows)) if mask[i]]
-
-
-def _write_filtered_detections(det_buf, csv_writers, dp, ch_routing_map):
-    """Write detections to CSV, applying bbox/intensity filters and per-z IoMin NMS.
-
-    Filters (bbox_min/max, aspect_ratio, area_pct, mean_pct, mean_min) are applied here
-    so 1_tile_2d_raw already contains clean boxes.  Stage 2.75 can then be disabled
-    (stage_2_75_enabled=false) to skip redundant re-filtering.
-    """
-    yolo_dp = dp.get('yolo', {})
-    sd_dp   = dp.get('stardist', {})
-    containment_thresh = yolo_dp.get('nms_containment_thresh', None)
-
-    for ch_id, rows in det_buf.items():
-        ch    = ch_routing_map.get(ch_id, {})
-        model = ch.get('model', '').lower()
-        model_dp = sd_dp if model == 'stardist' else yolo_dp
-        rows = _apply_bbox_filters(rows, model_dp)
-        if containment_thresh is not None and model == 'yolo':
-            rows = _iomin_nms_rows(rows, containment_thresh)
-        for row in rows:
-            csv_writers[ch_id].writerow(row)
-
 
 def process_single_tile(i, pATHTEST, config):
     current_logger = logging.getLogger(__name__)
@@ -358,9 +232,6 @@ def process_single_tile(i, pATHTEST, config):
         PREFETCH_DEPTH = 8  # 预取深度：降低以减少内存峰值压力
         prefetch_futures = {}
 
-        det_buf        = {ch['id']: [] for ch in channels_to_run}
-        ch_routing_map = {ch['id']: ch for ch in channels_to_run}
-
         with ThreadPoolExecutor(max_workers=16) as downloader_pool:
 
             pbar.set_description(f"[{dir_name[:10]}] 正在填装初始流水线...")
@@ -468,7 +339,7 @@ def process_single_tile(i, pATHTEST, config):
                                     x1r = max(0, int(round(box[0]))); x2r = min(W0, int(round(box[2])))
                                     y1r = max(0, int(round(box[1]))); y2r = min(H0, int(round(box[3])))
                                     mean_val = float(img_raw[y1r:y2r, x1r:x2r].mean()) if y2r > y1r and x2r > x1r else 0.0
-                                    det_buf[ch_id].append([name_no_ext, box[0], box[1], box[2], box[3], class_str, box[4], mean_val, current_z_real])
+                                    csv_writers[ch_id].writerow([name_no_ext, box[0], box[1], box[2], box[3], class_str, box[4], mean_val, current_z_real])
 
                     # --------- StarDist: 逐切片推断，直接写出 BBox ---------
                     elif ch_model == 'stardist':
@@ -490,15 +361,12 @@ def process_single_tile(i, pATHTEST, config):
                         )
                         for prop in regionprops(labels, intensity_image=img_raw):
                             min_r, min_c, max_r, max_c = prop.bbox
-                            det_buf[ch_id].append([
+                            csv_writers[ch_id].writerow([
                                 name_no_ext, int(min_c), int(min_r), int(max_c), int(max_r),
                                 "nucleus", 1.0, float(prop.mean_intensity), current_z_real,
                             ])
 
                 pbar.update(1)
-
-        # --- 3. Per-tile filter and write ---
-        _write_filtered_detections(det_buf, csv_writers, dp, ch_routing_map)
         tile_ok = True
 
     finally:

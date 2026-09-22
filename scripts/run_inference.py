@@ -25,6 +25,9 @@ from src.utils.io import (listTile, listTile_from_local_csvs, loadTeraxml,
 from src.utils.markers import channel_marker, class_markers, split_class
 import multiprocessing.connection
 from src.core.worker import run_tile_process
+from src.core.detection_filter import (
+    atomic_write_csv, filter_detection_df, resolve_filter_params, source_dir_for_channel,
+)
 from src.core.stitcher import fuse_dual_intensity_2d
 from src.core.channel_stage3 import stitch_and_link_channel
 from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_containment,
@@ -417,134 +420,58 @@ if __name__ == '__main__':
                     os.path.join(_fusion_dst, "fusion_summary.csv"), index=False
                 )
 
+
     # ==========================================
-    # 阶段 2.75: Tile 级 CSV 强度/尺寸过滤
-    # 输入: 1_tile_2d_raw (post_align) 或 0_channel_alignment (pre_align)
-    # 输出: 1_tile_2d_filtered  (Stage 3 从此读取)
-    # stage_2_75_enabled=true : 应用过滤（适合旧的未过滤 1_tile_2d_raw）
-    # stage_2_75_enabled=false: 直接透传（检测阶段已过滤时跳过重复处理）
-    # 修改过滤参数后删除 1_tile_2d_filtered 即可重跑，无需重新检测
+    # Stage 2.75: mandatory tile-level filtering.
+    # Stage 3 consumes only this directory; raw output is never passed through.
     # ==========================================
-    _filter_src = (derived['pATH_ALIGN_OFFSETS']
-                   if pipeline_mode == 'pre_align'
-                   else derived['pATH_DET_RES'])
     _filter_dst = derived['pATH_DET_FILTERED']
-    _stage_2_75_enabled = config.get('stage_2_75_enabled', True)
-
-    def _src_for(ch):
-        """double_exposure 通道读取融合(Stage 2.6)后的结果，其余通道读取常规来源。"""
-        return derived['pATH_DET_FUSED'] if ch.get('double_exposure') else _filter_src
-
+    os.makedirs(_filter_dst, exist_ok=True)
     _tile_names_all = [os.path.split(p)[-1] for p in pATHTILE_all]
-    _filter_done = all(
-        os.path.exists(os.path.join(_filter_dst, f"{tn}_{ch['id']}_result.csv"))
-        for tn in _tile_names_all
-        for ch in routing_config
-        if os.path.exists(os.path.join(_src_for(ch), f"{tn}_{ch['id']}_result.csv"))
-    )
+    _expected_filter_inputs = [
+        (_tn, _ch, source_dir_for_channel(derived, pipeline_mode, _ch))
+        for _tn in _tile_names_all for _ch in routing_config
+    ]
+    _missing_sources = [
+        os.path.join(_src, f"{_tn}_{_ch['id']}_result.csv")
+        for _tn, _ch, _src in _expected_filter_inputs
+        if not os.path.isfile(os.path.join(_src, f"{_tn}_{_ch['id']}_result.csv"))
+    ]
+    if _missing_sources:
+        preview = "\n  ".join(_missing_sources[:10])
+        raise FileNotFoundError(
+            "Stage 2.75 requires every expected source CSV before checkpointing; "
+            f"missing {len(_missing_sources)} file(s):\n  {preview}"
+        )
 
+    _filter_done = bool(_expected_filter_inputs) and all(
+        os.path.isfile(os.path.join(_filter_dst, f"{_tn}_{_ch['id']}_result.csv"))
+        for _tn, _ch, _src in _expected_filter_inputs
+    )
     if _filter_done:
-        logging.info("✔️ Checkpoint 2.75 达成: 过滤后 tile CSV 已全部存在。")
-    elif not _stage_2_75_enabled:
-        import shutil
-        logging.info("阶段 2.75: stage_2_75_enabled=false，直接透传 raw CSV → filtered（跳过过滤）...")
-        for _tn in tqdm(_tile_names_all, desc="Passthrough tiles"):
-            for _ch in routing_config:
-                _ch_id  = _ch['id']
-                _in_csv = os.path.join(_src_for(_ch), f"{_tn}_{_ch_id}_result.csv")
-                _out_csv = os.path.join(_filter_dst, f"{_tn}_{_ch_id}_result.csv")
-                if os.path.exists(_in_csv) and not os.path.exists(_out_csv):
-                    shutil.copy2(_in_csv, _out_csv)
-        logging.info("✔️ [2.75] 透传完成。")
+        logging.info("Stage 2.75 checkpoint reached: all filtered tile CSVs exist.")
     else:
-        logging.info("阶段 2.75: 对 tile CSV 应用强度/尺寸过滤...")
-        _sd_dp   = dp.get('stardist', {})
-        _yolo_dp = dp.get('yolo', {})
+        logging.info("Stage 2.75: applying shared filter to tile CSVs...")
         _n_filtered_total = 0
-        for _tn in tqdm(_tile_names_all, desc="Filter tiles"):
-            for _ch in routing_config:
-                _ch_id   = _ch['id']
-                _in_csv  = os.path.join(_src_for(_ch), f"{_tn}_{_ch_id}_result.csv")
-                _out_csv = os.path.join(_filter_dst, f"{_tn}_{_ch_id}_result.csv")
-                if not os.path.exists(_in_csv) or os.path.exists(_out_csv):
-                    continue
-                _model_dp = _sd_dp if _ch['model'] == 'stardist' else _yolo_dp
-                _df = pd.read_csv(_in_csv)
-                _n_before = len(_df)
-                if not _df.empty:
-                    _bbox_min      = _model_dp.get('bbox_min')
-                    _bbox_max      = _model_dp.get('bbox_max')
-                    _area_pct_min  = _model_dp.get('bbox_area_pct_min')
-                    _area_pct_max  = _model_dp.get('bbox_area_pct_max')
-                    _pct_min       = _model_dp.get('bbox_mean_pct_min')
-                    _abs_min       = (_model_dp.get('bbox_mean_min') or
-                                      _model_dp.get('nucleus_mean_min', 0)) or 0
-                    # 1. 绝对尺寸
-                    if _bbox_min is not None:
-                        _df = _df[(_df['x2'] - _df['x1'] >= _bbox_min) &
-                                  (_df['y2'] - _df['y1'] >= _bbox_min)]
-                    if _bbox_max is not None:
-                        _df = _df[(_df['x2'] - _df['x1'] <= _bbox_max) &
-                                  (_df['y2'] - _df['y1'] <= _bbox_max)]
-                    # 1b. 宽高比过滤
-                    _aspect_max = _model_dp.get('bbox_max_aspect_ratio')
-                    if _aspect_max is not None and not _df.empty:
-                        _w = (_df['x2'] - _df['x1']).values
-                        _h = (_df['y2'] - _df['y1']).values
-                        _df = _df[np.maximum(_w, _h) <= _aspect_max * np.maximum(np.minimum(_w, _h), 1e-6)]
-                    # 2. 面积百分位（在通过绝对尺寸过滤的子集上计算）
-                    if _area_pct_min is not None and not _df.empty:
-                        _areas  = (_df['x2'] - _df['x1']) * (_df['y2'] - _df['y1'])
-                        _thresh = float(_areas.quantile(_area_pct_min / 100.0))
-                        _df = _df[_areas >= _thresh]
-                    # 2b. 面积百分位上限（过滤掉面积最大的框）
-                    if _area_pct_max is not None and not _df.empty:
-                        _areas  = (_df['x2'] - _df['x1']) * (_df['y2'] - _df['y1'])
-                        _thresh = float(_areas.quantile(_area_pct_max / 100.0))
-                        _df = _df[_areas <= _thresh]
-                    # 3. 亮度百分位（在通过面积过滤的子集上计算）
-                    if _pct_min is not None and not _df.empty:
-                        _thresh = float(_df['mean'].quantile(_pct_min / 100.0))
-                        _df = _df[_df['mean'] >= _thresh]
-                    # 4. 亮度绝对下限
-                    if _abs_min > 0:
-                        _df = _df[_df['mean'] >= _abs_min]
-                    # 5. Per-z-slice IoMin containment NMS（抑制大框套小框的重复检测）
-                    _containment_thresh = _model_dp.get('nms_containment_thresh', None)
-                    if _containment_thresh is not None and not _df.empty:
-                        _keep_mask = np.ones(len(_df), dtype=bool)
-                        _df_reset = _df.reset_index(drop=True)
-                        for _z_val in _df_reset['z'].unique():
-                            _z_mask = (_df_reset['z'] == _z_val).values
-                            _idx    = np.where(_z_mask)[0]
-                            _x1 = _df_reset['x1'].values[_idx].astype(float)
-                            _y1 = _df_reset['y1'].values[_idx].astype(float)
-                            _x2 = _df_reset['x2'].values[_idx].astype(float)
-                            _y2 = _df_reset['y2'].values[_idx].astype(float)
-                            _sc = _df_reset['score'].values[_idx].astype(float)
-                            _ar = np.maximum(0, _x2 - _x1) * np.maximum(0, _y2 - _y1)
-                            _order      = np.argsort(-_sc)
-                            _local_keep = np.ones(len(_idx), dtype=bool)
-                            for _ki in range(len(_order)):
-                                _i = _order[_ki]
-                                if not _local_keep[_i]:
-                                    continue
-                                _rest = _order[_ki + 1:]
-                                _rest = _rest[_local_keep[_rest]]
-                                if len(_rest) == 0:
-                                    continue
-                                _ix1   = np.maximum(_x1[_i], _x1[_rest])
-                                _iy1   = np.maximum(_y1[_i], _y1[_rest])
-                                _ix2   = np.minimum(_x2[_i], _x2[_rest])
-                                _iy2   = np.minimum(_y2[_i], _y2[_rest])
-                                _inter = np.maximum(0, _ix2 - _ix1) * np.maximum(0, _iy2 - _iy1)
-                                _iomin = _inter / (np.minimum(_ar[_i], _ar[_rest]) + 1e-6)
-                                _local_keep[_rest[_iomin > _containment_thresh]] = False
-                            _keep_mask[_idx[~_local_keep]] = False
-                        _df = _df[_keep_mask]
-                _df.to_csv(_out_csv, index=False)
-                _n_filtered_total += _n_before - len(_df)
-        logging.info(f"✔️ [2.75] Tile 过滤完成，共移除 {_n_filtered_total:,} 个 box。")
+        for _tn, _ch, _src in tqdm(_expected_filter_inputs, desc="Filter tiles"):
+            _ch_id = _ch['id']
+            _in_csv = os.path.join(_src, f"{_tn}_{_ch_id}_result.csv")
+            _out_csv = os.path.join(_filter_dst, f"{_tn}_{_ch_id}_result.csv")
+            if os.path.isfile(_out_csv):
+                continue
+            _params = resolve_filter_params(config, _ch)
+            _filtered_df, _stats = filter_detection_df(
+                pd.read_csv(_in_csv), _params, return_stats=True,
+                context=f"{_in_csv} ({_ch_id})",
+            )
+            atomic_write_csv(_filtered_df, _out_csv)
+            _n_filtered_total += _stats["removed_total"]
+            logging.info(
+                "[2.75][%s][%s] %s -> %s (removed=%s; params=%s)",
+                _tn, _ch_id, _stats["before"], _stats["after"],
+                _stats["removed_total"], _params,
+            )
+        logging.info("[2.75] filtered %s box(es).", _n_filtered_total)
 
     pATH_SRC_CSV = _filter_dst
 
@@ -565,7 +492,7 @@ if __name__ == '__main__':
             for _tn in _tile_names_all
             for _ch in routing_config
             if _ch.get('active', True)
-            and os.path.exists(os.path.join(_src_for(_ch), f"{_tn}_{_ch['id']}_result.csv"))
+            and os.path.exists(os.path.join(source_dir_for_channel(derived, pipeline_mode, _ch), f"{_tn}_{_ch['id']}_result.csv"))
             and not os.path.exists(os.path.join(_hist_dir, f"{_tn}_{_ch['id']}_hist.png"))
         ]
         if not _hist_todo:
@@ -574,7 +501,7 @@ if __name__ == '__main__':
         logging.info(f"阶段 2.8: 生成 {len(_hist_todo)} 个 raw 2D 直方图 ...")
         for _tn, _ch in tqdm(_hist_todo, desc="Raw histograms"):
             _ch_id    = _ch['id']
-            _csv_path = os.path.join(_src_for(_ch), f"{_tn}_{_ch_id}_result.csv")
+            _csv_path = os.path.join(source_dir_for_channel(derived, pipeline_mode, _ch), f"{_tn}_{_ch_id}_result.csv")
             _df_raw   = pd.read_csv(_csv_path)
             if _df_raw.empty:
                 continue

@@ -575,3 +575,54 @@ Olig2 逐 tile 包含数中位数 54 → 122。
   ]
 }
 ```
+---
+
+## 2026-09-22 Raw/Filtered contract and reusable Stage 2.75 filter
+
+### Completed
+
+- Added src/core/detection_filter.py as the CPU-only source of truth for Stage 2.75: ordered bbox/aspect/area/mean/IoMin filtering, per-z stable-score containment NMS, parameter validation, per-channel override resolution, statistics, legal source routing, and atomic CSV writing.
+- Updated src/core/worker.py so 1_tile_2d_raw/ streams the full nine-column detector output and no longer applies configurable bbox, percentile, intensity, or containment filters. Detector-native YOLO patch stitching/model NMS and StarDist instance NMS remain.
+- Updated scripts/run_inference.py: Stage 2.75 is now mandatory, has no passthrough switch, validates every required raw/aligned/fused source CSV before checkpointing, logs per-tile/channel params and counts, and leaves Stage 3 reading only filtered CSVs.
+- Added CPU-only scripts/refilter_detections.py with --channels, --tiles, --output-dir, --dry-run, and explicit --overwrite. It uses existing CSV means, writes only after all filter calculations succeed, records refilter_manifest.json, and warns (without deleting) about stale downstream outputs.
+- Updated 2-D visualization preview to use the shared filter before z-range cropping, read raw/post-align, aligned/pre-align, or fused/double-exposure sources, use the recorded runtime_config.json parameters when available, and distinguish source -> preview-kept from preview-rejected layers. The dual-exposure preview utility now uses the shared module as well.
+- Added empty channel_filter_overrides.Olig2 placeholders to the three EGFR T4 local config files. No Olig2 QC threshold was guessed or written; Sox9 still inherits the StarDist defaults. config/ is locally ignored/skip-worktree, so these local config edits require explicit force-add or equivalent if they are intended for Git.
+- Extended README with raw/filtered semantics, override/null behavior, cache invalidation, and refilter commands.
+
+### Verification
+
+- brain_detector environment: python -m unittest discover -s tests -p test_*.py -v passed 5 tests (filter order/stability, containment NMS, override/null validation, refilter dry-run, candidate output, and manifest).
+- Compiled: shared filter, worker, main pipeline, refilter CLI, visualizer, and dual-exposure preview.
+- git diff --check passed. Repository scan found no non-log stage_2_75_enabled references.
+
+### Still requires manual QC / authorization
+
+- Final EGFR T4 Olig2 threshold values remain pending user QC confirmation.
+- No T4 data was archived, overwritten, re-filtered in place, or re-run.
+- Perform the planned side-directory refilter + visual QC before using --overwrite, then regenerate Stage 3-5 outputs.
+
+- Follow-up correction: removed the remaining obsolete stage_2_75_enabled switch and passthrough-era comments from config/config_EGFR_t4_local_gpu.json. The pipeline does not read this key; Stage 2.75 is mandatory.
+
+---
+
+## 2026-09-22 Visualization coordinate-frame repair
+
+### Completed
+
+- Added `src/utils/coordinate_context.py`. It derives visualizer geometry exclusively from `<pATHRESULT>/runtime_config.json` and its `paths.pATHXML`, validates the final frame channel, same-directory `xml_merging_<channel>.xml` files, unique tile names, complete pre-align offset JSON, and zero shift for the frame channel.
+- The visualizer now uses the runtime routing/paths rather than the duplicated sample routing in `vis_config.json`. Global Stage 3/4 results use the runtime frame XML without a channel-directory or regular-grid fallback.
+- Post-mode image layers and intensity-filter volumes now use the same per-channel shifts as prealign mode, including an expanded raw Z read before shift/crop so edge slices entering the requested final-frame range are retained. Post Stage-1 preview reads the filtered, final-frame CSV source.
+- Startup provenance prints `P_O`, `P_c-P_O`, per-tile alignment `s`, and residual `q = P_O + s - P_c` for every channel.
+- Added `tests/test_coordinate_context.py` covering global/local inversion, the two equivalent global-coordinate expressions, the T4 GFP residual, and fail-fast incomplete offsets.
+
+### Verification
+
+- `conda run -n brain_detector python -m unittest discover -s tests -p test_*.py -v`: 7 tests passed.
+- T4 smoke test for `360100_349900`: Olig2 `P_O=(3458,8674,5)`; global `z=2` maps to local index `6` (the seventh slice); GFP `q=(-1,34,-3)`.
+- Compiled `coordinate_context.py` and `visualize.py`; `git diff --check` passed.
+
+### Notes
+
+- No EGFR T4 detection, filtered, Stage 3, Stage 4, or colocalization result files were changed. This update changes only visualization coordinate parsing/display and its regression tests.
+
+- Added scripts/review_filtered_gui.py: read-only raw-image plus saved-filtered-box QC. It prints the visualize.py spatial tile grid, accepts comma-separated multi-tile selection, then opens one Napari window per selected tile with a shared Z range and selected channels.

@@ -367,3 +367,31 @@ Key `vis_config.json` settings:
 | `stage` | `"all"` / `"s1"` / `"s3"` / `"s4"` — which result layers to load |
 | `show_coloc` | Show colocalization layer *(prealign mode)* |
 | `filter` | Per-type bbox size/intensity filters applied at display time only |
+
+## Detection CSV filtering
+
+`1_tile_2d_raw/` is the complete detector output: it includes only detector-native
+post-processing (YOLO patch stitching/model NMS or StarDist instance NMS), never
+configurable size, percentile, intensity, or containment filtering. Stage 2.75 always
+reads raw/post-alignment CSVs (or fused CSVs for a double-exposure logical channel),
+applies the shared filter once, and atomically writes `1_tile_2d_filtered/`. Stage 3
+reads only that filtered directory.
+
+Model defaults live in `detection_params.yolo` / `detection_params.stardist`. A
+`channel_filter_overrides.<channel-id>` object overrides only explicitly present keys;
+`null` deliberately disables an inherited filter. This permits Olig2-specific tuning
+without changing Sox9. After a parameter change, filtered and all downstream stages are
+stale; regenerate filtered output before rerunning Stage 3 onward.
+
+To regenerate without loading images or models:
+
+```bash
+python scripts/refilter_detections.py --config config/config_EGFR_t4_local_gpu.json --channels Olig2 --dry-run
+python scripts/refilter_detections.py --config config/config_EGFR_t4_local_gpu.json --channels Olig2 --overwrite
+```
+
+The CLI reads the correct raw/aligned/fused CSV source by pipeline mode, uses the CSV
+`mean` column, writes CSVs atomically, and warns instead of deleting downstream output.
+The 2-D visualizer uses the same implementation and, when present, resolves parameters
+from `runtime_config.json`; its layers distinguish source, preview-kept, and preview-
+rejected boxes.
