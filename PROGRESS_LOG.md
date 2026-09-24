@@ -626,3 +626,23 @@ Olig2 逐 tile 包含数中位数 54 → 122。
 - No EGFR T4 detection, filtered, Stage 3, Stage 4, or colocalization result files were changed. This update changes only visualization coordinate parsing/display and its regression tests.
 
 - Added scripts/review_filtered_gui.py: read-only raw-image plus saved-filtered-box QC. It prints the visualize.py spatial tile grid, accepts comma-separated multi-tile selection, then opens one Napari window per selected tile with a shared Z range and selected channels.
+
+## 2026-09-24 — score_min 后处理过滤
+
+### 已完成
+- 在共享 `src/core/detection_filter.py` 中加入 `score_min`：允许 `null` 或 `[0,1]` 有限数值，拒绝 bool/字符串/NaN/Infinity/越界值；过滤顺序在 `mean_min` 后、containment NMS 前，使用 `score >= score_min`。Filter schema 升至 `"2"`，每步统计始终包含 `removed.score_min`。
+- `scripts/refilter_detections.py` 继续使用共享 filter，终端显示 score_min 独立删除数；manifest 记录参数、分步统计和 schema。Stage 2.75 日志同样报告独立删除数。
+- 可视化 preview 通过共享 filter 对 CSV score 过滤，不加载像素数据；更新 README 与预览说明，区分 StarDist 推理用 `prob_thresh` 和后处理用 `score_min`。
+- 所有生产模型配置加入显式 `score_min`。Olig2 redetect 的 HPC/local 配置均设为 `0.30`，其他配置为 `null`；两份 Olig2 config 阈值一致。
+- 新增阈值边界、参数校验、空表、channel override、NMS 顺序、refilter manifest/overwrite 覆盖。修复过滤后 index 非连续时 containment NMS 使用行位置越界的问题。
+
+### 验证与真实数据
+- `conda run -n brain_detector python -m unittest discover -s tests -v`：12 项全部通过。
+- `conda run -n brain_detector python -m compileall -q src scripts tests`：通过。
+- 全部生产 config 均可通过项目 JSONC loader 解析，且 active channel 的 filter 参数校验通过。
+- Olig2 本地 config dry-run：读取 21 个 raw tile，5390220 条进入 filter，5262590 条保留，累计删除 127630 条；其中 `score_min=0.30` 单独删除 0 条。dry-run 未写文件。
+- 按计划生成独立候选目录 `Y:\Fengyi\EGFR_brain\T4\detection_results\redetect_norm_prob\1_tile_2d_filtered_score030`：21 个 filtered CSV 和 manifest；schema 为 `2`，每条记录 `params.score_min=0.30`，合计数据与 dry-run 一致。raw CSV 和正式 filtered 目录未修改。
+
+### 未完成的人工验收
+- Napari 视觉抽查尚未完成；需要人工检查候选目录里的信号强/暗边缘/高背景 tile。
+- 不同阈值（null/0.25/0.40）的额外候选比较未生成，本次计划只指定了 score030 的输出目录。

@@ -467,9 +467,9 @@ if __name__ == '__main__':
             atomic_write_csv(_filtered_df, _out_csv)
             _n_filtered_total += _stats["removed_total"]
             logging.info(
-                "[2.75][%s][%s] %s -> %s (removed=%s; params=%s)",
+                "[2.75][%s][%s] %s -> %s (removed=%s; score_min_removed=%s; params=%s)",
                 _tn, _ch_id, _stats["before"], _stats["after"],
-                _stats["removed_total"], _params,
+                _stats["removed_total"], _stats["removed"]["score_min"], _params,
             )
         logging.info("[2.75] filtered %s box(es).", _n_filtered_total)
 

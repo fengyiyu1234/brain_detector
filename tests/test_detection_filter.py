@@ -68,6 +68,65 @@ class DetectionFilterTests(unittest.TestCase):
             filter_detection_df(pd.DataFrame({"x1": [0]}), {})
 
 
+    def test_score_min_keeps_threshold_boundary_and_counts_removals(self):
+        source = frame([
+            ["a", 0, 0, 2, 2, "n", .19, 1, 1],
+            ["a", 0, 0, 2, 2, "n", .20, 1, 1],
+            ["a", 0, 0, 2, 2, "n", .30, 1, 1],
+            ["a", 0, 0, 2, 2, "n", .80, 1, 1],
+        ])
+        original = source.copy(deep=True)
+        result, stats = filter_detection_df(source, {"score_min": .30}, return_stats=True)
+        self.assertEqual(result.score.tolist(), [.30, .80])
+        self.assertEqual(result.index.tolist(), [2, 3])
+        self.assertEqual(stats["removed"]["score_min"], 2)
+        self.assertEqual(stats["removed_total"], 2)
+        pd.testing.assert_frame_equal(source, original)
+
+    def test_score_min_null_and_empty_frame_are_noops(self):
+        source = frame([["a", 0, 0, 2, 2, "n", .2, 1, 1],
+                        ["a", 0, 0, 2, 2, "n", .8, 1, 1]])
+        result, stats = filter_detection_df(source, {"score_min": None}, return_stats=True)
+        self.assertEqual(result.index.tolist(), source.index.tolist())
+        self.assertEqual(stats["removed"]["score_min"], 0)
+        empty, empty_stats = filter_detection_df(source.iloc[:0], {"score_min": .5}, return_stats=True)
+        self.assertTrue(empty.empty)
+        self.assertEqual(empty_stats["removed"]["score_min"], 0)
+
+    def test_score_min_validation(self):
+        for invalid in (-.01, 1.01, "0.3", True, float("nan"), float("inf")):
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "score_min"):
+                validate_filter_params({"score_min": invalid})
+        validate_filter_params({"score_min": 0})
+        validate_filter_params({"score_min": 1})
+        validate_filter_params({"score_min": None})
+
+    def test_score_min_channel_override_and_null_disable(self):
+        config = {
+            "detection_params": {"stardist": {"score_min": .25}},
+            "channels_routing": [{"id": "Olig2", "model": "stardist"},
+                                 {"id": "Sox9", "model": "stardist"}],
+            "channel_filter_overrides": {"Olig2": {"score_min": .35}},
+        }
+        self.assertEqual(resolve_filter_params(config, "Olig2")["score_min"], .35)
+        self.assertEqual(resolve_filter_params(config, "Sox9")["score_min"], .25)
+        config["channel_filter_overrides"]["Olig2"]["score_min"] = None
+        self.assertIsNone(resolve_filter_params(config, "Olig2")["score_min"])
+
+    def test_score_filter_precedes_containment_nms(self):
+        source = frame([
+            ["a", 0, 0, 10, 10, "n", .9, 1, 1],
+            ["a", 1, 1, 2, 2, "n", .2, 1, 1],
+            ["a", 1, 1, 2, 2, "n", .8, 1, 1],
+        ])
+        result, stats = filter_detection_df(
+            source, {"score_min": .5, "nms_containment_thresh": .9}, return_stats=True)
+        self.assertEqual(result.index.tolist(), [0])
+        self.assertEqual(stats["removed"]["score_min"], 1)
+        self.assertEqual(stats["removed"]["containment_nms"], 1)
+        self.assertEqual(stats["removed_total"], sum(stats["removed"].values()))
+
+
 if __name__ == "__main__":
     unittest.main()
 

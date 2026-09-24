@@ -106,7 +106,7 @@ def main() -> int:
         )
         prepared.append((tile, ch, source, target, params, filtered, stats))
         print(f"[{tile}][{ch['id']}] {stats['before']} -> {stats['after']} "
-              f"(removed={stats['removed_total']})")
+              f"(removed={stats['removed_total']}; score_min={stats['removed']['score_min']})")
 
     if args.dry_run:
         print("Dry run complete: no files were written.")

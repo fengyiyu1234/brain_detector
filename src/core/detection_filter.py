@@ -9,11 +9,11 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-FILTER_SCHEMA_VERSION = "1"
+FILTER_SCHEMA_VERSION = "2"
 FILTER_KEYS = frozenset({
     "bbox_min", "bbox_max", "bbox_max_aspect_ratio", "bbox_area_pct_min",
     "bbox_area_pct_max", "bbox_mean_pct_min", "bbox_mean_min",
-    "nms_containment_thresh",
+    "score_min", "nms_containment_thresh",
 })
 REQUIRED_COLUMNS = ("x1", "y1", "x2", "y2", "score", "mean", "z")
 
@@ -74,7 +74,7 @@ def validate_filter_params(params: Mapping[str, Any]) -> None:
     number("bbox_min", 0); number("bbox_max", 0); number("bbox_max_aspect_ratio", 1)
     number("bbox_area_pct_min", 0, 100); number("bbox_area_pct_max", 0, 100)
     number("bbox_mean_pct_min", 0, 100); number("bbox_mean_min")
-    number("nms_containment_thresh", 0, 1)
+    number("score_min", 0, 1); number("nms_containment_thresh", 0, 1)
     if params.get("bbox_min") is not None and params.get("bbox_max") is not None and params["bbox_min"] > params["bbox_max"]:
         raise ValueError("bbox_min must be <= bbox_max")
     if params.get("bbox_area_pct_min") is not None and params.get("bbox_area_pct_max") is not None and params["bbox_area_pct_min"] > params["bbox_area_pct_max"]:
@@ -90,8 +90,8 @@ def _check_columns(df: pd.DataFrame, context: str | None) -> None:
 
 def _iomin_keep(df: pd.DataFrame, threshold: float) -> np.ndarray:
     keep = np.ones(len(df), dtype=bool)
-    for _, group in df.groupby("z", sort=False):
-        indices = group.index.to_numpy()
+    for positions in df.groupby("z", sort=False).indices.values():
+        group = df.iloc[positions]
         x1, y1 = group.x1.to_numpy(float), group.y1.to_numpy(float)
         x2, y2 = group.x2.to_numpy(float), group.y2.to_numpy(float)
         areas = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
@@ -108,7 +108,7 @@ def _iomin_keep(df: pd.DataFrame, threshold: float) -> np.ndarray:
                 denom = min(areas[winner], areas[loser])
                 if denom > 0 and inter / denom > threshold:
                     local_keep[loser] = False
-        keep[indices[~local_keep]] = False
+        keep[np.asarray(positions)[~local_keep]] = False
     return keep
 
 
@@ -149,6 +149,8 @@ def filter_detection_df(df: pd.DataFrame, params: Mapping[str, Any], return_stat
     percentile_step("mean_pct_min", out["mean"].to_numpy(float) if not out.empty else np.array([]), params.get("bbox_mean_pct_min"), True)
     if not out.empty and params.get("bbox_mean_min") is not None: apply("mean_min", out["mean"].to_numpy(float) >= params["bbox_mean_min"])
     else: stats["removed"]["mean_min"] = 0
+    if not out.empty and params.get("score_min") is not None: apply("score_min", out["score"].to_numpy(float) >= params["score_min"])
+    else: stats["removed"]["score_min"] = 0
     if not out.empty and params.get("nms_containment_thresh") is not None: apply("containment_nms", _iomin_keep(out, float(params["nms_containment_thresh"])))
     else: stats["removed"]["containment_nms"] = 0
     stats["after"] = len(out); stats["removed_total"] = stats["before"] - stats["after"]

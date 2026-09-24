@@ -380,7 +380,11 @@ reads only that filtered directory.
 Model defaults live in `detection_params.yolo` / `detection_params.stardist`. A
 `channel_filter_overrides.<channel-id>` object overrides only explicitly present keys;
 `null` deliberately disables an inherited filter. This permits Olig2-specific tuning
-without changing Sox9. After a parameter change, filtered and all downstream stages are
+without changing Sox9. `prob_thresh` is the StarDist inference threshold that determines
+which candidates enter raw CSVs. `score_min` filters the raw CSV `score` column during
+postprocessing with `score >= score_min`; it applies to StarDist probability or YOLO
+confidence and does not rerun inference. Channel overrides can set a different value or
+`null` to disable it. After a parameter change, filtered and all downstream stages are
 stale; regenerate filtered output before rerunning Stage 3 onward.
 
 To regenerate without loading images or models:

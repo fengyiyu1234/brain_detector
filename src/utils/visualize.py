@@ -118,7 +118,7 @@ def _pipeline_preview_filters(base_res, fallback):
         return fallback
 
 def _needs_raw_vol(filter_cfg, ch):
-    """True only when a channel's filter needs pixel data, i.e. an intensity threshold.
+    """True only when an intensity threshold requires pixel data.
 
     Size/area filters are geometry-only, so gating on this avoids re-reading a whole
     tile volume that the image layers already loaded.
@@ -670,7 +670,7 @@ def _load_tile_csv_shapes(csv_path, z_range=None, raw_vol=None, filt=None,
     """Load a tile-local detection CSV (1-indexed z) → napari shapes.
 
     raw_vol: optional float32 (Z,H,W) with 16-bit values for intensity filtering.
-    filt: optional dict — bbox_min, bbox_max, bbox_mean_pct_min, bbox_mean_min.
+    filt: optional shared filter params, including score_min; it filters the CSV score column.
     Returns ((shapes, colors, meta), (rej_shapes, rej_colors, rej_meta)).
     rej_* holds boxes removed by filt; both lists are empty when filt is None.
     """
@@ -793,7 +793,7 @@ def _load_global_csv_to_tile_shapes(csv_path, tile_name, tile_x0, tile_y0, tile_
     Filters by tile_name column if present, otherwise by spatial bounding box.
     z convention: z_local = z_csv + tile_z0 - z_range[0] - 1
     raw_vol: optional float32 (Z,H,W) with 16-bit values for intensity filtering.
-    filt: optional dict — bbox_min, bbox_max, bbox_mean_pct_min, bbox_mean_min.
+    filt: optional shared filter params, including score_min; it filters the CSV score column.
     Returns ((shapes, colors, meta), (rej_shapes, rej_colors, rej_meta)).
     """
     _empty = ([], [], [])
