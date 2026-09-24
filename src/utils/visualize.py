@@ -15,6 +15,11 @@ Reads config/vis_config.json and launches napari in one of two modes:
     [s1] raw 2D detections, [s3] saved z-linked tracks from 3_channel_3d/,
     [s4] colocalization result.
 
+  mode: "2d"
+    Channel-aligned images and tile-local 2D boxes.  2d_source selects
+    aligned raw boxes or filtered boxes.  Ctrl+click records false negatives.
+    Does not load XML or run z-linking.
+
 Usage
 -----
   python src/utils/visualize.py
@@ -39,13 +44,13 @@ from src.utils.coordinate_context import CoordinateContext, CoordinateContextErr
 import numpy as np
 import pandas as pd
 import napari
-from qtpy.QtWidgets import QWidget, QGridLayout, QLabel, QSpinBox
+from qtpy.QtWidgets import QApplication, QMessageBox, QWidget, QGridLayout, QLabel, QSpinBox
 
 from src.config.loader import load_config
-from src.utils.io import listTile, compute_grid_fallback_offsets
+from src.utils.io import listTile
 from src.utils.markers import channel_marker, class_markers, split_class
 from src.core.z_linker import run_z_linker
-from src.core.detection_filter import FILTER_KEYS, filter_detection_df, resolve_filter_params
+from src.core.detection_filter import FILTER_KEYS, filter_detection_df
 from src.core.stitcher import (
     match_soma_3d_iou, annotate_soma_with_tf_containment,
     suppress_cross_class_overlap, _merge_class,
@@ -100,22 +105,6 @@ def _get_ch_filter(filter_cfg, ch):
     override = filter_cfg.get(ch.get('id', ''), {}) or {}
     return {**inherited, **override} if (inherited or override) else None
 
-
-def _pipeline_preview_filters(base_res, fallback):
-    """Use the recorded pipeline config so previews reproduce saved filtering."""
-    runtime_path = os.path.join(base_res, 'runtime_config.json')
-    if not os.path.isfile(runtime_path):
-        return fallback
-    try:
-        with open(runtime_path, encoding='utf-8') as handle:
-            runtime = json.load(handle)
-        return {
-            ch['id']: resolve_filter_params(runtime, ch)
-            for ch in runtime.get('channels_routing', []) if ch.get('active', True)
-        }
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"[preview filter] runtime_config unavailable ({exc}); using vis_config filter")
-        return fallback
 
 def _needs_raw_vol(filter_cfg, ch):
     """True only when an intensity threshold requires pixel data.
@@ -478,56 +467,9 @@ def _canvas_shape_from_tile(tile_path, z_range):
 # ── XML helpers ───────────────────────────────────────────────────────────────
 
 def _get_runtime_tile_offset(context, tile_name):
-    """Global result ? final-frame tile offset from runtime paths.pATHXML."""
+    """Global result to configured frame tile offset."""
     pos = context.position(tile_name)
     return pos.x, pos.y, pos.z
-
-    """Return (tile_x0, tile_y0, tile_z0) for coordinate conversion.
-
-    Resolution order:
-      1. xml_merging.xml / xml_import.xml (real TeraStitcher inter-tile offsets)
-      2. grid fallback, replicating run_inference.py's pre_align behavior when
-         no TeraStitcher XML exists — reads tile_size/overlap_pct from the run's
-         own runtime_config.json (under base_res) so this always matches whatever
-         offset was actually baked into coloc_result.csv / 3d_tracked.csv.
-      3. (0, 0, 0)
-    """
-    for xml_name in ('xml_merging.xml', 'xml_import.xml'):
-        xml_path = os.path.join(channel_dir, xml_name)
-        if not os.path.isfile(xml_path):
-            continue
-        try:
-            root   = ET.parse(xml_path).getroot()
-            stacks = list(root.find('STACKS'))
-            z_start = max(int(s.get('ABS_D', 0)) for s in stacks)
-            x_min   = min(int(s.get('ABS_H', 0)) for s in stacks)
-            y_min   = min(int(s.get('ABS_V', 0)) for s in stacks)
-            for stack in stacks:
-                if os.path.basename(stack.get('DIR_NAME', '')) == tile_name:
-                    return (int(stack.get('ABS_H', 0)) - x_min,
-                            int(stack.get('ABS_V', 0)) - y_min,
-                            z_start - int(stack.get('ABS_D', 0)))
-        except Exception:
-            pass
-
-    if base_res and tile_paths:
-        try:
-            with open(os.path.join(base_res, 'runtime_config.json'), encoding='utf-8') as f:
-                runtime_cfg = json.load(f)
-            if runtime_cfg.get('pipeline_mode') == 'pre_align':
-                tile_size   = runtime_cfg.get('detection_params', {}).get('tILESIZE', 2048)
-                overlap_pct = runtime_cfg.get('pre_align_params', {}).get('tile_overlap_pct', 15)
-                xy_res_um   = runtime_cfg.get('detection_params', {}).get('xy_resolution_um', 0.65)
-                dir_dict, disp_mat_fin = compute_grid_fallback_offsets(tile_paths, tile_size, overlap_pct, xy_res_um)
-                if tile_name in dir_dict:
-                    gi, gj = dir_dict[tile_name]
-                    ax, ay, az = disp_mat_fin[gi, gj]
-                    return int(ax), int(ay), int(az)
-        except Exception:
-            pass
-
-    return 0, 0, 0
-
 
 def _get_tile_overlap_margins(channel_dir, tile_name, canvas_w, canvas_h):
     xml_path = os.path.join(channel_dir, 'xml_merging.xml')
@@ -1434,6 +1376,12 @@ def _active_image_channel(viewer):
     active = viewer.layers.selection.active
     if active is not None and active.name.startswith('[img] '):
         return active.name[len('[img] '):]
+    if active is not None:
+        for prefix in ('[raw] ', '[filtered] '):
+            if active.name.startswith(prefix):
+                channel = active.name[len(prefix):]
+                if any(layer.name == f'[img] {channel}' for layer in viewer.layers):
+                    return channel
     img_visible = [l for l in viewer.layers
                    if l.name.startswith('[img] ') and l.visible]
     if len(img_visible) == 1:
@@ -1733,17 +1681,31 @@ def _run_tile_colocalization(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
 
 # ── Dual-intensity helpers ─────────────────────────────────────────────────────
 
-def _add_second_intensity_layer(viewer, ch, paths, anchor_dir, tile_path, z_range,
+class InvalidImageContrastError(ValueError):
+    """A selected image range has no usable intensity span for napari."""
+
+
+def _check_image_contrast(climits, tile_name, channel_id, z_range):
+    lo, hi = climits
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        raise InvalidImageContrastError(
+            f"Tile {tile_name}, channel {channel_id}, Z {z_range[0]}–{z_range[1]}: "
+            f"invalid image contrast limits {climits}. "
+            "The selected image slices may be blank or have constant intensity."
+        )
+
+
+def _load_second_intensity_image(ch, paths, anchor_dir, tile_path, z_range,
                                  contrast_pct, offsets=None):
     """For a double_exposure channel, load its second-intensity volume as its own
     image layer (same colormap as the primary channel — same physical channel,
     just a different laser power). No-op for regular channels.
 
-    offsets: prealign's per-channel shift dict, keyed by channel id — the pipeline
+    offsets: per-channel shift dict for prealign or 2d, keyed by channel id — the pipeline
     already copies the primary channel's shift onto second_intensity_id when writing
     0_channel_alignment/*_offsets.json, so this needs no special-case resolution.
     Pass None in post mode (raw, unshifted images).
-    Returns (second_id, layer), or None if nothing was loaded.
+    Returns (second_id, volume, contrast_limits, display_id), or None.
     """
     if not ch.get('double_exposure'):
         return None
@@ -1751,24 +1713,135 @@ def _add_second_intensity_layer(viewer, ch, paths, anchor_dir, tile_path, z_rang
     second_base = os.path.abspath(paths[ch['second_intensity_dir_key']])
     tile_dir = os.path.join(second_base, os.path.relpath(tile_path, anchor_dir))
     print(f"[img] Loading {second_id}  ({tile_dir})  [dual-intensity] ...")
-    vol, climits = load_volume(tile_dir, z_range=z_range, contrast_pct=contrast_pct)
+    shift_info = (offsets.get(second_id) or offsets.get(ch['id'])) if offsets else None
+    if shift_info is None:
+        vol, climits = load_volume(tile_dir, z_range=z_range, contrast_pct=contrast_pct)
+    else:
+        shift = tuple(int(shift_info[key]) for key in ('dx', 'dy', 'dz'))
+        vol, climits = load_frame_volume(tile_dir, z_range, shift, contrast_pct)
+        if any(shift):
+            print(f"  shifted ({shift[0]:+d}, {shift[1]:+d}, {shift[2]:+d})")
     if vol is None:
-        print("  → not found, skipping")
+        print("  not found, skipping")
         return None
-    if offsets and second_id in offsets:
-        o = offsets[second_id]
-        dx, dy, dz = o['dx'], o['dy'], o['dz']
-        if dx != 0 or dy != 0 or dz != 0:
-            vol = _shift_volume(vol, dx, dy, dz)
-            print(f"  → shifted ({dx:+d}, {dy:+d}, {dz:+d})")
-    layer = viewer.add_image(vol, name=f"[img] {second_id}", contrast_limits=climits,
-                              **_ch_vis(ch['id']))
-    layer.contrast_limits_range = (0, 65535)
-    print(f"  → {vol.shape}  contrast_limits={climits}")
-    return second_id, layer
+    _check_image_contrast(climits, os.path.basename(tile_path), second_id, z_range)
+    print(f"  shape={vol.shape}  contrast_limits={climits}")
+    return second_id, vol, climits, ch['id']
 
 
 # ── Mode: prealign ────────────────────────────────────────────────────────────
+
+def _run_2d(vis_cfg, paths, routing_config, tile_path, tile_name):
+    """Show aligned raw or filtered tile-local detections without XML or z-linking."""
+    source = vis_cfg.get('2d_source', 'raw')
+    if source not in ('raw', 'filtered'):
+        raise ValueError("2d_source must be 'raw' or 'filtered'")
+    csv_dir = os.path.join(paths['pATHRESULT'], {
+        'raw': '0_channel_alignment',
+        'filtered': '1_tile_2d_filtered',
+    }[source])
+    if not os.path.isdir(csv_dir):
+        raise FileNotFoundError(f"2D {source} result directory does not exist: '{csv_dir}'")
+    offset_path = os.path.join(paths['pATHRESULT'], '0_channel_alignment',
+                               f"{tile_name}_offsets.json")
+    if not os.path.isfile(offset_path):
+        raise FileNotFoundError(f"Channel alignment offsets do not exist: '{offset_path}'")
+    offsets = load_offsets(os.path.dirname(offset_path), tile_name)
+    for ch in routing_config:
+        shift = offsets.get(ch['id'])
+        if not isinstance(shift, dict) or not all(k in shift for k in ('dx', 'dy', 'dz')):
+            raise ValueError(f"Offsets '{offset_path}' lack dx/dy/dz for '{ch['id']}'")
+        print(f"[align] {ch['id']}: ({shift['dx']:+d}, {shift['dy']:+d}, {shift['dz']:+d})")
+
+    z_range = _resolve_z_range(vis_cfg, tile_path)
+    if z_range[1] <= z_range[0]:
+        raise ValueError(f"No TIFF slices selected for tile '{tile_name}': {z_range}")
+    canvas_shape = _canvas_shape_from_tile(tile_path, z_range)
+    anchor_dir = os.path.abspath(paths[routing_config[0]['dir_key']])
+    contrast_pct = tuple(vis_cfg.get('contrast_pct', [0.1, 99.9]))
+    prepared_images = []
+    if not vis_cfg.get('no_images', False):
+        for ch in routing_config:
+            cid = ch['id']
+            ch_dir = os.path.abspath(paths[ch['dir_key']])
+            tile_dir = os.path.join(ch_dir, os.path.relpath(tile_path, anchor_dir))
+            print(f"[img] Loading {cid} ({tile_dir}) ...")
+            shift = tuple(int(offsets[cid][key]) for key in ('dx', 'dy', 'dz'))
+            vol, climits = load_frame_volume(tile_dir, z_range, shift, contrast_pct)
+            if vol is None:
+                print(f"  [img] {cid}: no TIFF slices found")
+                continue
+            _check_image_contrast(climits, tile_name, cid, z_range)
+            if vol.shape != canvas_shape:
+                raise ValueError(f"Image shape differs for {cid}: {vol.shape} vs {canvas_shape}")
+            prepared_images.append((cid, vol, climits, cid))
+            second = _load_second_intensity_image(
+                ch, paths, anchor_dir, tile_path, z_range, contrast_pct,
+                offsets=offsets)
+            if second:
+                second_id, second_vol, _, _ = second
+                if second_vol.shape != canvas_shape:
+                    raise ValueError(f"Image shape differs for {second_id}: {second_vol.shape} vs {canvas_shape}")
+                prepared_images.append(second)
+
+    viewer = napari.Viewer(title=f"2D {source} - {tile_name}")
+    image_layers = []
+    for cid, vol, climits, display_id in prepared_images:
+        layer = viewer.add_image(vol, name=f"[img] {cid}",
+                                 contrast_limits=climits, **_ch_vis(display_id))
+        layer.contrast_limits_range = (0, 65535)
+        image_layers.append((cid, layer))
+    if image_layers:
+        _add_contrast_panel(viewer, image_layers)
+
+    total = 0
+    box_registry = []
+    for ch in routing_config:
+        cid = ch['id']
+        csv_path = os.path.join(csv_dir, f"{tile_name}_{cid}_result.csv")
+        (shapes, colors, box_meta), _ = _load_tile_csv_shapes(csv_path, z_range)
+        if not os.path.isfile(csv_path):
+            print(f"[2d {source}] Missing {cid}: {csv_path}")
+        if not shapes:
+            continue
+        # A Shapes layer avoids a full-volume labels array per channel.
+        viewer.add_shapes(shapes, shape_type='rectangle', edge_color=colors,
+                          face_color='transparent',
+                          edge_width=vis_cfg.get('outline_width', 2),
+                          name=f"[{source}] {cid}")
+        box_registry.extend({**item, 'layer_name': f"[{source}] {cid}"}
+                            for item in box_meta)
+        total += len(shapes)
+        print(f"[2d {source}] {cid}: {len(shapes)} boxes")
+    print(f"[2d {source}] {total} boxes; Z {z_range[0]}-{z_range[1]}")
+
+    fn_record = _make_fn_recorder(vis_cfg, paths, routing_config, anchor_dir,
+                                  tile_path, tile_name, z_range, offsets=offsets)
+    if fn_record is not None:
+        @viewer.bind_key('Control')
+        def _ctrl_hint(v):
+            v.status = "Ctrl held - click anywhere to mark a false negative"
+            yield
+            v.status = ""
+
+        def _on_click(v, event):
+            if event.type != 'mouse_press':
+                return
+            try:
+                modifiers = [str(mod).lower() for mod in event.modifiers]
+            except (AttributeError, TypeError):
+                return
+            if not any('ctrl' in mod or 'control' in mod for mod in modifiers):
+                return
+            pos = v.cursor.position
+            if len(pos) < 3:
+                return
+            fn_record(v, int(round(pos[0])), float(pos[2]), float(pos[1]),
+                      box_registry)
+
+        viewer.mouse_drag_callbacks.append(_on_click)
+    viewer.reset_view()
+
 
 def _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name):
     zl_cfg  = vis_cfg.get('z_linker', {})
@@ -1828,8 +1901,6 @@ def _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name)
             print(f"  [{cid:8s}]  (no offset data)")
     print("=================================\n")
 
-    viewer = napari.Viewer(title=f"Pre-Align QC — {tile_name}")
-
     # ── Z-linking ─────────────────────────────────────────────────────────────
     need_zlink = show_spheres or show_zlinked or show_coloc
     per_ch_vol_lists = {}
@@ -1871,8 +1942,8 @@ def _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name)
               f"({len(_debug_soma_vols)} soma, {len(_debug_all_tf)} TF)")
 
     # ── Image layers ──────────────────────────────────────────────────────────
+    prepared_images = []
     if not no_images:
-        img_layers = []
         for ch in routing_config:
             cid      = ch['id']
             ch_base  = os.path.abspath(paths[ch['dir_key']])
@@ -1882,6 +1953,7 @@ def _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name)
             if vol is None:
                 print("  → not found, skipping")
                 continue
+            _check_image_contrast(climits, tile_name, cid, z_range)
             canvas_shape = vol.shape
             if cid in offsets:
                 o = offsets[cid]
@@ -1889,23 +1961,29 @@ def _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name)
                 if dx != 0 or dy != 0 or dz != 0:
                     vol = _shift_volume(vol, dx, dy, dz)
                     print(f"  → shifted ({dx:+d}, {dy:+d}, {dz:+d})")
-            img_layer = viewer.add_image(vol, name=f"[img] {cid}", contrast_limits=climits,
-                                          **_ch_vis(cid))
-            img_layer.contrast_limits_range = (0, 65535)
-            img_layers.append((cid, img_layer))
+            prepared_images.append((cid, vol, climits, cid))
             print(f"  → {vol.shape}  contrast_limits={climits}")
 
-            second = _add_second_intensity_layer(
-                viewer, ch, paths, anchor_dir, tile_path, z_range, contrast_pct,
+            second = _load_second_intensity_image(
+                ch, paths, anchor_dir, tile_path, z_range, contrast_pct,
                 offsets=offsets)
             if second:
-                img_layers.append(second)
+                prepared_images.append(second)
+
+    viewer = napari.Viewer(title=f"Pre-Align QC — {tile_name}")
+    if not no_images:
+        img_layers = []
+        for cid, vol, climits, display_id in prepared_images:
+            img_layer = viewer.add_image(vol, name=f"[img] {cid}",
+                                         contrast_limits=climits, **_ch_vis(display_id))
+            img_layer.contrast_limits_range = (0, 65535)
+            img_layers.append((cid, img_layer))
         _add_contrast_panel(viewer, img_layers)
 
     box_registry = []  # {z, x1, y1, x2, y2, cls, layer_name} — populated below
 
     # ── Load raw volumes for intensity filtering (prealign: apply shift) ──────
-    filter_cfg = _pipeline_preview_filters(base_res, vis_cfg.get('filter', {}))
+    filter_cfg = vis_cfg.get('filter', {})
     raw_vols   = {}
     for ch in routing_config:
         cid = ch['id']
@@ -2248,12 +2326,10 @@ def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
     tile_x0, tile_y0, tile_z0 = _get_runtime_tile_offset(context, tile_name)
     print(f"Tile global offset: x0={tile_x0}, y0={tile_y0}, z0={tile_z0}\n")
 
-    viewer = napari.Viewer(title=f"Post-Pipeline — {tile_name}")
-
     box_registry = []  # {z, x1, y1, x2, y2, cls, layer_name} — populated below
 
     # ── Load raw volumes for intensity filtering ──────────────────────────────
-    filter_cfg = _pipeline_preview_filters(base_res, vis_cfg.get('filter', {}))
+    filter_cfg = vis_cfg.get('filter', {})
     raw_vols   = {}
     for ch in routing_config:
         cid = ch['id']
@@ -2269,8 +2345,8 @@ def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
             print(f"[raw_vol] [{cid}] loaded {rv.shape} — active filter: {active}")
 
     # ── Image layers (raw, no shift) ──────────────────────────────────────────
+    prepared_images = []
     if not no_images:
-        img_layers = []
         for ch in routing_config:
             cid      = ch['id']
             ch_base  = os.path.abspath(paths[ch['dir_key']])
@@ -2281,17 +2357,24 @@ def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
             if vol is None:
                 print("  → not found, skipping")
                 continue
+            _check_image_contrast(climits, tile_name, cid, z_range)
             canvas_shape = vol.shape
-            img_layer = viewer.add_image(vol, name=f"[img] {cid}", contrast_limits=climits,
-                                          **_ch_vis(cid))
-            img_layer.contrast_limits_range = (0, 65535)
-            img_layers.append((cid, img_layer))
+            prepared_images.append((cid, vol, climits, cid))
             print(f"  → {vol.shape}  contrast_limits={climits}")
 
-            second = _add_second_intensity_layer(
-                viewer, ch, paths, anchor_dir, tile_path, z_range, contrast_pct)
+            second = _load_second_intensity_image(
+                ch, paths, anchor_dir, tile_path, z_range, contrast_pct)
             if second:
-                img_layers.append(second)
+                prepared_images.append(second)
+
+    viewer = napari.Viewer(title=f"Post-Pipeline — {tile_name}")
+    if not no_images:
+        img_layers = []
+        for cid, vol, climits, display_id in prepared_images:
+            img_layer = viewer.add_image(vol, name=f"[img] {cid}",
+                                         contrast_limits=climits, **_ch_vis(display_id))
+            img_layer.contrast_limits_range = (0, 65535)
+            img_layers.append((cid, img_layer))
         _add_contrast_panel(viewer, img_layers)
 
     # ── Overlap margins (hide inaccurate boxes in left/top tile boundaries) ──────
@@ -2537,6 +2620,10 @@ def main():
         default=os.path.join(project_root, 'config', 'vis_config.json'),
         help='Path to vis_config.json',
     )
+    parser.add_argument('--mode', choices=('2d', 'prealign', 'post'),
+                        help='Override mode from vis_config.json')
+    parser.add_argument('--2d-source', dest='source_2d', choices=('raw', 'filtered'),
+                        help='Select aligned raw or filtered 2D detections')
     args = parser.parse_args()
 
     vis_cfg_path = args.config
@@ -2552,22 +2639,29 @@ def main():
         vis_cfg = {**vis_cfg, **samples[active_sample]}
         print(f"Sample: {active_sample}")
 
-    mode = vis_cfg.get('mode', 'prealign')
+    mode = args.mode or vis_cfg.get('mode', 'prealign')
+    if args.source_2d:
+        vis_cfg['2d_source'] = args.source_2d
     print(f"Mode: {mode}\n")
 
-    if mode not in ('prealign', 'post'):
-        sys.exit(f"Unknown mode '{mode}'. Use 'prealign' or 'post'.")
-
-    display_paths = vis_cfg.get('paths') or {}
-    if not display_paths.get('pATHRESULT'):
-        sys.exit("vis_config must specify paths.pATHRESULT so runtime_config.json can be loaded.")
-    try:
-        context = CoordinateContext.from_result_dir(display_paths['pATHRESULT'])
-    except CoordinateContextError as exc:
-        sys.exit(f"Coordinate context error: {exc}")
-    # Runtime metadata owns coordinate semantics, image routing, and the frame XML.
-    paths = context.paths
-    routing_config = context.routing
+    if mode not in ('2d', 'prealign', 'post'):
+        sys.exit(f"Unknown mode '{mode}'. Use '2d', 'prealign', or 'post'.")
+    if mode == '2d':
+        paths = vis_cfg.get('paths') or {}
+        routing_config = [ch for ch in vis_cfg.get('channels_routing', [])
+                          if ch.get('active', True)]
+        if not paths.get('pATHRESULT') or not routing_config:
+            sys.exit("2d mode requires paths.pATHRESULT and active channels_routing.")
+        if vis_cfg.get('2d_source', 'raw') not in ('raw', 'filtered'):
+            sys.exit("2d_source must be 'raw' or 'filtered'.")
+        context = None
+    else:
+        try:
+            context = CoordinateContext.from_vis_config(vis_cfg, vis_cfg_path)
+        except CoordinateContextError as exc:
+            sys.exit(f"Coordinate context error: {exc}")
+        paths = context.paths
+        routing_config = context.routing
 
     anchor_ch  = routing_config[0]
     anchor_dir = os.path.abspath(paths[anchor_ch['dir_key']])
@@ -2579,14 +2673,29 @@ def main():
     # One napari.Viewer() (= one OS window) per tile, all built up-front; napari.run()
     # is called once at the end so every window stays open and you can Alt-Tab / click
     # between them, instead of blocking on a single tile at a time.
+    opened_tiles = 0
+    qt_app = None
     for tile_path, tile_name in selected_tiles:
         print(f"\n{'=' * 70}\nTile: {tile_name}\n{'=' * 70}")
-        if mode == 'prealign':
-            _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name)
-        else:
-            _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name)
+        try:
+            if mode == '2d':
+                _run_2d(vis_cfg, paths, routing_config, tile_path, tile_name)
+            elif mode == 'prealign':
+                _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name)
+            else:
+                _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name)
+        except InvalidImageContrastError as exc:
+            print(f"[error] {exc}\nSkipping tile {tile_name}.")
+            qt_app = QApplication.instance() or QApplication(sys.argv)
+            QMessageBox.critical(
+                None, "Cannot open tile",
+                f"{exc}\n\nThis tile was skipped. Other selected tiles will continue."
+            )
+            continue
+        opened_tiles += 1
 
-    napari.run()
+    if opened_tiles:
+        napari.run()
 
 
 if __name__ == '__main__':
