@@ -96,6 +96,21 @@ def calculate_ioa(box_nuc, box_soma):
 
 
 
+def stardist_regions_with_scores(labels, details, image):
+    """Pair rendered StarDist labels with their original instance probabilities.
+
+    StarDist renders instance i with label i+1, even when an overlapping
+    instance has no remaining pixels in the label image.
+    """
+    from skimage.measure import regionprops
+
+    probabilities = np.asarray(details['prob'])
+    for region in regionprops(labels, intensity_image=image):
+        index = region.label - 1
+        if index >= len(probabilities):
+            raise ValueError(f"StarDist label {region.label} has no instance probability")
+        yield region, float(probabilities[index])
+
 def process_single_tile(i, pATHTEST, config):
     current_logger = logging.getLogger(__name__)
     dir_name = os.path.basename(pATHTEST)
@@ -344,7 +359,7 @@ def process_single_tile(i, pATHTEST, config):
                     # --------- StarDist: 逐切片推断，直接写出 BBox ---------
                     elif ch_model == 'stardist':
                         from csbdeep.utils import normalize as csbdeep_normalize
-                        from skimage.measure import regionprops
+
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                         sd_dp = dp.get('stardist', {})
@@ -353,17 +368,17 @@ def process_single_tile(i, pATHTEST, config):
                             sd_dp.get('norm_low', 1),
                             sd_dp.get('norm_high', 99.8),
                         )
-                        labels, _ = _global_models['stardist'].predict_instances(
+                        labels, details = _global_models['stardist'].predict_instances(
                             sd_img, axes='YX',
                             n_tiles=tuple(sd_dp.get('n_tiles', [2, 2])),
                             prob_thresh=sd_dp.get('prob_thresh', 0.5),
                             nms_thresh=sd_dp.get('nms_thresh', 0.4),
                         )
-                        for prop in regionprops(labels, intensity_image=img_raw):
+                        for prop, score in stardist_regions_with_scores(labels, details, img_raw):
                             min_r, min_c, max_r, max_c = prop.bbox
                             csv_writers[ch_id].writerow([
                                 name_no_ext, int(min_c), int(min_r), int(max_c), int(max_r),
-                                "nucleus", 1.0, float(prop.mean_intensity), current_z_real,
+                                "nucleus", score, float(prop.mean_intensity), current_z_real,
                             ])
 
                 pbar.update(1)

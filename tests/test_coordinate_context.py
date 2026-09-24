@@ -61,6 +61,27 @@ class CoordinateContextTests(unittest.TestCase):
         own_xml = (raw[0] + p_g.x + q[0], raw[1] + p_g.y + q[1], raw[2] - p_g.z + q[2])
         self.assertEqual(pipeline, own_xml)
 
+    def test_vis_config_works_without_runtime_config(self):
+        tmp, original = self._make_context()
+        self.addCleanup(tmp.cleanup)
+        os.remove(original.runtime_path)
+        config = {
+            "paths": {
+                "pATHRESULT": original.result_dir,
+                "pATHXML": original.frame_xml,
+            },
+            "frame_channel": "Olig2",
+            "channels_routing": [
+                {"id": "GFP", "active": True},
+                {"id": "Olig2", "active": True},
+            ],
+        }
+        context = CoordinateContext.from_vis_config(config, "vis_config.json")
+        self.assertEqual(context.frame_channel, "Olig2")
+        self.assertEqual(tuple(context.position(self.tile)), (3458, 8674, 5))
+        self.assertEqual(tuple(context.position(self.tile, "GFP")), (3466, 8668, 5))
+        self.assertEqual(context.offsets_for_tile(self.tile)["GFP"]["dx"], 7)
+
     def test_prealign_requires_complete_offsets(self):
         tmp, context = self._make_context()
         self.addCleanup(tmp.cleanup)

@@ -35,6 +35,8 @@ from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_containm
 from src.core.point_cloud_aligner import (
     align_tile, tile_alignment_done,
     resolve_align_settings, check_align_settings, save_align_settings,
+    validate_alignment_frame, validate_stitching_xml_frame,
+    validate_cached_geometry,
 )
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -233,6 +235,8 @@ if __name__ == '__main__':
     if pipeline_mode == 'pre_align':
         align_settings = resolve_align_settings(config, routing_config)
         check_align_settings(derived['pATH_ALIGN_OFFSETS'], align_settings)
+        validate_stitching_xml_frame(paths.get('pATHXML'), align_settings['stitching_reference_channel'])
+        logging.info(f"Stitching frame: {align_settings['stitching_reference_channel']}")
         logging.info(f"Pre-align 参考通道: {align_settings['reference_channel']}，"
                      f"TF 对齐方式: {align_settings['tf_align_mode']}")
 
@@ -270,6 +274,11 @@ if __name__ == '__main__':
         dirnames, pATHTILE_all = listTile(anchor_dir)
         if not pATHTILE_all:
             raise ValueError(f"❌ 在锚点目录 {anchor_dir} 中没有找到合法的 Tile！")
+
+    if align_settings is not None:
+        previous_path = os.path.join(base_res_path, 'runtime_config.json')
+        previous = load_config(previous_path) if os.path.isfile(previous_path) else None
+        validate_cached_geometry(previous, config, base_res_path, align_settings)
 
     save_run_metadata(config, start_time)
 
@@ -349,6 +358,14 @@ if __name__ == '__main__':
     #       原始来源，在过滤之前完成两个曝光的融合。
     # 输出: 1_tile_2d_fused/{tile}_{primary_id}_result.csv （落在 Stage 2.75 期望主通道数据的位置）
     # ==========================================
+    if pipeline_mode == 'pre_align':
+        validate_alignment_frame(
+            derived['pATH_ALIGN_OFFSETS'],
+            [os.path.basename(p) for p in pATHTILE_all],
+            [ch['id'] for ch in routing_config],
+            align_settings['stitching_reference_channel'],
+        )
+
     _de_channels = [ch for ch in routing_config if ch.get('double_exposure')]
     _tile_names_all = [os.path.split(p)[-1] for p in pATHTILE_all]
 
@@ -545,6 +562,8 @@ if __name__ == '__main__':
     pATHxml = next((p for p in xml_candidates if os.path.isfile(p)), None)
 
     if pATHxml:
+        if align_settings is not None:
+            validate_stitching_xml_frame(pATHxml, align_settings['stitching_reference_channel'])
         dir_dict, H, W, Z, z_start, disp_mat_fin = loadTeraxml(pATHxml, tile_size)
         _absd = disp_mat_fin[:, :, 2]
         _dmin, _dmax = _absd.min(), _absd.max()

@@ -72,6 +72,80 @@ class CoordinateContext:
     frame_positions: dict[str, TilePosition]
     channel_positions: dict[str, dict[str, TilePosition]]
 
+
+    @classmethod
+    def from_vis_config(cls, config: dict, config_path: str = "vis_config.json") -> "CoordinateContext":
+        """Build visualization coordinates solely from the selected vis sample."""
+        paths = config.get("paths") or {}
+        result_dir = paths.get("pATHRESULT")
+        if not result_dir:
+            raise CoordinateContextError("vis_config must specify paths.pATHRESULT")
+        result_dir = os.path.abspath(result_dir)
+        routing = [dict(ch) for ch in config.get("channels_routing", []) if ch.get("active", True)]
+        if not routing:
+            raise CoordinateContextError("vis_config has no active channels_routing")
+
+        frame_channel = config.get("frame_channel") or routing[0]["id"]
+        if frame_channel not in {ch["id"] for ch in routing}:
+            raise CoordinateContextError(f"vis_config frame_channel '{frame_channel}' is not active")
+        frame_xml = paths.get("pATHXML")
+        if not frame_xml:
+            channel_dir = paths.get(next(ch["dir_key"] for ch in routing if ch["id"] == frame_channel))
+            if not channel_dir:
+                raise CoordinateContextError(f"vis_config has no image directory for '{frame_channel}'")
+            frame_xml = next((candidate for candidate in (
+                os.path.join(channel_dir, "xml_merging.xml"),
+                os.path.join(channel_dir, "xml_import.xml"),
+            ) if os.path.isfile(candidate)), None)
+        if not frame_xml:
+            raise CoordinateContextError("vis_config needs paths.pATHXML or a frame-channel XML")
+        frame_xml = os.path.abspath(frame_xml)
+        if not os.path.isfile(frame_xml):
+            raise CoordinateContextError(f"Visualization frame XML does not exist: '{frame_xml}'")
+        named_channel = re.fullmatch(r"xml_merging_(.+)\.xml", os.path.basename(frame_xml), re.IGNORECASE)
+        if named_channel and named_channel.group(1) != frame_channel:
+            raise CoordinateContextError(
+                f"vis_config frame_channel '{frame_channel}' disagrees with '{frame_xml}'")
+
+        raw_frame = _read_xml_positions(frame_xml)
+        x_min = min(p[0] for p in raw_frame.values())
+        y_min = min(p[1] for p in raw_frame.values())
+        z_start = max(p[2] for p in raw_frame.values())
+
+        def normalize(raw: dict[str, tuple[int, int, int]], label: str) -> dict[str, TilePosition]:
+            missing = set(raw_frame) - set(raw)
+            extra = set(raw) - set(raw_frame)
+            if missing or extra:
+                raise CoordinateContextError(
+                    f"Tile mapping differs between frame XML and {label}: "
+                    f"missing={sorted(missing)}, extra={sorted(extra)}")
+            return {name: TilePosition(p[0] - x_min, p[1] - y_min, z_start - p[2])
+                    for name, p in raw.items()}
+
+        xml_dir = os.path.dirname(frame_xml)
+        per_channel = {ch["id"]: os.path.join(xml_dir, f"xml_merging_{ch['id']}.xml")
+                       for ch in routing}
+        available = {ch: path for ch, path in per_channel.items() if os.path.isfile(path)}
+        if available and len(available) != len(per_channel):
+            missing = sorted(set(per_channel) - set(available))
+            raise CoordinateContextError(f"Missing per-channel XML beside '{frame_xml}': {missing}")
+        if available:
+            channel_positions = {ch: normalize(_read_xml_positions(path), path)
+                                 for ch, path in per_channel.items()}
+        else:
+            # A shared TeraStitcher XML plus recorded alignment offsets can
+            # describe prealignment views before per-channel XMLs are solved.
+            channel_positions = {ch["id"]: normalize(raw_frame, frame_xml) for ch in routing}
+
+        return cls(
+            result_dir=result_dir, runtime_path=os.path.abspath(config_path), runtime=config,
+            paths=dict(paths), routing=routing,
+            pipeline_mode=str(config.get("pipeline_mode", "pre_align")),
+            frame_channel=frame_channel, frame_xml=frame_xml, xml_dir=xml_dir,
+            tile_size=int((config.get("detection_params") or {}).get("tILESIZE", 2048)),
+            frame_positions=normalize(raw_frame, frame_xml), channel_positions=channel_positions,
+        )
+
     @classmethod
     def from_result_dir(cls, result_dir: str) -> "CoordinateContext":
         result_dir = os.path.abspath(result_dir)
@@ -192,7 +266,7 @@ class CoordinateContext:
     def print_provenance(self, tile_name: str, offsets: dict) -> None:
         frame = self.position(tile_name)
         print("=== Coordinate context ===")
-        print(f"  runtime_config: {self.runtime_path}")
+        print(f"  config: {self.runtime_path}")
         print(f"  pipeline_mode={self.pipeline_mode}, final_frame={self.frame_channel}")
         print(f"  frame XML: {self.frame_xml}")
         print(f"  per-channel XML directory: {self.xml_dir}")

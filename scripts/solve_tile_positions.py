@@ -786,7 +786,7 @@ def parse_args():
                     help='默认 <results_dir>/5_analysis_report/tile_positions')
     ap.add_argument('--channels', default=None, help='逗号分隔；默认 config 里所有 active 通道')
     ap.add_argument('--ref', default=None,
-                    help='通道对齐的参考通道（通道场和常数都相对它，MADM 流程里就是 GFP）；'
+                    help='通道对齐的参考通道（通道场和常数都相对它；MADM 可用 GFP 或 RFP）；'
                          '默认 pre_align_params.reference_channel')
     ap.add_argument('--frame', default=None,
                     help='全局坐标系用哪个通道的几何（细胞和配准用的全脑图都落在它上面）；'
@@ -883,7 +883,7 @@ def main():
     ref = args.ref or settings['reference_channel']
     if ref not in channels:
         raise SystemExit(f"❌ 参考通道 {ref} 不在 --channels {channels} 里")
-    frame = args.frame or ref
+    frame = args.frame or config.get('stitching_reference_channel') or ref
     if frame not in channels:
         raise SystemExit(f"❌ 坐标系通道 {frame} 不在 --channels {channels} 里")
 

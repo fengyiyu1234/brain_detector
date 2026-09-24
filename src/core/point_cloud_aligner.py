@@ -989,6 +989,10 @@ def align_tile(tile_path, det_dir, align_dir, routing, settings):
             shifts[second_id] = shifts.get(ch['id'], (0, 0, 0))
             scores[second_id] = scores.get(ch['id'], 0.0)
 
+    # Alignment is measured in the MADM reference frame. Rebase every shift
+    # into the stitching frame before writing aligned CSVs or offsets JSON.
+    shifts = rebase_shifts(shifts, settings['stitching_reference_channel'])
+
     # 4. 对每个通道的原始 CSV 应用偏移（覆盖写：设置已由 check_align_settings 保证一致，
     #    偏移是确定性的，重算的结果与上次相同）
     for cid in _aligned_channel_ids(routing):
@@ -1005,6 +1009,84 @@ def align_tile(tile_path, det_dir, align_dir, routing, settings):
 # ──────────────────────────────────────────────────────────────────────────────
 # 10.  Alignment settings: resolve once, persist, guard against stale outputs
 # ──────────────────────────────────────────────────────────────────────────────
+
+def rebase_shifts(shifts, frame_channel):
+    """Convert raw-to-reference shifts into raw-to-stitching-frame shifts."""
+    if frame_channel not in shifts:
+        raise ValueError(f"Stitching frame {frame_channel!r} has no alignment shift")
+    origin = shifts[frame_channel]
+    return {cid: tuple(int(v[i]) - int(origin[i]) for i in range(3))
+            for cid, v in shifts.items()}
+
+
+def validate_stitching_xml_frame(xml_path, frame_channel):
+    """Check named solver XMLs against the configured stitching frame."""
+    name = os.path.basename(xml_path or '')
+    prefix, suffix = 'xml_merging_', '.xml'
+    if name.startswith(prefix) and name.endswith(suffix):
+        named_frame = name[len(prefix):-len(suffix)]
+        if named_frame != frame_channel:
+            raise ValueError(
+                f"XML frame {named_frame!r} does not match "
+                f"stitching_reference_channel={frame_channel!r}: {xml_path}")
+
+
+def validate_alignment_frame(align_dir, tile_names, channel_ids, frame_channel):
+    """Reject incomplete or differently framed alignment checkpoints."""
+    for tile in tile_names:
+        path = os.path.join(align_dir, f"{tile}_offsets.json")
+        if not os.path.isfile(path):
+            raise ValueError(f"Missing alignment offsets for tile {tile}: {path}")
+        with open(path, encoding='utf-8') as f:
+            offsets = json.load(f)
+        for cid in channel_ids:
+            if cid not in offsets or any(k not in offsets[cid] for k in ('dx', 'dy', 'dz')):
+                raise ValueError(f"Alignment offsets for tile {tile} lack {cid}")
+        frame = offsets[frame_channel]
+        if any(int(frame[k]) != 0 for k in ('dx', 'dy', 'dz')):
+            raise ValueError(f"Alignment for tile {tile} is not in {frame_channel} frame: {frame}")
+
+
+def validate_cached_geometry(previous, current, results_dir, settings):
+    """Reject reused alignment/global checkpoints after coordinate config changes."""
+    align_dir = os.path.join(results_dir, '0_channel_alignment')
+    has_alignment = os.path.isdir(align_dir) and any(
+        name.endswith('_offsets.json') for name in os.listdir(align_dir))
+    downstream = ('2_global_2d_raw', '3_channel_3d', '4_colocalization')
+    has_global = any(
+        os.path.isdir(os.path.join(results_dir, stage)) and
+        any(name.endswith(('.csv', '.pkl')) for name in os.listdir(os.path.join(results_dir, stage)))
+        for stage in downstream)
+    if not (has_alignment or has_global):
+        return
+    if previous is None:
+        raise ValueError("Existing alignment/global checkpoints lack runtime_config.json provenance")
+
+    old_routing = [ch for ch in previous.get('channels_routing', [])
+                   if ch.get('active', True)]
+    old_somas = [ch['id'] for ch in old_routing if ch.get('type', 'soma') == 'soma']
+    old_ref = previous.get('pre_align_params', {}).get('reference_channel')
+    old_ref = old_ref or (old_somas[0] if old_somas else None)
+    old_xml = previous.get('paths', {}).get('pATHXML') or ''
+    new_xml = current.get('paths', {}).get('pATHXML') or ''
+    name = os.path.basename(old_xml)
+    named_frame = name[len('xml_merging_'):-len('.xml')] if (
+        name.startswith('xml_merging_') and name.endswith('.xml')) else None
+    old_frame = previous.get('stitching_reference_channel') or named_frame or old_ref
+    new_ref = settings['reference_channel']
+    new_frame = settings['stitching_reference_channel']
+
+    if has_alignment and old_ref != new_ref:
+        raise ValueError(
+            f"Alignment reference changed {old_ref!r} -> {new_ref!r}; "
+            "archive/regenerate 0_channel_alignment and downstream checkpoints")
+    if has_global and (old_ref != new_ref or old_frame != new_frame or
+                       os.path.normcase(os.path.abspath(old_xml)) !=
+                       os.path.normcase(os.path.abspath(new_xml))):
+        raise ValueError(
+            "Stitching geometry/reference changed while global checkpoints exist; "
+            "archive/regenerate 2_global_2d_raw, 3_channel_3d, 4_colocalization, "
+            "and downstream reports")
 
 ALIGN_SETTINGS_FILE = "_align_settings.json"
 
@@ -1025,6 +1107,10 @@ def resolve_align_settings(config, routing_config):
     ref = pa.get('reference_channel') or (soma_ids[0] if soma_ids else None)
     if soma_ids and ref not in soma_ids:
         raise ValueError(f"❌ pre_align_params.reference_channel='{ref}' 不是已激活的 soma 通道 {soma_ids}")
+    frame = config.get('stitching_reference_channel') or ref
+    active_ids = {ch['id'] for ch in routing_config}
+    if frame not in active_ids:
+        raise ValueError(f"stitching_reference_channel={frame!r} is not an active channel {sorted(active_ids)}")
     mode = pa.get('tf_align_mode', 'chain')
     if mode not in ('chain', 'direct'):
         raise ValueError(f"❌ pre_align_params.tf_align_mode='{mode}'，只能是 'chain' 或 'direct'")
@@ -1036,6 +1122,7 @@ def resolve_align_settings(config, routing_config):
     zl_tf = zl.get('tf', {})
     return {
         'reference_channel': ref,
+        'stitching_reference_channel': frame,
         'tf_align_mode': mode,
         # compute_tile_channel_shifts treats soma_ch_ids[0] as the reference (stable sort)
         'soma_ch_ids': sorted(soma_ids, key=lambda c: c != ref),
@@ -1071,6 +1158,7 @@ def check_align_settings(align_dir, settings):
             saved = json.load(f)
         # 这个键出现之前的对齐结果都是用 FFT 粗搜索算的
         saved.setdefault('containment_coarse', 'fft')
+        saved.setdefault('stitching_reference_channel', saved.get('reference_channel'))
         current = json.loads(json.dumps(settings))
         if saved != current:
             changed = sorted(k for k in set(saved) | set(current) if saved.get(k) != current.get(k))

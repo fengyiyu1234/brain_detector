@@ -55,8 +55,8 @@ Step 1a: align other soma channels (RFP)      → reference soma (GFP)
 Step 1b: align other TF channels (Olig2)      → first TF (Sox9)
 Step 2:  align first TF (Sox9)                → reference soma (GFP)   [containment]
 
-Final offsets:
-  GFP:   (0, 0, 0)              ← global reference
+Measured offsets before stitching-frame conversion:
+  GFP:   (0, 0, 0)              ← alignment reference
   RFP:   step-1a shift
   Sox9:  step-2 shift
   Olig2: step-1b shift + step-2 ← chained
@@ -212,6 +212,14 @@ Use `3` to re-run only colocalization and downstream steps without re-running de
 Stage 3 stitches and z-links every channel in its own process; this caps how many run at once (default: all channels, limited by `$SLURM_CPUS_PER_TASK`). Dense TF channels hold several GB each while they run, so lower it if the job runs out of memory. Cross-channel colocalization (3A/3B/3C) stays in the main process.
 
 **Z-linker solver.** Each slice's Hungarian matching is solved separately inside every connected group of boxes with IoU > 0 (`run_z_linker(..., solver='sparse')`, the default) instead of on one whole-brain cost matrix. This is the same optimum — the number of forced cross-type pairs doesn't depend on which positive-IoU pairs are chosen — so results only differ where two assignments have exactly equal cost. On sample18, soma channels came out identical and Sox9 differed in 2 of 3.69 M cells; Sox9 z-linking went from 56 min to ~3.5 min. `solver='dense'` keeps the original for comparison.
+
+### Alignment reference and stitching frame
+
+Set `pre_align_params.reference_channel` to the MADM soma channel (`GFP` or `RFP`), and set the top-level `stitching_reference_channel` to the channel whose tile positions and XML define the final global frame. The latter defaults to the alignment reference if omitted. `paths.pATHXML` must be the merging XML for that stitching channel.
+
+For each tile, Stage 2.5 measures raw-to-MADM shifts `t_c`, then saves `s_c = t_c - t_frame` in the aligned CSV and offsets JSON. Thus `s_frame = 0` even if the two references differ. Global coordinates use the frame XML position `P_frame`: `x_global = x_raw + s_x + P_x`, `y_global = y_raw + s_y + P_y`, and `z_global = z_raw + s_z - P_z`, where `P_z = z_start - ABS_D` and raw Z is 1-based. Named solver XMLs and saved alignment offsets are checked against the configured frame before stitching.
+
+`solve_tile_positions.py` also takes the stitching frame from this config field unless `--frame` overrides it. The local T4 wrapper reads the full T4 config; the separate Olig2/Sox9 redetection config stops before stitching and does not perform Stage 2.5.
 
 ### `pre_align_params` *(pre_align mode only)*
 | Key | Default | Description |
