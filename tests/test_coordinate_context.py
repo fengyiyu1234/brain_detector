@@ -61,6 +61,62 @@ class CoordinateContextTests(unittest.TestCase):
         own_xml = (raw[0] + p_g.x + q[0], raw[1] + p_g.y + q[1], raw[2] - p_g.z + q[2])
         self.assertEqual(pipeline, own_xml)
 
+    def test_independent_merge_origins_and_z_positions(self):
+        tmp, context = self._make_context()
+        self.addCleanup(tmp.cleanup)
+        gfp_path = os.path.join(context.xml_dir, "xml_merging_GFP.xml")
+        with open(gfp_path, "w", encoding="utf-8") as handle:
+            handle.write(_xml({"origin": (10, 0, 14),
+                               self.tile: (3466, 8668, 7)}))
+        context = CoordinateContext.from_result_dir(context.result_dir)
+        offsets = context.offsets_for_tile(self.tile)
+        self.assertEqual(context.channel_residual(
+            self.tile, "GFP", offsets), (-1, 34, -4))
+        self.assertEqual(context.channel_image_residual(
+            self.tile, "GFP", offsets), (9, 34, -1))
+        raw = (100, 200, 10)
+        own = context.image_positions["GFP"][self.tile]
+        image_point = (raw[0] + own.x, raw[1] + own.y, raw[2] - own.z)
+        global_point = context.channel_image_to_global(
+            self.tile, "GFP", *image_point, offsets)
+        frame = context.position(self.tile)
+        expected = (raw[0] + frame.x + offsets["GFP"]["dx"],
+                    raw[1] + frame.y + offsets["GFP"]["dy"],
+                    raw[2] - frame.z + offsets["GFP"]["dz"])
+        self.assertEqual(global_point, expected)
+        self.assertEqual(context.global_to_channel_image(
+            self.tile, "GFP", *global_point, offsets), image_point)
+
+    def test_shared_xml_from_runtime_config(self):
+        tmp, context = self._make_context()
+        self.addCleanup(tmp.cleanup)
+        shared = os.path.join(context.xml_dir, "xml_merging.xml")
+        with open(shared, "w", encoding="utf-8") as handle:
+            handle.write(_xml({"origin": (0, 0, 11),
+                               self.tile: (3458, 8674, 6)}))
+        for channel in ("GFP", "Olig2"):
+            os.remove(os.path.join(context.xml_dir,
+                                   f"xml_merging_{channel}.xml"))
+        with open(context.runtime_path, encoding="utf-8") as handle:
+            runtime = json.load(handle)
+        runtime["paths"]["pATHXML"] = shared
+        runtime["stitching_reference_channel"] = "Olig2"
+        with open(context.runtime_path, "w", encoding="utf-8") as handle:
+            json.dump(runtime, handle)
+        rebuilt = CoordinateContext.from_result_dir(context.result_dir)
+        self.assertEqual(rebuilt.frame_channel, "Olig2")
+        self.assertEqual(tuple(rebuilt.position(self.tile)), (3458, 8674, 5))
+        vis = {
+            "paths": {"pATHRESULT": context.result_dir},
+            "channels_routing": [
+                {"id": "GFP", "active": True},
+                {"id": "Olig2", "active": True},
+            ],
+        }
+        inferred = CoordinateContext.from_vis_config(vis, "vis_config.json")
+        self.assertEqual(inferred.frame_channel, "Olig2")
+        self.assertEqual(inferred.frame_xml, shared)
+
     def test_vis_config_works_without_runtime_config(self):
         tmp, original = self._make_context()
         self.addCleanup(tmp.cleanup)

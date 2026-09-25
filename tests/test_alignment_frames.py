@@ -11,7 +11,7 @@ import pandas as pd
 from src.core.point_cloud_aligner import (
     align_tile, rebase_shifts, resolve_align_settings,
     validate_alignment_frame, validate_stitching_xml_frame,
-    validate_cached_geometry,
+    validate_cached_geometry, validate_measurement_source, save_align_settings,
 )
 
 
@@ -96,6 +96,49 @@ class AlignmentFrameTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "not in GFP frame"):
                         validate_alignment_frame(
                             str(out), ["tile_a"], list(measured), "GFP")
+
+    def test_measured_shifts_can_be_reused_with_another_stitching_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tile = root / "tile_a"
+            tile.mkdir()
+            (tile / "slice_5.tif").touch()
+            raw = root / "raw"
+            raw.mkdir()
+            cols = ["slice_name", "x1", "y1", "x2", "y2",
+                    "class", "score", "mean", "z"]
+            for ch in self.routing:
+                pd.DataFrame(
+                    [["slice_5", 10, 20, 18, 28, "nucleus", .83, 100, 5]],
+                    columns=cols,
+                ).to_csv(raw / f"tile_a_{ch['id']}_result.csv", index=False)
+            source = root / "source"
+            first = self._settings("GFP", "GFP")
+            save_align_settings(str(source), first)
+            with patch("src.core.z_linker.run_z_linker",
+                       return_value=([], [])), patch(
+                "src.core.point_cloud_aligner.compute_tile_channel_shifts",
+                return_value=(self.gfp_shifts, {}),
+            ):
+                align_tile(str(tile), str(raw), str(source), self.routing, first)
+            self.assertTrue(
+                (source / "tile_a_measured_offsets.json").is_file())
+            second = self._settings("GFP", "Olig2")
+            second["measured_offsets_source"] = str(source)
+            destination = root / "destination"
+            validate_measurement_source(str(destination), second)
+            with patch(
+                "src.core.point_cloud_aligner.compute_tile_channel_shifts",
+                side_effect=AssertionError("alignment was recalculated"),
+            ):
+                align_tile(str(tile), str(raw), str(destination),
+                           self.routing, second)
+            saved = json.loads(
+                (destination / "tile_a_offsets.json").read_text())
+            self.assertEqual(
+                (saved["Olig2"]["dx"], saved["Olig2"]["dy"],
+                 saved["Olig2"]["dz"]), (0, 0, 0))
+            self.assertEqual(saved["GFP"]["dx"], 7)
 
     def test_existing_cache_rejects_reference_or_xml_change(self):
         with tempfile.TemporaryDirectory() as tmp:

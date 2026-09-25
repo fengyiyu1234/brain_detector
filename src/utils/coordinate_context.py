@@ -71,6 +71,7 @@ class CoordinateContext:
     tile_size: int
     frame_positions: dict[str, TilePosition]
     channel_positions: dict[str, dict[str, TilePosition]]
+    image_positions: dict[str, dict[str, TilePosition]]
 
 
     @classmethod
@@ -85,10 +86,36 @@ class CoordinateContext:
         if not routing:
             raise CoordinateContextError("vis_config has no active channels_routing")
 
-        frame_channel = config.get("frame_channel") or routing[0]["id"]
+        runtime_hint = {}
+        runtime_hint_path = os.path.join(result_dir, "runtime_config.json")
+        if os.path.isfile(runtime_hint_path) and (
+                not config.get("frame_channel") or not paths.get("pATHXML")):
+            try:
+                with open(runtime_hint_path, encoding="utf-8") as handle:
+                    runtime_hint = json.load(handle)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise CoordinateContextError(
+                    f"Cannot read runtime config '{runtime_hint_path}': {exc}") from exc
+        runtime_xml_name = os.path.basename(
+            (runtime_hint.get("paths") or {}).get("pATHXML") or "")
+        runtime_named = re.fullmatch(
+            r"xml_merging_(.+)\.xml", runtime_xml_name, re.IGNORECASE)
+        frame_channel = (
+            config.get("frame_channel")
+            or config.get("stitching_reference_channel")
+            or runtime_hint.get("stitching_reference_channel")
+            or (runtime_named.group(1) if runtime_named else None)
+            or (config.get("pre_align_params") or {}).get("reference_channel")
+            or (runtime_hint.get("pre_align_params") or {}).get("reference_channel")
+            or routing[0]["id"]
+        )
         if frame_channel not in {ch["id"] for ch in routing}:
             raise CoordinateContextError(f"vis_config frame_channel '{frame_channel}' is not active")
         frame_xml = paths.get("pATHXML")
+        if not frame_xml:
+            runtime_xml = (runtime_hint.get("paths") or {}).get("pATHXML")
+            if runtime_xml and os.path.isfile(runtime_xml):
+                frame_xml = runtime_xml
         if not frame_xml:
             channel_dir = paths.get(next(ch["dir_key"] for ch in routing if ch["id"] == frame_channel))
             if not channel_dir:
@@ -130,12 +157,28 @@ class CoordinateContext:
             missing = sorted(set(per_channel) - set(available))
             raise CoordinateContextError(f"Missing per-channel XML beside '{frame_xml}': {missing}")
         if available:
-            channel_positions = {ch: normalize(_read_xml_positions(path), path)
-                                 for ch, path in per_channel.items()}
+            raw_channels = {ch: _read_xml_positions(path)
+                            for ch, path in per_channel.items()}
+            channel_positions = {ch: normalize(raw, per_channel[ch])
+                                 for ch, raw in raw_channels.items()}
         else:
-            # A shared TeraStitcher XML plus recorded alignment offsets can
-            # describe prealignment views before per-channel XMLs are solved.
-            channel_positions = {ch["id"]: normalize(raw_frame, frame_xml) for ch in routing}
+            # Shared XML geometry before per-channel mosaics are solved.
+            raw_channels = {ch["id"]: raw_frame for ch in routing}
+            channel_positions = {ch["id"]: normalize(raw_frame, frame_xml)
+                                 for ch in routing}
+
+        # Each independently merged TeraStitcher image resets its own XY origin
+        # and uses its own maximum ABS_D as the first displayed Z slice.
+        image_positions = {}
+        for ch, raw in raw_channels.items():
+            own_x_min = min(p[0] for p in raw.values())
+            own_y_min = min(p[1] for p in raw.values())
+            own_z_start = max(p[2] for p in raw.values())
+            image_positions[ch] = {
+                name: TilePosition(p[0] - own_x_min, p[1] - own_y_min,
+                                   own_z_start - p[2])
+                for name, p in raw.items()
+            }
 
         return cls(
             result_dir=result_dir, runtime_path=os.path.abspath(config_path), runtime=config,
@@ -143,11 +186,13 @@ class CoordinateContext:
             pipeline_mode=str(config.get("pipeline_mode", "pre_align")),
             frame_channel=frame_channel, frame_xml=frame_xml, xml_dir=xml_dir,
             tile_size=int((config.get("detection_params") or {}).get("tILESIZE", 2048)),
-            frame_positions=normalize(raw_frame, frame_xml), channel_positions=channel_positions,
+            frame_positions=normalize(raw_frame, frame_xml),
+            channel_positions=channel_positions, image_positions=image_positions,
         )
 
     @classmethod
     def from_result_dir(cls, result_dir: str) -> "CoordinateContext":
+        """Use runtime provenance for shared and per-channel frame XMLs."""
         result_dir = os.path.abspath(result_dir)
         runtime_path = os.path.join(result_dir, "runtime_config.json")
         if not os.path.isfile(runtime_path):
@@ -156,67 +201,28 @@ class CoordinateContext:
             with open(runtime_path, encoding="utf-8") as handle:
                 runtime = json.load(handle)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise CoordinateContextError(f"Cannot read runtime config '{runtime_path}': {exc}") from exc
-
-        paths = runtime.get("paths") or {}
+            raise CoordinateContextError(
+                f"Cannot read runtime config '{runtime_path}': {exc}") from exc
+        paths = dict(runtime.get("paths") or {})
         frame_xml = paths.get("pATHXML")
         if not frame_xml:
             raise CoordinateContextError(
-                f"runtime config '{runtime_path}' has no paths.pATHXML; global Stage 3/4 results cannot be displayed")
-        frame_xml = os.path.abspath(frame_xml)
-        if not os.path.isfile(frame_xml):
-            raise CoordinateContextError(
-                f"Runtime frame XML does not exist: '{frame_xml}' (from '{runtime_path}')")
-
-        match = re.fullmatch(r"xml_merging_(.+)\.xml", os.path.basename(frame_xml), re.IGNORECASE)
-        if not match:
-            raise CoordinateContextError(
-                f"Runtime frame XML must be named xml_merging_<channel>.xml, got '{frame_xml}'")
-        frame_channel = match.group(1)
-        routing = [dict(ch) for ch in runtime.get("channels_routing", []) if ch.get("active", True)]
-        if not routing:
-            raise CoordinateContextError(f"No active channels in runtime config '{runtime_path}'")
-        routed_ids = {ch.get("id") for ch in routing}
-        if frame_channel not in routed_ids:
-            raise CoordinateContextError(
-                f"Frame channel '{frame_channel}' from '{frame_xml}' is not an active runtime channel")
-
-        raw_frame = _read_xml_positions(frame_xml)
-        x_min = min(p[0] for p in raw_frame.values())
-        y_min = min(p[1] for p in raw_frame.values())
-        z_start = max(p[2] for p in raw_frame.values())
-
-        def normalize(raw: dict[str, tuple[int, int, int]], label: str) -> dict[str, TilePosition]:
-            missing = set(raw_frame) - set(raw)
-            extra = set(raw) - set(raw_frame)
-            if missing or extra:
-                raise CoordinateContextError(
-                    f"Tile mapping differs between frame XML and {label}: "
-                    f"missing={sorted(missing)}, extra={sorted(extra)}")
-            # Solver XML files share their ABS origin. Never independently normalize
-            # channels before computing P_c - P_frame.
-            return {name: TilePosition(p[0] - x_min, p[1] - y_min, z_start - p[2])
-                    for name, p in raw.items()}
-
-        xml_dir = os.path.dirname(frame_xml)
-        channel_positions = {frame_channel: normalize(raw_frame, "frame XML")}
-        for ch in routing:
-            channel = ch["id"]
-            xml_path = os.path.join(xml_dir, f"xml_merging_{channel}.xml")
-            if not os.path.isfile(xml_path):
-                raise CoordinateContextError(
-                    f"Missing per-channel XML for '{channel}': '{xml_path}'. "
-                    f"It must be beside runtime frame XML '{frame_xml}'.")
-            channel_positions[channel] = normalize(_read_xml_positions(xml_path), xml_path)
-
-        return cls(
-            result_dir=result_dir, runtime_path=runtime_path, runtime=runtime,
-            paths=dict(paths), routing=routing,
-            pipeline_mode=str(runtime.get("pipeline_mode", "")),
-            frame_channel=frame_channel, frame_xml=frame_xml, xml_dir=xml_dir,
-            tile_size=int((runtime.get("detection_params") or {}).get("tILESIZE", 2048)),
-            frame_positions=channel_positions[frame_channel], channel_positions=channel_positions,
-        )
+                f"runtime config '{runtime_path}' has no paths.pATHXML; "
+                "global Stage 3/4 results cannot be displayed")
+        named = re.fullmatch(
+            r"xml_merging_(.+)\.xml", os.path.basename(frame_xml), re.IGNORECASE)
+        routing = [ch for ch in runtime.get("channels_routing", [])
+                   if ch.get("active", True)]
+        somas = [ch["id"] for ch in routing if ch.get("type", "soma") == "soma"]
+        configured_ref = (runtime.get("pre_align_params") or {}).get(
+            "reference_channel")
+        inferred_frame = (named.group(1) if named else
+                          (configured_ref or (somas[0] if somas else
+                                              (routing[0]["id"] if routing else None))))
+        frame = runtime.get("stitching_reference_channel") or inferred_frame
+        paths["pATHRESULT"] = result_dir
+        config = {**runtime, "paths": paths, "frame_channel": frame}
+        return cls.from_vis_config(config, runtime_path)
 
     def offsets_for_tile(self, tile_name: str) -> dict:
         path = os.path.join(self.result_dir, "0_channel_alignment", f"{tile_name}_offsets.json")
@@ -261,7 +267,29 @@ class CoordinateContext:
         shift = offsets[channel]
         return (frame.x + int(shift["dx"]) - own.x,
                 frame.y + int(shift["dy"]) - own.y,
-                frame.z + int(shift["dz"]) - own.z)
+                int(shift["dz"]) - frame.z + own.z)
+
+    def channel_image_residual(self, tile_name: str, channel: str,
+                               offsets: dict) -> tuple[int, int, int]:
+        """Translation from an independently merged channel image to Stage 3."""
+        frame = self.position(tile_name)
+        native = self.image_positions[channel][tile_name]
+        shift = offsets[channel]
+        return (frame.x + int(shift["dx"]) - native.x,
+                frame.y + int(shift["dy"]) - native.y,
+                int(shift["dz"]) - frame.z + native.z)
+
+    def global_to_channel_image(self, tile_name: str, channel: str,
+                                x: float, y: float, z: int,
+                                offsets: dict) -> tuple[float, float, int]:
+        q = self.channel_image_residual(tile_name, channel, offsets)
+        return x - q[0], y - q[1], int(z) - q[2]
+
+    def channel_image_to_global(self, tile_name: str, channel: str,
+                                x: float, y: float, z: int,
+                                offsets: dict) -> tuple[float, float, int]:
+        q = self.channel_image_residual(tile_name, channel, offsets)
+        return x + q[0], y + q[1], int(z) + q[2]
 
     def print_provenance(self, tile_name: str, offsets: dict) -> None:
         frame = self.position(tile_name)
@@ -276,9 +304,11 @@ class CoordinateContext:
             own = self.position(tile_name, channel)
             shift = offsets.get(channel, {"dx": 0, "dy": 0, "dz": 0})
             residual = self.channel_residual(tile_name, channel, offsets) if channel in offsets else None
+            image_q = self.channel_image_residual(tile_name, channel, offsets) if channel in offsets else None
             delta = (own.x - frame.x, own.y - frame.y, own.z - frame.z)
             print(
                 f"  {channel}: P_c-P_O={delta}, "
-                f"s=({shift['dx']}, {shift['dy']}, {shift['dz']}), q={residual}")
+                f"s=({shift['dx']}, {shift['dy']}, {shift['dz']}), "
+                f"q_common={residual}, q_image={image_q}")
         print("==========================")
 

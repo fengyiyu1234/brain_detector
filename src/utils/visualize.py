@@ -1867,7 +1867,7 @@ def _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name)
 
     base_res     = paths['pATHRESULT']
     align_dir    = os.path.join(base_res, '0_channel_alignment')
-    raw_dir      = os.path.join(base_res, '1_tile_2d_raw')
+    raw_dir      = paths.get('pATH_RAW_DETECTIONS') or os.path.join(base_res, '1_tile_2d_raw')
     fused_dir    = os.path.join(base_res, '1_tile_2d_fused')
     filtered_dir = os.path.join(base_res, '1_tile_2d_filtered')
 
@@ -2303,7 +2303,7 @@ def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
     coloc_opacity = vis_cfg.get('coloc_opacity', 0.9)
 
     base_res     = paths['pATHRESULT']
-    raw_dir      = os.path.join(base_res, '1_tile_2d_raw')
+    raw_dir      = paths.get('pATH_RAW_DETECTIONS') or os.path.join(base_res, '1_tile_2d_raw')
     filtered_dir = os.path.join(base_res, '1_tile_2d_filtered')
     fused_dir    = os.path.join(base_res, '1_tile_2d_fused')
     s3_dir    = os.path.join(base_res, '3_channel_3d')

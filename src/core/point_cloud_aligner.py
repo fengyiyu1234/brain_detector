@@ -30,6 +30,10 @@ tf_align_mode='direct': Step 1a as above, then every TF channel is aligned
 independently to the reference soma channel with the cross-group containment
 search (no intra-TF step). Use when TF markers label different populations.
 
+tf_align_mode='sequential_joint': align RFP to GFP, Sox9 to the fixed GFP+RFP
+soma union, and Olig2 to that union plus the fixed Sox9 nuclei. Measurements
+stay in the GFP frame until the final stitching-frame rebase.
+
 Step 2 uses containment-based scoring (find_shift_containment) rather than
 voxel-IoU: TF nucleus boxes (e.g. Sox9, ~8-17px) are much smaller than soma
 boxes (whole-cell YOLO boxes), so shifting the TF box by a few pixels inside
@@ -356,7 +360,7 @@ def _containment_score(soma_idx, tf_arrays, dx, dy, dz,
     """
     Score how well TF cells satisfy strict 3D bbox containment inside a soma
     cell after shifting TF coordinates by (dx, dy, dz). Vectorized batch
-    query (cKDTree.query_ball_point with workers=-1) + NumPy masking,
+    query (cKDTree.query_ball_point with workers=1) + NumPy masking,
     mirroring stitcher.match_soma_3d_iou's approach.
 
     Mirrors stitcher.annotate_soma_with_tf_containment(): XY/Z bbox
@@ -384,7 +388,7 @@ def _containment_score(soma_idx, tf_arrays, dx, dy, dz,
     tf_pts = tf_centroids + shift
 
     candidate_lists = soma_idx['tree'].query_ball_point(
-        tf_pts, r=soma_idx['max_radius'] * 2, workers=-1
+        tf_pts, r=soma_idx['max_radius'] * 2, workers=1
     )
     counts = np.array([len(c) for c in candidate_lists], dtype=np.int64)
     if counts.sum() == 0:
@@ -458,7 +462,7 @@ def _displacement_peaks(soma_idx, tf_arrays, xy_range_px, z_range_slices,
         return [(0, 0, 0)]
     r_xy, r_z = float(xy_range_px), max(int(z_range_slices), 0)
     scale = np.array([1.0, 1.0, r_xy / max(r_z, 0.5)])
-    groups = cKDTree(soma_c * scale).query_ball_point(tf_c * scale, r=r_xy, p=np.inf, workers=-1)
+    groups = cKDTree(soma_c * scale).query_ball_point(tf_c * scale, r=r_xy, p=np.inf, workers=1)
     counts = np.fromiter((len(g) for g in groups), dtype=np.int64, count=len(groups))
     if counts.sum() == 0:
         return [(0, 0, 0)]
@@ -621,7 +625,7 @@ def _fine_containment(soma_idx, tf_arrays, center, fine_xy_px, fine_z_slices,
     span = float(np.sqrt(2.0) * fine_xy_px + fine_z_slices)
     radius = soma_idx['max_radius'] * 2 + span
     base = tf_centroids + np.array([dx0, dy0, dz0], dtype=float)
-    lists = soma_idx['tree'].query_ball_point(base, r=radius, workers=-1)
+    lists = soma_idx['tree'].query_ball_point(base, r=radius, workers=1)
     counts = np.fromiter((len(c) for c in lists), dtype=np.int64, count=n_tf)
     total = int(counts.sum())
     if total == 0:
@@ -705,6 +709,270 @@ def containment_shift_from_arrays(soma_idx, tf_arrays, xy_range_px, z_range_slic
 # 8.  Two-step per-tile alignment orchestration
 # ──────────────────────────────────────────────────────────────────────────────
 
+def shifted_cell_boxes(cells, shift):
+    """Translate z-linked cell geometry without mutating raw detections."""
+    dx, dy, dz = (int(value) for value in shift)
+    moved = []
+    for source in cells:
+        cell = source.copy()
+        for key, delta in (
+            ('cx', dx), ('cy', dy), ('cz', dz),
+            ('x1_3d', dx), ('x2_3d', dx),
+            ('y1_3d', dy), ('y2_3d', dy),
+            ('z_min', dz), ('z_max', dz),
+        ):
+            if key in source:
+                cell[key] = source[key] + delta
+        cell['per_z_boxes'] = {
+            int(z) + dz: [box[0] + dx, box[1] + dy,
+                          box[2] + dx, box[3] + dy]
+            for z, box in source.get('per_z_boxes', {}).items()
+        }
+        moved.append(cell)
+    return moved
+
+
+def _joint_candidate_shifts(seeds, xy_radius, z_radius):
+    return sorted({
+        (sx + dx, sy + dy, sz + dz)
+        for sx, sy, sz in seeds.values()
+        for dx in range(-xy_radius, xy_radius + 1)
+        for dy in range(-xy_radius, xy_radius + 1)
+        for dz in range(-z_radius, z_radius + 1)
+    })
+
+
+def _sox_proximity(tree, centers, shift, radius, z_scale):
+    if tree is None or not len(centers):
+        return 0.0
+    moved = centers + np.asarray(shift, dtype=float)
+    moved[:, 2] *= z_scale
+    distances, _ = tree.query(moved, k=1, workers=1)
+    return float(np.maximum(0.0, 1.0 - distances / radius).mean())
+
+
+def _choose_joint_nucleus_shift(soma, nuclei, seeds, preferred, ratio, z_pad,
+                                local_xy, local_z, max_cells,
+                                sox_cells=None, sox_radius=10.0,
+                                sox_z_scale=6.0):
+    """Rank local candidates against unique soma matches and optional Sox9."""
+    if not soma or not nuclei:
+        return (0, 0, 0), 0.0, {'status': 'insufficient_cells'}
+    sampled = nuclei
+    if len(nuclei) > max_cells:
+        indices = np.linspace(0, len(nuclei) - 1, max_cells, dtype=int)
+        sampled = [nuclei[i] for i in indices]
+    soma_idx = _prepare_soma_containment_index(soma)
+    arrays = _cell_arrays(sampled)
+    sox_tree = None
+    if sox_cells:
+        sox_centers = _cell_arrays(sox_cells)[0].copy()
+        sox_centers[:, 2] *= sox_z_scale
+        sox_tree = cKDTree(sox_centers)
+    candidates = _joint_candidate_shifts(seeds, local_xy, local_z)
+    records = []
+    for shift in candidates:
+        count, margin = _containment_score(
+            soma_idx, arrays, *shift, ratio, 0, z_pad)
+        records.append((shift, count / len(sampled),
+                        _sox_proximity(sox_tree, arrays[0], shift,
+                                       sox_radius, sox_z_scale), margin))
+    soma_values = np.array([r[1] for r in records])
+    sox_values = np.array([r[2] for r in records])
+    soma_span = float(np.ptp(soma_values))
+    sox_span = float(np.ptp(sox_values))
+    soma_norm = ((soma_values - soma_values.min()) / soma_span
+                 if soma_span >= 0.002 else np.zeros(len(records)))
+    sox_norm = ((sox_values - sox_values.min()) / sox_span
+                if sox_tree is not None and sox_span >= 0.002
+                else np.zeros(len(records)))
+    joint = soma_norm + sox_norm
+    anchor = seeds[preferred]
+    def anchor_distance(shift):
+        return sum((shift[axis] - anchor[axis]) ** 2 for axis in range(3))
+
+    if sox_tree is None and soma_values.max() > 0:
+        # Sox9 has only soma references. Matched counts form broad plateaus;
+        # the containment margin centers nuclei within those matched somata.
+        best = max(range(len(records)), key=lambda i: (
+            records[i][1], records[i][3], -anchor_distance(records[i][0])))
+        chosen = records[best][0]
+        status = 'soma_peak'
+    elif np.any(joint):
+        best = max(range(len(records)), key=lambda i: (
+            joint[i], soma_norm[i], sox_norm[i],
+            -anchor_distance(records[i][0])))
+        chosen = records[best][0]
+        status = 'joint_peak'
+    else:
+        # A flat landscape contains no evidence to move away from the
+        # selected union-soma coarse estimate.
+        chosen = anchor
+        status = 'flat_evidence_kept_seed'
+    full_arrays = _cell_arrays(nuclei)
+    count, _ = _containment_score(soma_idx, full_arrays, *chosen, ratio, 0, z_pad)
+    report = {
+        'status': status,
+        'seeds': {name: list(value) for name, value in seeds.items()},
+        'shift': list(chosen),
+        'soma_fraction': count / len(nuclei),
+        'sox_score': _sox_proximity(sox_tree, full_arrays[0], chosen,
+                                    sox_radius, sox_z_scale),
+        'matched_nuclei': count,
+        'nuclei_in_window': len(nuclei),
+        'sampled_nuclei': len(sampled),
+        'soma_score_span': soma_span,
+        'sox_score_span': sox_span,
+        'n_candidates': len(records),
+    }
+    return chosen, count / len(nuclei), report
+
+
+def _nearest_displacement_seed(soma, nuclei, xy_range, z_range,
+                               z_scale=6.0):
+    """A sparse-channel seed from repeated nearest soma-nucleus displacements."""
+    if not soma or not nuclei:
+        return (0, 0, 0)
+    soma_centers = _cell_arrays(soma)[0]
+    nucleus_centers = _cell_arrays(nuclei)[0]
+    scaled_soma = soma_centers.copy()
+    scaled_nuclei = nucleus_centers.copy()
+    scaled_soma[:, 2] *= z_scale
+    scaled_nuclei[:, 2] *= z_scale
+    _, index = cKDTree(scaled_soma).query(scaled_nuclei, k=1, workers=1)
+    displacement = np.rint(soma_centers[index] - nucleus_centers).astype(int)
+    valid = ((np.abs(displacement[:, 0]) <= xy_range)
+             & (np.abs(displacement[:, 1]) <= xy_range)
+             & (np.abs(displacement[:, 2]) <= z_range))
+    displacement = displacement[valid]
+    if not len(displacement):
+        return (0, 0, 0)
+    values, counts = np.unique(displacement, axis=0, return_counts=True)
+    best = max(range(len(values)), key=lambda i: (
+        counts[i], -int(np.dot(values[i], values[i]))))
+    return tuple(int(v) for v in values[best])
+
+
+def compute_sequential_joint_shifts(per_ch_vol_lists, z_center, z_half_window,
+                                    align_kwargs, max_center_dist_ratio,
+                                    containment_z_pad, containment_coarse,
+                                    joint_local_xy=2, joint_local_z=1,
+                                    joint_max_scored_cells=1500,
+                                    joint_sox_radius=10.0,
+                                    joint_sox_z_scale=6.0):
+    """GFP -> RFP -> Sox9 -> Olig2, keeping each solved reference fixed."""
+    z_lo = z_center - z_half_window
+    z_hi = z_center + z_half_window
+    boxes = {ch: build_cell_boxes(per_ch_vol_lists.get(ch, []), z_lo, z_hi)
+             for ch in ('GFP', 'RFP', 'Sox9', 'Olig2')}
+    kwargs = dict(align_kwargs)
+    shifts = {'GFP': (0, 0, 0)}
+    scores = {'GFP': 1.0}
+    report = {'reference_channel': 'GFP',
+              'cells_in_window': {ch: len(cells) for ch, cells in boxes.items()}}
+    if not boxes['GFP']:
+        for ch in ('RFP', 'Sox9', 'Olig2'):
+            shifts[ch] = (0, 0, 0)
+            scores[ch] = 0.0
+        report['status'] = 'missing_gfp_reference'
+        return shifts, scores, report
+
+    rfp_result = find_shift(boxes['GFP'], boxes['RFP'], **kwargs)
+    shifts['RFP'] = tuple(rfp_result[:3])
+    scores['RFP'] = rfp_result[3]
+    rfp = shifted_cell_boxes(boxes['RFP'], shifts['RFP'])
+    soma = boxes['GFP'] + rfp
+    report['RFP'] = {'shift': list(shifts['RFP']), 'iou_score': scores['RFP'],
+                     'status': 'aligned' if boxes['RFP'] else 'missing_cells'}
+
+    def sampled(cells):
+        if len(cells) <= joint_max_scored_cells:
+            return cells
+        indices = np.linspace(0, len(cells) - 1,
+                              joint_max_scored_cells, dtype=int)
+        return [cells[i] for i in indices]
+
+    def containment(ref, target):
+        return find_shift_containment(
+            ref, sampled(target), max_center_dist_ratio=max_center_dist_ratio,
+            xy_margin=0, z_pad=containment_z_pad,
+            coarse=containment_coarse, **kwargs)
+
+    if boxes['Sox9']:
+        # The existing full-data GFP estimate is already reliable for T70.
+        # Use the union of fixed GFP/RFP somata to refine it; admit distant
+        # alternative seeds only if they improve full-data soma support.
+        gfp_seed = tuple(find_shift_containment(
+            boxes['GFP'], boxes['Sox9'],
+            max_center_dist_ratio=max_center_dist_ratio,
+            xy_margin=0, z_pad=containment_z_pad,
+            coarse=containment_coarse, **kwargs)[:3])
+        union_seed = tuple(containment(soma, boxes['Sox9'])[:3])
+        nearest_seed = _nearest_displacement_seed(
+            soma, sampled(boxes['Sox9']),
+            align_kwargs['xy_range_px'], align_kwargs['z_range_slices'])
+        soma_idx = _prepare_soma_containment_index(soma)
+        sox_arrays = _cell_arrays(boxes['Sox9'])
+        def support(shift):
+            return _containment_score(
+                soma_idx, sox_arrays, *shift,
+                max_center_dist_ratio, 0, containment_z_pad)[0]
+        baseline_support = support(gfp_seed)
+        sox_seed = {'GFP': gfp_seed}
+        for name, seed in (('GFP_RFP', union_seed),
+                           ('nearest', nearest_seed)):
+            if seed == gfp_seed or support(seed) > baseline_support + max(
+                    3, round(0.1 * baseline_support)):
+                sox_seed[name] = seed
+        sox_shift, sox_score, sox_report = _choose_joint_nucleus_shift(
+            soma, boxes['Sox9'], sox_seed, 'GFP',
+            max_center_dist_ratio, containment_z_pad,
+            joint_local_xy, joint_local_z, joint_max_scored_cells)
+        selected_support = support(sox_shift)
+        sox_report['gfp_baseline_support'] = baseline_support
+        sox_report['sample_selected_full_support'] = selected_support
+        if selected_support < baseline_support:
+            # Subsampled ranking can be noisy on a dense Sox9 tile. Never
+            # replace a verified GFP estimate with worse full-data support.
+            sox_report['status'] = 'gfp_baseline_preserved'
+            sox_report['rejected_shift'] = list(sox_shift)
+            sox_shift = gfp_seed
+            sox_score = baseline_support / len(boxes['Sox9'])
+            sox_report['shift'] = list(sox_shift)
+            sox_report['soma_fraction'] = sox_score
+            sox_report['matched_nuclei'] = baseline_support
+    else:
+        sox_shift, sox_score = (0, 0, 0), 0.0
+        sox_report = {'status': 'missing_sox9'}
+    shifts['Sox9'], scores['Sox9'] = sox_shift, sox_score
+    report['Sox9'] = sox_report
+    sox = shifted_cell_boxes(boxes['Sox9'], sox_shift)
+
+    if boxes['Olig2']:
+        union_seed = tuple(containment(soma, boxes['Olig2'])[:3])
+        seeds = {
+            'GFP_RFP': union_seed,
+            'nearest': _nearest_displacement_seed(
+                soma, sampled(boxes['Olig2']),
+                align_kwargs['xy_range_px'], align_kwargs['z_range_slices']),
+        }
+        if sox:
+            seeds['Sox9'] = tuple(find_shift(
+                sox, boxes['Olig2'], **kwargs)[:3])
+        olig_shift, olig_score, olig_report = _choose_joint_nucleus_shift(
+            soma, boxes['Olig2'], seeds, 'GFP_RFP',
+            max_center_dist_ratio, containment_z_pad,
+            joint_local_xy, joint_local_z, joint_max_scored_cells,
+            sox_cells=sox, sox_radius=joint_sox_radius,
+            sox_z_scale=joint_sox_z_scale)
+    else:
+        olig_shift, olig_score = (0, 0, 0), 0.0
+        olig_report = {'status': 'missing_olig2'}
+    shifts['Olig2'], scores['Olig2'] = olig_shift, olig_score
+    report['Olig2'] = olig_report
+    return shifts, scores, report
+
+
 def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
                                 z_center, z_half_window,
                                 bin_size=4, xy_res_um=0.65, z_res_um=8.0,
@@ -712,7 +980,8 @@ def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
                                 fine_xy_px=8, fine_z_slices=2,
                                 max_center_dist_ratio=0.3, xy_margin=0,
                                 containment_z_pad=0, tf_align_mode='chain',
-                                containment_coarse='displacement_hist'):
+                                containment_coarse='displacement_hist',
+                                joint_params=None, diagnostics=None):
     """
     Compute final (dx, dy, dz) per channel for one tile using two-step strategy.
 
@@ -764,6 +1033,21 @@ def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
         xy_range_px=xy_range_px, z_range_slices=z_range_slices,
         fine_xy_px=fine_xy_px, fine_z_slices=fine_z_slices,
     )
+
+    if tf_align_mode == 'sequential_joint':
+        required = (soma_ch_ids == ['GFP', 'RFP']
+                    and set(tf_ch_ids) == {'Sox9', 'Olig2'}
+                    and len(tf_ch_ids) == 2)
+        if not required:
+            raise ValueError(
+                "sequential_joint requires active GFP/RFP soma and Sox9/Olig2 TF channels")
+        shifts, scores, report = compute_sequential_joint_shifts(
+            per_ch_vol_lists, z_center, z_half_window, align_kwargs,
+            max_center_dist_ratio, containment_z_pad,
+            containment_coarse, **(joint_params or {}))
+        if diagnostics is not None:
+            diagnostics.update(report)
+        return shifts, scores
 
     ref_soma = soma_ch_ids[0] if soma_ch_ids else None
     ref_tf   = tf_ch_ids[0]   if tf_ch_ids   else None
@@ -943,43 +1227,74 @@ def align_tile(tile_path, det_dir, align_dir, routing, settings):
         if f.lower().endswith(('.tif', '.tiff')) and not f.startswith('.'))]
 
     # 1. 对每个通道轻量 z-link，得到 per-tile 3D vol_list
-    per_ch_vol_lists, z_counts, missing = {}, [], []
-    for ch in routing:
-        cid, ctype = ch['id'], ch.get('type', 'soma')
-        csv_path = os.path.join(det_dir, f"{tile_name}_{cid}_result.csv")
-        per_ch_vol_lists[cid] = []
-        if not os.path.isfile(csv_path):
-            missing.append(csv_path)
-            continue
-        df_tile = pd.read_csv(csv_path)
-        if df_tile.empty:
-            continue
-        mat = df_tile[["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]].values
-        mat[:, 6] = np.array([f"{v}_{cid}" for v in mat[:, 6]])
-        _, vol_list = run_z_linker(mat, **settings['z_link']['soma' if ctype == 'soma' else 'tf'])
-        per_ch_vol_lists[cid] = vol_list
-        z_counts.extend(c.get('cz', 0) for c in vol_list)
+    measurement_source = settings.get('measured_offsets_source')
+    if measurement_source:
+        source_file = os.path.join(
+            measurement_source, f'{tile_name}_measured_offsets.json')
+        with open(source_file, encoding='utf-8') as handle:
+            measured = json.load(handle)
+        if (measured.get('reference_channel') != settings['reference_channel']
+                or measured.get('tf_align_mode') != settings['tf_align_mode']):
+            raise ValueError(f'Incompatible measured shifts: {source_file}')
+        shifts = {
+            cid: tuple(int(measured['shifts'][cid][key])
+                       for key in ('dx', 'dy', 'dz'))
+            for cid in [ch['id'] for ch in routing]
+        }
+        scores = {cid: float(measured.get('scores', {}).get(cid, 0.0))
+                  for cid in shifts}
+        z_center = measured.get('z_center')
+        diagnostics = {
+            'status': 'reused_measured_shifts',
+            'measurement_source': source_file,
+        }
+        missing = [
+            os.path.join(det_dir, f"{tile_name}_{ch['id']}_result.csv")
+            for ch in routing
+            if not os.path.isfile(os.path.join(
+                det_dir, f"{tile_name}_{ch['id']}_result.csv"))
+        ]
+    else:
+        per_ch_vol_lists, z_counts, missing = {}, [], []
+        for ch in routing:
+            cid, ctype = ch['id'], ch.get('type', 'soma')
+            csv_path = os.path.join(det_dir, f"{tile_name}_{cid}_result.csv")
+            per_ch_vol_lists[cid] = []
+            if not os.path.isfile(csv_path):
+                missing.append(csv_path)
+                continue
+            df_tile = pd.read_csv(csv_path)
+            if df_tile.empty:
+                continue
+            mat = df_tile[["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]].values
+            mat[:, 6] = np.array([f"{v}_{cid}" for v in mat[:, 6]])
+            _, vol_list = run_z_linker(mat, **settings['z_link']['soma' if ctype == 'soma' else 'tf'])
+            per_ch_vol_lists[cid] = vol_list
+            z_counts.extend(c.get('cz', 0) for c in vol_list)
 
-    # 2. 估计 tile z 中心；3. 两步体素对齐
-    z_center = float(np.median(z_counts)) if z_counts else 0.0
-    shifts, scores = compute_tile_channel_shifts(
-        per_ch_vol_lists,
-        soma_ch_ids=settings['soma_ch_ids'],
-        tf_ch_ids=settings['tf_ch_ids'],
-        z_center=z_center,
-        z_half_window=settings['sample_z_center_count'] // 2,
-        bin_size=settings['voxel_bin_size_px'],
-        xy_res_um=settings['xy_resolution_um'],
-        z_res_um=settings['z_resolution_um'],
-        xy_range_px=settings['xy_search_range_px'],
-        z_range_slices=settings['z_search_range_slices'],
-        fine_xy_px=settings['xy_fine_search_px'],
-        fine_z_slices=settings['z_fine_search_slices'],
-        max_center_dist_ratio=settings['max_center_dist_ratio'],
-        containment_z_pad=settings['containment_z_pad'],
-        tf_align_mode=settings['tf_align_mode'],
-        containment_coarse=settings.get('containment_coarse', 'fft'),
-    )
+        # 2. 估计 tile z 中心；3. 两步体素对齐
+        z_center = float(np.median(z_counts)) if z_counts else 0.0
+        diagnostics = {}
+        shifts, scores = compute_tile_channel_shifts(
+            per_ch_vol_lists,
+            soma_ch_ids=settings['soma_ch_ids'],
+            tf_ch_ids=settings['tf_ch_ids'],
+            z_center=z_center,
+            z_half_window=settings['sample_z_center_count'] // 2,
+            bin_size=settings['voxel_bin_size_px'],
+            xy_res_um=settings['xy_resolution_um'],
+            z_res_um=settings['z_resolution_um'],
+            xy_range_px=settings['xy_search_range_px'],
+            z_range_slices=settings['z_search_range_slices'],
+            fine_xy_px=settings['xy_fine_search_px'],
+            fine_z_slices=settings['z_fine_search_slices'],
+            max_center_dist_ratio=settings['max_center_dist_ratio'],
+            containment_z_pad=settings['containment_z_pad'],
+            tf_align_mode=settings['tf_align_mode'],
+            containment_coarse=settings.get('containment_coarse', 'fft'),
+            joint_params=settings.get('joint_params'),
+            diagnostics=diagnostics,
+        )
 
     # 3b. double_exposure 通道的第二曝光复用主曝光的偏移量
     # （同一物理通道/视野，只是曝光不同，无需独立点云配准）。
@@ -991,7 +1306,37 @@ def align_tile(tile_path, det_dir, align_dir, routing, settings):
 
     # Alignment is measured in the MADM reference frame. Rebase every shift
     # into the stitching frame before writing aligned CSVs or offsets JSON.
+    measurement_payload = {
+        'reference_channel': settings['reference_channel'],
+        'tf_align_mode': settings['tf_align_mode'],
+        'z_center': z_center,
+        'shifts': {cid: dict(zip(('dx', 'dy', 'dz'), values))
+                   for cid, values in shifts.items()},
+        'scores': scores,
+    }
+    os.makedirs(align_dir, exist_ok=True)
+    measurement_file = os.path.join(
+        align_dir, f'{tile_name}_measured_offsets.json')
+    with open(measurement_file + '.part', 'w', encoding='utf-8') as handle:
+        json.dump(measurement_payload, handle, indent=2)
+    os.replace(measurement_file + '.part', measurement_file)
+
+    measured_shifts = dict(shifts)
     shifts = rebase_shifts(shifts, settings['stitching_reference_channel'])
+    if diagnostics:
+        diagnostics.update({
+            'tile': tile_name,
+            'z_center': z_center,
+            'stitching_reference_channel': settings['stitching_reference_channel'],
+            'measured_shifts': {ch: list(v) for ch, v in measured_shifts.items()},
+            'written_shifts': {ch: list(v) for ch, v in shifts.items()},
+        })
+        diagnostic_dir = os.path.join(align_dir, 'diagnostics')
+        os.makedirs(diagnostic_dir, exist_ok=True)
+        diagnostic_path = os.path.join(diagnostic_dir, f'{tile_name}.json')
+        with open(diagnostic_path + '.part', 'w', encoding='utf-8') as handle:
+            json.dump(diagnostics, handle, indent=2, ensure_ascii=False)
+        os.replace(diagnostic_path + '.part', diagnostic_path)
 
     # 4. 对每个通道的原始 CSV 应用偏移（覆盖写：设置已由 check_align_settings 保证一致，
     #    偏移是确定性的，重算的结果与上次相同）
@@ -1112,8 +1457,30 @@ def resolve_align_settings(config, routing_config):
     if frame not in active_ids:
         raise ValueError(f"stitching_reference_channel={frame!r} is not an active channel {sorted(active_ids)}")
     mode = pa.get('tf_align_mode', 'chain')
-    if mode not in ('chain', 'direct'):
-        raise ValueError(f"❌ pre_align_params.tf_align_mode='{mode}'，只能是 'chain' 或 'direct'")
+    if mode not in ('chain', 'direct', 'sequential_joint'):
+        raise ValueError(
+            f"pre_align_params.tf_align_mode={mode!r} must be chain, direct, or sequential_joint")
+    if mode == 'sequential_joint' and (
+            sorted(soma_ids) != ['GFP', 'RFP'] or sorted(tf_ids) != ['Olig2', 'Sox9']
+            or ref != 'GFP'):
+        raise ValueError(
+            "sequential_joint requires GFP as reference, GFP/RFP soma and Sox9/Olig2 TF")
+
+    if mode == 'sequential_joint':
+        jp = {
+            'joint_local_xy': int(pa.get('joint_local_xy', 2)),
+            'joint_local_z': int(pa.get('joint_local_z', 1)),
+            'joint_max_scored_cells': int(pa.get('joint_max_scored_cells', 1500)),
+            'joint_sox_radius': float(pa.get('joint_sox_radius', 10.0)),
+            'joint_sox_z_scale': float(pa.get('joint_sox_z_scale', 6.0)),
+        }
+        if (jp['joint_local_xy'] < 0 or jp['joint_local_z'] < 0
+                or jp['joint_max_scored_cells'] < 1
+                or jp['joint_sox_radius'] <= 0
+                or jp['joint_sox_z_scale'] <= 0):
+            raise ValueError('Invalid sequential_joint search or Sox9 distance parameters')
+    else:
+        jp = None
 
     def _z_link(p):
         return {'iou_thresh': p.get('iou_thresh', 0.35), 'min_z_layers': p.get('min_z_layers', 1),
@@ -1139,7 +1506,36 @@ def resolve_align_settings(config, routing_config):
         'max_center_dist_ratio': zl_tf.get('max_center_dist_ratio', 0.3),
         'containment_z_pad': zl_tf.get('containment_z_pad', 0),
         'containment_coarse': pa.get('containment_coarse', 'displacement_hist'),
+        **({'joint_params': jp} if jp is not None else {}),
+        **({'measured_offsets_source': os.path.abspath(
+            pa['measured_offsets_source'])}
+           if pa.get('measured_offsets_source') else {}),
     }
+
+
+def validate_measurement_source(align_dir, settings):
+    """Verify that a reused measurement differs only in stitching frame."""
+    source = settings.get('measured_offsets_source')
+    if not source:
+        return
+    if os.path.normcase(os.path.abspath(source)) == os.path.normcase(
+            os.path.abspath(align_dir)):
+        raise ValueError('measured_offsets_source must be a different alignment directory')
+    source_settings = os.path.join(source, ALIGN_SETTINGS_FILE)
+    if not os.path.isfile(source_settings):
+        raise FileNotFoundError(
+            f'Measurement source lacks {ALIGN_SETTINGS_FILE}: {source}')
+    with open(source_settings, encoding='utf-8') as handle:
+        saved = json.load(handle)
+    current = dict(settings)
+    for value in (saved, current):
+        value.pop('stitching_reference_channel', None)
+        value.pop('measured_offsets_source', None)
+    if saved != current:
+        changed = sorted(key for key in set(saved) | set(current)
+                         if saved.get(key) != current.get(key))
+        raise ValueError(
+            f'Measurement source {source} has incompatible alignment settings: {changed}')
 
 
 def check_align_settings(align_dir, settings):
@@ -1172,6 +1568,10 @@ def check_align_settings(align_dir, settings):
         return True
     if os.path.isdir(align_dir) and any(f.endswith(('_result.csv', '_offsets.json'))
                                         for f in os.listdir(align_dir)):
+        if settings['tf_align_mode'] == 'sequential_joint':
+            raise ValueError(
+                f"Existing alignment outputs in {align_dir} have no _align_settings.json; "
+                "use a fresh result directory for sequential_joint")
         logging.warning(f"⚠️ {align_dir} 已有对齐结果但没有 {ALIGN_SETTINGS_FILE}（旧版本生成），"
                         f"无法校验参数是否一致；如果改过对齐参数，请删除该目录后重跑。")
     return False

@@ -36,15 +36,16 @@ from src.core.point_cloud_aligner import (
     align_tile, tile_alignment_done,
     resolve_align_settings, check_align_settings, save_align_settings,
     validate_alignment_frame, validate_stitching_xml_frame,
-    validate_cached_geometry,
+    validate_cached_geometry, validate_measurement_source,
 )
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
 def align_worker_count(pre_align_cfg, n_tasks):
     """Stage 2.5 并行进程数：pre_align_params.n_workers，缺省为 slurm 分到的 CPU 数（没有则本机核数）。"""
-    n = pre_align_cfg.get('n_workers') or int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))
-    return max(1, min(int(n), n_tasks))
+    allocated = int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))
+    n = pre_align_cfg.get('n_workers') or allocated
+    return max(1, min(int(n), n_tasks, allocated))
 
 
 _THREAD_VARS = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS')
@@ -195,10 +196,18 @@ if __name__ == '__main__':
     pipeline_mode = config.get('pipeline_mode', 'post_align')  # "post_align" | "pre_align"
     start_from_stage = config.get('start_from_stage', 1)
     pre_align_cfg = config.get('pre_align_params', {})
+    raw_source = paths.get('pATH_RAW_DETECTIONS')
+    if raw_source:
+        if start_from_stage < 2:
+            raise ValueError(
+                "paths.pATH_RAW_DETECTIONS is read-only; use start_from_stage >= 2")
+        if not os.path.isdir(raw_source):
+            raise FileNotFoundError(
+                f"Raw detection source does not exist: {raw_source}")
 
     derived = {}
     derived['pATH_ALIGN_OFFSETS'] = os.path.join(base_res_path, "0_channel_alignment")
-    derived['pATH_DET_RES']      = os.path.join(base_res_path, "1_tile_2d_raw")
+    derived['pATH_DET_RES']      = raw_source or os.path.join(base_res_path, "1_tile_2d_raw")
     derived['pATH_DET_FILTERED'] = os.path.join(base_res_path, "1_tile_2d_filtered")
     derived['pATH_DET_FUSED']    = os.path.join(base_res_path, "1_tile_2d_fused")
     derived['pATH_GLOBAL_2D']    = os.path.join(base_res_path, "2_global_2d_raw")
@@ -234,6 +243,7 @@ if __name__ == '__main__':
     align_settings = None
     if pipeline_mode == 'pre_align':
         align_settings = resolve_align_settings(config, routing_config)
+        validate_measurement_source(derived['pATH_ALIGN_OFFSETS'], align_settings)
         check_align_settings(derived['pATH_ALIGN_OFFSETS'], align_settings)
         validate_stitching_xml_frame(paths.get('pATHXML'), align_settings['stitching_reference_channel'])
         logging.info(f"Stitching frame: {align_settings['stitching_reference_channel']}")
@@ -305,6 +315,11 @@ if __name__ == '__main__':
             tasks_to_run.append((i, path, config))
 
     if tasks_to_run:
+        if raw_source:
+            raise FileNotFoundError(
+                f"Read-only raw detection source {raw_source} is missing "
+                f"{len(tasks_to_run)} tile(s); complete Stage 2 in its original "
+                "result directory before reusing it")
         num_gpus = torch.cuda.device_count()
         num_processes = max(1, num_gpus)
         logging.info(f"阶段 2: 发现 {len(tasks_to_run)} 个缺失结果，启动 {num_processes} 个进程 ({num_gpus} GPU)...")
@@ -559,6 +574,9 @@ if __name__ == '__main__':
     if paths.get('pATHXML'):
         xml_candidates.append(paths['pATHXML'])
     xml_candidates += [os.path.join(anchor_dir, n) for n in ('xml_merging.xml', 'xml_import.xml')]
+    if paths.get('pATHXML') and not os.path.isfile(paths['pATHXML']):
+        raise FileNotFoundError(
+            f"Explicit paths.pATHXML does not exist: {paths['pATHXML']}")
     pATHxml = next((p for p in xml_candidates if os.path.isfile(p)), None)
 
     if pATHxml:
