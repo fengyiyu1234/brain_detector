@@ -44,7 +44,7 @@ from src.utils.coordinate_context import CoordinateContext, CoordinateContextErr
 import numpy as np
 import pandas as pd
 import napari
-from qtpy.QtWidgets import QApplication, QMessageBox, QWidget, QGridLayout, QLabel, QSpinBox
+from qtpy.QtWidgets import QApplication, QMessageBox, QWidget, QGridLayout, QLabel, QSpinBox, QLineEdit
 
 from src.config.loader import load_config
 from src.utils.io import listTile
@@ -442,6 +442,34 @@ def _list_tiffs(path):
     return sorted(f for f in os.listdir(path)
                   if f.lower().endswith(('.tif', '.tiff'))
                   ) if os.path.isdir(path) else []
+
+
+def _add_current_image_name(viewer, tile_path, z_range, dz=0, source_range=None):
+    """Show the anchor channel's source TIFF for the current Z slice."""
+    files = _list_tiffs(tile_path)
+    if not files:
+        return
+
+    panel = QWidget()
+    layout = QGridLayout(panel)
+    layout.setContentsMargins(4, 2, 4, 2)
+    layout.addWidget(QLabel("Current image:"), 0, 0)
+    name = QLineEdit()
+    name.setReadOnly(True)
+    layout.addWidget(name, 0, 1)
+
+    def update_name(event=None):
+        z = z_range[0] + viewer.dims.current_step[0] - dz
+        if 0 <= z < len(files) and (source_range is None or source_range[0] <= z < source_range[1]):
+            name.setText(files[z])
+            name.setToolTip(os.path.join(tile_path, files[z]))
+        else:
+            name.setText("(no source image at this Z)")
+            name.setToolTip("")
+
+    viewer.dims.events.current_step.connect(update_name)
+    update_name()
+    viewer.window.add_dock_widget(panel, name="Source image", area="bottom")
 
 
 def _resolve_z_range(vis_cfg, tile_path):
@@ -1793,6 +1821,8 @@ def _run_2d(vis_cfg, paths, routing_config, tile_path, tile_name):
         image_layers.append((cid, layer))
     if image_layers:
         _add_contrast_panel(viewer, image_layers)
+        _add_current_image_name(viewer, tile_path, z_range,
+                                offsets[routing_config[0]['id']]['dz'])
 
     total = 0
     box_registry = []
@@ -1979,6 +2009,10 @@ def _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name)
             img_layer.contrast_limits_range = (0, 65535)
             img_layers.append((cid, img_layer))
         _add_contrast_panel(viewer, img_layers)
+        if img_layers:
+            _add_current_image_name(viewer, tile_path, z_range,
+                                    offsets[routing_config[0]['id']]['dz'],
+                                    source_range=z_range)
 
     box_registry = []  # {z, x1, y1, x2, y2, cls, layer_name} — populated below
 
@@ -2376,6 +2410,9 @@ def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
             img_layer.contrast_limits_range = (0, 65535)
             img_layers.append((cid, img_layer))
         _add_contrast_panel(viewer, img_layers)
+        if img_layers:
+            _add_current_image_name(viewer, tile_path, z_range,
+                                    offsets[routing_config[0]['id']]['dz'])
 
     # ── Overlap margins (hide inaccurate boxes in left/top tile boundaries) ──────
     left_m, top_m = _get_tile_overlap_margins(anchor_dir, tile_name, canvas_w, canvas_h)
