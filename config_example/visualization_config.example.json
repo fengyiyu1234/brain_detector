@@ -1,0 +1,145 @@
+// Example visualization config. Copy to config/vis_config.json and replace sample paths.
+// Set mode to post only after global results exist and pATHXML identifies their exact geometry.
+{
+    // The 2d mode previews tile-local detections without XML.
+    "mode": "2d",
+    // Choose raw or filtered aligned tile detections.
+    "2d_source": "filtered",
+    // Set a CSV path to save false-negative annotations.
+    "fn_ann_path": null,
+    // Set a directory to save annotation image crops.
+    "fn_crop_dir": null,
+    "fn_crop_size": 512,
+    // Select the matching sample entry below.
+    "active_sample": "example_sample",
+    // First displayed slice, zero based.
+    "z_start": 0,
+    // Maximum number of displayed slices.
+    "z_count": 50,
+    // Replace paths to match the detection config and keep frame_channel consistent.
+    "samples": {
+        "example_sample": {
+            "paths": {
+                "rfp_dir": "/path/to/brain_sample/561nm",
+                "gfp_dir": "/path/to/brain_sample/640nm",
+                "sox9_dir": "/path/to/brain_sample/730nm",
+                "olig2_dir": "/path/to/brain_sample/488nm",
+                "pATHRESULT": "/path/to/brain_sample/detection_results",
+                "pATHXML": null
+            },
+            "pipeline_mode": "pre_align",
+            "frame_channel": "RFP",
+            "channels_routing": [
+                {
+                    "id": "GFP",
+                    "type": "soma",
+                    "dir_key": "gfp_dir",
+                    "active": true
+                },
+                {
+                    "id": "RFP",
+                    "type": "soma",
+                    "dir_key": "rfp_dir",
+                    "active": true
+                },
+                {
+                    "id": "Sox9",
+                    "type": "tf",
+                    "dir_key": "sox9_dir",
+                    "active": true
+                },
+                {
+                    "id": "Olig2",
+                    "type": "tf",
+                    "dir_key": "olig2_dir",
+                    "active": true
+                }
+            ]
+        }
+    },
+    // Preview Z-linking and colocalization thresholds.
+    "z_linker": {
+        "soma": {
+            "iou_thresh": 0.35,
+            "min_z_layers": 1,
+            "max_cell_z_span": 5,
+            "max_z_gap": 0,
+            "iou_thresh_3d": 0.15,
+            "z_pad_3d": 1,
+            "cross_class_iou_thresh": 0.5
+        },
+        "tf": {
+            "iou_thresh": 0.25,
+            "min_z_layers": 1,
+            "max_cell_z_span": 3,
+            "max_z_gap": 0,
+            "gmm_p_thresh": 0.5,
+            "max_center_dist_ratio": 0.3,
+            "containment_z_pad": 1
+        }
+    },
+    // Null prompts for a tile index; a name or list also works.
+    "tile": null,
+    "no_images": false,
+    // Initial image contrast percentiles.
+    "contrast_pct": [
+        0.1,
+        99.9
+    ],
+    "show_before": false,
+    "show_zlinked": true,
+    "show_coloc": false,
+    "spheres": false,
+    // Saved-result stage selection for post mode.
+    "stage": "all",
+    "outline_width": 4,
+    "aligned_opacity": 0.8,
+    "raw_opacity": 0.6,
+    "zlinked_opacity": 0.7,
+    "coloc_opacity": 0.9,
+    "sphere_opacity": 0.6,
+    "sphere_raw_opacity": 0.3,
+    "sphere_colors": {
+        "RFP": [
+            1.0,
+            0.25,
+            0.25,
+            0.85
+        ],
+        "GFP": [
+            0.25,
+            1.0,
+            0.25,
+            0.85
+        ],
+        "Sox9": [
+            0.0,
+            0.85,
+            1.0,
+            0.85
+        ],
+        "Olig2": [
+            1.0,
+            0.2,
+            1.0,
+            0.85
+        ]
+    },
+    "marker_colors": {},
+    // Visualization-only filters; these never change saved CSV files.
+    "filter": {
+        "soma": {
+            "bbox_min": null,
+            "bbox_max": null,
+            "bbox_area_pct_min": null,
+            "bbox_mean_pct_min": null
+        },
+        "tf": {
+            "bbox_min": 8,
+            "bbox_max": 17,
+            "bbox_area_pct_min": null,
+            "bbox_mean_pct_min": null
+        },
+        "Olig2": {}
+    }
+}

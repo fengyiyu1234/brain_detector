@@ -1,0 +1,157 @@
+// Example detection config. Copy to config/config.json and replace sample paths.
+// Current Stage 3 still reads XML geometry; IoU tile positions alone are not consumed by run_inference.py.
+// Use the matching solver-generated XML only if Stage 3 is enabled.
+{
+    // Replace model paths with installed model files.
+    "models": {
+        "yolo_path": "models/train18_best_0515.pt",
+        "stardist_basedir": "models",
+        "stardist_name": "2D_versatile_fluo"
+    },
+    // Saved labels for YOLO classes.
+    "model_classes": {
+        "yolo": {
+            "0": "neuron",
+            "1": "glia"
+        }
+    },
+    // Example four-channel routing; edit IDs and models for the sample.
+    "channels_routing": [
+        {
+            "id": "GFP",
+            "type": "soma",
+            "model": "yolo",
+            "dir_key": "gfp_dir",
+            "active": true
+        },
+        {
+            "id": "RFP",
+            "type": "soma",
+            "model": "yolo",
+            "dir_key": "rfp_dir",
+            "active": true
+        },
+        {
+            "id": "Sox9",
+            "type": "tf",
+            "model": "stardist",
+            "dir_key": "sox9_dir",
+            "active": true
+        },
+        {
+            "id": "Olig2",
+            "type": "tf",
+            "model": "stardist",
+            "dir_key": "olig2_dir",
+            "active": true
+        }
+    ],
+    // Replace sample paths. pATHXML stays null during tile-level processing.
+    "paths": {
+        "rfp_dir": "/path/to/brain_sample/561nm",
+        "gfp_dir": "/path/to/brain_sample/640nm",
+        "sox9_dir": "/path/to/brain_sample/730nm",
+        "olig2_dir": "/path/to/brain_sample/488nm",
+        "pATHXML": null,
+        "pATHRESULT": "/path/to/brain_sample/detection_results",
+        "pATH_RAW_DETECTIONS": null
+    },
+    "device": "cuda",
+    // Detect raw tiles and align channels from detection results.
+    "pipeline_mode": "pre_align",
+    // Final global frame; it may differ from pre_align_params.reference_channel.
+    "stitching_reference_channel": "RFP",
+    // Reference used to estimate channel shifts before rebasing to the stitching frame.
+    "pre_align_params": {
+        "reference_channel": "GFP",
+        "tf_align_mode": "sequential_joint",
+        "sample_z_center_count": 50,
+        "voxel_bin_size_px": 4,
+        "xy_search_range_px": 30,
+        "z_search_range_slices": 5,
+        "xy_fine_search_px": 8,
+        "z_fine_search_slices": 2,
+        "tile_overlap_pct": 15,
+        "n_workers": 4
+    },
+    "stop_after_detection": false,
+    // True runs through tile-level alignment and filtering without XML.
+    "stop_before_stitching": true,
+    // Use 1 for a new run; use 2 with pATH_RAW_DETECTIONS to reuse raw detections.
+    "start_from_stage": 1,
+    // Keep false when the detector already applied the same filter.
+    "stage_2_75_enabled": false,
+    "ENABLE_Z_LINKER": true,
+    "stage3_n_workers": null,
+    // Z linking and cross-channel matching settings.
+    "z_linker": {
+        "soma": {
+            "iou_thresh": 0.35,
+            "min_z_layers": 1,
+            "max_cell_z_span": 5,
+            "max_z_gap": 0,
+            "iou_thresh_3d": 0.15,
+            "z_pad_3d": 1,
+            "cross_class_iou_thresh": 0.5
+        },
+        "tf": {
+            "iou_thresh": 0.25,
+            "min_z_layers": 1,
+            "max_cell_z_span": 3,
+            "max_z_gap": 0,
+            "gmm_p_thresh": 0.5,
+            "max_center_dist_ratio": 0.3,
+            "containment_z_pad": 1
+        }
+    },
+    // Detector thresholds, physical resolution, and tile geometry.
+    "detection_params": {
+        "xy_resolution_um": 0.65,
+        "z_resolution_um": 8,
+        "conf_thresh": 0.2,
+        "nms_iou": 0.3,
+        "xsize": 512,
+        "ysize": 512,
+        "step": 384,
+        "tILESIZE": 2048,
+        "sTARTID": null,
+        "eNDID": null,
+        "normalize_PERCENTILE_LOW": 0.1,
+        "normalize_PERCENTILE_HIGH": 99.9,
+        "DOWNSAMPLE": false,
+        "DOWNSAMPLE_Z_STEP": 41,
+        "cross_tile_iomin_thresh": 0.5,
+        "generate_histograms": false,
+        "yolo": {
+            "score_min": null,
+            "bbox_min": 12,
+            "bbox_max": null,
+            "bbox_max_aspect_ratio": 2,
+            "bbox_area_pct_min": 5,
+            "bbox_area_pct_max": 95,
+            "bbox_mean_pct_min": null,
+            "bbox_mean_min": 0,
+            "nms_containment_thresh": 0.98
+        },
+        "stardist": {
+            "score_min": null,
+            "norm_low": 1,
+            "norm_high": 99.9,
+            "prob_thresh": 0.5,
+            "nms_thresh": 0.4,
+            "n_tiles": [
+                4,
+                4
+            ],
+            "bbox_min": 8,
+            "bbox_max": 22,
+            "bbox_max_aspect_ratio": 2,
+            "bbox_area_pct_min": 5,
+            "bbox_area_pct_max": null,
+            "bbox_mean_pct_min": 20,
+            "bbox_mean_min": 0,
+            "nms_containment_thresh": null
+        },
+        "allow_grid_fallback": false
+    }
+}
