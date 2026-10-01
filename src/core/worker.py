@@ -295,10 +295,12 @@ def process_single_tile(i, pATHTEST, config):
                     if len(img_raw.shape) == 3: img_raw = img_raw[:, :, 0]
                     if H0 == 0: H0, W0 = img_raw.shape[:2]
 
-                    norm_img = normalize_for_detection(img_raw, dp['normalize_PERCENTILE_LOW'], dp['normalize_PERCENTILE_HIGH'])
-
                     # --------- YOLO 单通道滑动窗口检测 ---------
                     if ch_model == 'yolo':
+                        yolo_dp = dp.get('yolo', {})
+                        norm_low = yolo_dp.get('norm_low', dp.get('normalize_PERCENTILE_LOW', 0.1))
+                        norm_high = yolo_dp.get('norm_high', dp.get('normalize_PERCENTILE_HIGH', 99.9))
+                        norm_img = normalize_for_detection(img_raw, norm_low, norm_high)
                         img_infer = cv2.cvtColor(norm_img, cv2.COLOR_GRAY2BGR)
 
                         xsize, ysize, step_win = dp['xsize'], dp['ysize'], dp['step']
@@ -308,8 +310,8 @@ def process_single_tile(i, pATHTEST, config):
                         fullimg_pad = np.zeros((H_pad, W_pad, 3), dtype=np.uint8)
                         fullimg_pad[0:H0, 0:W0] = img_infer
 
-                        conf_thresh = dp.get('conf_thresh', dp.get('tHRESHOLD', 0.25))
-                        nms_iou = dp.get('nms_iou', dp.get('mINIOU', 0.45))
+                        conf_thresh = yolo_dp.get('conf_thresh', dp.get('conf_thresh', dp.get('tHRESHOLD', 0.25)))
+                        nms_iou = yolo_dp.get('nms_iou', dp.get('nms_iou', dp.get('mINIOU', 0.45)))
 
                         raw_det_chunks = []
                         batch_patches = []

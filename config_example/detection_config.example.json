@@ -104,25 +104,26 @@
             "containment_z_pad": 1
         }
     },
-    // Detector thresholds, physical resolution, and tile geometry.
+    // Physical resolution, tile geometry, and detector-specific settings.
     "detection_params": {
         "xy_resolution_um": 0.65,
         "z_resolution_um": 8,
-        "conf_thresh": 0.2,
-        "nms_iou": 0.3,
         "xsize": 512,
         "ysize": 512,
         "step": 384,
         "tILESIZE": 2048,
         "sTARTID": null,
         "eNDID": null,
-        "normalize_PERCENTILE_LOW": 0.1,
-        "normalize_PERCENTILE_HIGH": 99.9,
         "DOWNSAMPLE": false,
         "DOWNSAMPLE_Z_STEP": 41,
         "cross_tile_iomin_thresh": 0.5,
         "generate_histograms": false,
         "yolo": {
+            // Map raw-image percentiles to 8-bit intensity for YOLO inference.
+            "norm_low": 0.1,
+            "norm_high": 99.9,
+            "conf_thresh": 0.2,
+            "nms_iou": 0.3,
             "score_min": null,
             "bbox_min": 12,
             "bbox_max": null,
