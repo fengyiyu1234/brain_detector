@@ -1,409 +1,150 @@
 # brain_detector
 
-Light-sheet microscopy pipeline for 3D brain cell detection and multi-channel colocalization.
-Designed for 0.65 × 0.65 × 8 µm/pixel tile-based acquisitions (TeraStitcher format).
+A tile-based light-sheet microscopy pipeline for cell detection, channel alignment, 3D Z linking, and multi-channel colocalization. The primary workflow detects cells on raw channel images (`pre_align`) and estimates alignment from detections. [`solve_tile_positions.py`](scripts/solve_tile_positions.py) can also estimate tile positions from cells shared by neighboring tiles, without running TeraStitcher.
 
----
+**Current integration boundary:** the position solver writes `tile_positions.csv`, but the main pipeline's Stage 3 and the global-result viewer still read tile geometry from XML. The solver can export XML as a compatibility format if a structural XML template is available. The checked-in Stage 3 code does not yet consume `tile_positions.csv` directly. Tile-level detection, alignment, filtering, and `2d` visualization do not require XML.
 
-## Project Structure
+## Start here
+
+1. Copy [`config_example/detection_config.example.json`](config_example/detection_config.example.json) to `config/config.json` and [`config_example/visualization_config.example.json`](config_example/visualization_config.example.json) to `config/vis_config.json`.
+2. Replace the example image, model, and result paths. `config/` is local and ignored by Git; the files in `config_example/` are generic templates. Configuration files accept `//` comments.
+3. Keep `pipeline_mode: "pre_align"` and `stop_before_stitching: true` to run all tile-level stages without XML.
+4. Run detection and inspect the aligned tile results:
+
+```bash
+python scripts/run_inference.py --config config/config.json
+python src/utils/visualize.py --config config/vis_config.json --mode 2d --2d-source filtered
+```
+
+The viewer's `2d` mode reads `0_channel_alignment/` or `1_tile_2d_filtered/` and shifts the displayed raw images into the same tile-local frame. It does not load XML.
+
+The expected image layout is a channel directory containing row directories and tile directories, for example `<channel>/305500/305500_319100/*.tif`. Active channel IDs, their types, models, and directory keys are defined in `channels_routing`.
+
+## Processing stages
+
+| Stage | What it does | Main output |
+| --- | --- | --- |
+| 2 | Detect 2D soma or TF boxes independently in each raw channel and tile | `1_tile_2d_raw/<tile>_<channel>_result.csv` |
+| 2.5 | In `pre_align`, estimate per-tile channel shifts from cell detections and write shifted CSVs | `0_channel_alignment/<tile>_offsets.json` and aligned CSVs |
+| 2.6 | Optionally fuse two exposures of one logical channel, one Z slice at a time | `1_tile_2d_fused/` |
+| 2.75 | Apply the configured tile-level detection filters | `1_tile_2d_filtered/` |
+| 2.8 | Optionally save area and intensity histograms | `1_tile_2d_histograms/` |
+| 3 | Place filtered boxes in global coordinates, link detections across Z, and colocalize channels | `2_global_2d_raw/`, `3_channel_3d/`, `4_colocalization/` |
+| Report | Save cell positions and summary statistics | `5_analysis_report/` |
+
+`stop_after_detection: true` exits after Stage 2. `stop_before_stitching: true` exits after the tile-level stages and is the appropriate setting while global geometry is unavailable. Existing CSV and PKL checkpoints are reused on later runs. Keep the saved `runtime_config.json` with the results: it records the coordinate settings used by that run.
+
+`start_from_stage: 1` scans image directories. Values of 2 or greater infer the tile list from existing raw detection CSVs; this setting does not by itself erase or invalidate downstream checkpoints. `paths.pATH_RAW_DETECTIONS` can point to an existing, read-only raw detection directory when reusing Stage 2 results in a new result directory.
+
+## Four-channel alignment in `pre_align`
+
+The typical four-channel sample has two soma channels (`GFP`, `RFP`) and two TF channels (`Sox9`, `Olig2`). Stage 2.5 first Z-links each channel's detections within a tile, then estimates an integer `(dx, dy, dz)` shift for each channel. A positive shift is added to the raw detection coordinates and to the displayed image placement. The shifts are saved per tile, so optical drift can vary across the sample.
+
+`pre_align_params.reference_channel` is the **measurement reference** and must be an active soma channel. The non-reference soma channel is matched to it by voxel IoU. Soma-to-TF alignment is scored by nucleus containment inside soma boxes. `pre_align_params.tf_align_mode` controls how TF shifts are estimated:
+
+| Mode | TF alignment |
+| --- | --- |
+| `chain` | Align additional TF channels to the first TF by voxel IoU, align that first TF to the reference soma by containment, then add the shifts. |
+| `direct` | Align each TF channel independently to the reference soma by containment. This avoids relying on overlap between different TF populations. |
+| `sequential_joint` | Requires active `GFP`/`RFP` soma and `Sox9`/`Olig2` TF channels, with `GFP` as the measurement reference. Match RFP to GFP first. Evaluate Sox9 against the combined GFP/RFP somata while preserving a better full-data GFP estimate. Evaluate Olig2 using soma, nearest-cell, and Sox9-derived candidates, then select the shift using joint evidence. Previously solved channel shifts stay fixed. |
+
+The implementation is in [`src/core/point_cloud_aligner.py`](src/core/point_cloud_aligner.py). `0_channel_alignment/<tile>_measured_offsets.json` records the shifts in the measurement frame. The aligned CSVs and `<tile>_offsets.json` use the **final frame** selected by `stitching_reference_channel`.
+
+These two references may differ. If the measured raw-to-reference shift for channel `c` is `t_c` and the chosen final frame is `f`, the written shift is:
 
 ```text
-brain_detector/
-├── config/
-│   ├── config.json               # Main pipeline config (paths, model params, pipeline mode)
-│   └── vis/
-│       └── vis_config.json       # Visualization config (napari viewer settings)
-├── models/
-│   ├── train18_best_0515.pt      # YOLO soma detector
-│   └── 2D_versatile_fluo/        # StarDist TF nucleus detector
-├── scripts/
-│   ├── run_inference.py          # Main pipeline entrypoint
-│   ├── validate_align_shifts.py  # Pre-align QC: overlap-vs-offset curves on held-out subvolumes
-│   └── compare_stitching.py      # Stitching QC: TeraStitcher self-report, seam residuals, XML cross-check
-├── src/
-│   ├── config/
-│   │   └── loader.py             # JSON config loader (strips // comments)
-│   ├── core/
-│   │   ├── worker.py             # Per-tile parallel inference (YOLO + StarDist)
-│   │   ├── stitcher.py           # Global stitching, soma merge, 3D colocalization
-│   │   ├── z_linker.py           # Z-axis tracking (Hungarian matching)
-│   │   └── point_cloud_aligner.py# Pre-align mode: point-cloud-based channel alignment
-│   └── utils/
-│       ├── io.py                 # Tile listing, TeraStitcher XML parsing
-│       ├── image.py              # Normalization, patch inference
-│       ├── logger.py             # Logging setup
-│       ├── visualize.py          # Napari result viewer
-│       └── vis_stitched.py       # Stitched volume visualization helpers
-└── README.md
+s_c = t_c - t_f
+s_f = (0, 0, 0)
+aligned_detection_c = raw_detection_c + s_c
 ```
 
----
+For example, the example detection config measures alignment relative to GFP but selects RFP as the final global frame. The same frame must be used when estimating tile positions and when interpreting saved global results. The first active channel in `channels_routing` supplies the tile-enumeration anchor and, when no XML path is explicit, the XML lookup directory; it does not automatically determine either reference.
 
-## Pipeline Modes
+For a double-exposure channel, Stage 2 detects both exposures. Stage 2.5 gives the second exposure the primary channel's shift, and Stage 2.6 fuses matching 2D detections before filtering. Subsequent stages treat them as one logical channel.
 
-### `post_align` (default)
-Runs on images already aligned by numorph + TeraStitcher. Reads per-channel aligned tile directories → detects → global stitching → Z-linking → colocalization.
+## Solve tile positions from detections
 
-### `pre_align`
-Runs on raw unaligned images. After per-tile detection, inserts a **Stage 2.5** point-cloud alignment step that computes per-tile XYZ channel offsets (replacing numorph), then continues with the same downstream pipeline.
+[`scripts/solve_tile_positions.py`](scripts/solve_tile_positions.py) is a separate global position solver. It reads `1_tile_2d_raw/`, matches detections from the **same channel** across neighboring tile overlaps, and uses those measured seam displacements to solve tile positions. Tile names provide nominal stage-coordinate priors. The default `joint` model fits shared tile positions plus a smooth channel-dependent displacement field. Cross-channel data estimates constant offsets; local per-tile refinement is enabled by default. This geometry step does not use TeraStitcher displacement estimates.
 
-The reference channel is `pre_align_params.reference_channel` (must be a soma channel; defaults to the first soma channel in `channels_routing`). Other soma channels are aligned to it by voxel IoU. TF channels are aligned according to `pre_align_params.tf_align_mode`:
-
-`"chain"` (default):
-```
-Step 1a: align other soma channels (RFP)      → reference soma (GFP)
-Step 1b: align other TF channels (Olig2)      → first TF (Sox9)
-Step 2:  align first TF (Sox9)                → reference soma (GFP)   [containment]
-
-Measured offsets before stitching-frame conversion:
-  GFP:   (0, 0, 0)              ← alignment reference
-  RFP:   step-1a shift
-  Sox9:  step-2 shift
-  Olig2: step-1b shift + step-2 ← chained
-```
-
-`"direct"`: every TF channel is aligned independently to the reference soma by containment (no TF-to-TF step). Use this when the TF markers label different cell populations (e.g. Sox9 vs Olig2), where TF-to-TF overlap is too sparse to align on.
-```
-  GFP:   (0, 0, 0)              ← global reference
-  RFP:   voxel-IoU shift → GFP
-  Sox9:  containment shift → GFP
-  Olig2: containment shift → GFP
-```
-
-Search windows: the coarse step covers ±`xy_search_range_px` / ±`z_search_range_slices`, the fine step ±`xy_fine_search_px` / ±`z_fine_search_slices` around the coarse result, so a shift outside the sum of the two can never be found. There is no cap beyond that — check `validate_align_shifts.py` for shifts that sit at the edge.
-
-The soma↔TF (containment) step finds its coarse candidates from a histogram of soma−TF centroid displacements (`containment_coarse: "displacement_hist"`, default): a nucleus only counts at shift *s* when a soma centroid lies within the gate radius of nucleus + *s*, so the histogram peak is where containment peaks. The previous coarse step (`"fft"`, 3D-FFT correlation of occupancy grids, still used by the intra-soma / intra-TF steps) locked onto spurious peaks for a dense nuclear channel against a GFP soma reference on T4, and the ±8 px fine search never reached the real one. `_align_settings.json` files written before this option existed count as `"fft"`, so re-running a sample aligned with the old code stops with a settings mismatch: delete `0_channel_alignment/` to re-align, or set `"containment_coarse": "fft"` to keep the old offsets.
-
-#### Validating the computed offsets
-
-`scripts/validate_align_shifts.py` answers whether a tile's offsets are a real optimum or just one point in a noise floor: it re-measures cross-channel cell overlap on a **held-out** subvolume while walking the offset away from the stored solution along each axis. A trustworthy offset gives a peak at Δ=0; a flat curve — or a peak several pixels off — means that tile's offset is not supported by data the solver never saw.
+After Stage 2 raw detections exist, run, for example:
 
 ```bash
-python scripts/validate_align_shifts.py --sample /path/to/sample18 \
-    --n-tiles 8 --regions-per-tile 2 --workers 4
+python scripts/solve_tile_positions.py \
+    --sample /path/to/brain_sample \
+    --config config/config.json \
+    --workers 8
 ```
 
-`--sample` takes the sample directory (or its `detection_results/` directly). Alignment parameters are read from `0_channel_alignment/_align_settings.json` when present, otherwise re-resolved from `runtime_config.json` (override with `--config`).
+The default output directory is `<results_dir>/5_analysis_report/tile_positions/`:
 
-**Held-out region.** Stage 2.5 solves on the full XY extent of the central z-window, so the only never-used data is z *outside* that window. The script recomputes each tile's `z_center` exactly as Stage 2.5 does, samples a z-slab outside `[z_center ± sample_z_center_count/2]` plus a `--z-guard` margin (default `max_cell_z_span + z_search_range_slices + z_fine_search_slices`, because `build_cell_boxes` keeps cells that merely *overlap* the window and those extend past its edges), then crops a random `--xy-size` square inside it. If a tile is too thin to avoid the window, the region is still used but flagged `held_out=False`.
+| File | Contents |
+| --- | --- |
+| `seams.csv` | Measured neighboring-tile displacements and match quality |
+| `tile_positions.csv` | Shared and per-channel tile positions, alignment fields, refinement, and `s_<channel>_<axis>` shifts into the selected frame |
+| `solution.json` | Model coefficients, constant-offset provenance, and diagnostics |
+| `report.txt` | Human-readable solver summary |
 
-**Metrics**, swept one axis at a time (Δx varies while Δy/Δz stay at the optimum):
+`--ref` chooses the alignment measurement reference; `--frame` chooses the final coordinate frame. By default these come from `pre_align_params.reference_channel` and `stitching_reference_channel`. `--write-aligned` optionally creates pipeline-style aligned CSVs and offsets in a **separate** `0_channel_alignment_solved/` directory; it does not automatically replace Stage 2.5 output. `--write-xml` optionally writes `xml_merging_<channel>.xml` files using an existing `xml_merging.xml` or `xml_import.xml` structure, or an explicit `--xml-template`. It cannot export XML without a template.
 
-| Metric | Channels | Matches the solver's objective for |
-|--------|----------|------------------------------------|
-| `voxel_iou` | all | intra-soma / intra-TF alignment |
-| `containment` | TF only | soma↔TF alignment — fraction of TF nuclei in the region contained by a reference soma |
+The solver's `tile_positions.csv` is an analysis result, not a Stage 3 input in the current code. If solver-derived geometry is exported for Stage 3, its channel shifts must match the aligned CSVs used by that run; exporting new tile positions alone does not replace existing Stage 2.5 offsets. Do not set `stop_before_stitching: false` just because this CSV exists.
 
-Candidate offsets are applied to cell coordinates *before* voxelization (pixel-exact), so `--xy-step` need not be a multiple of `voxel_bin_size_px`.
+## Global coordinates and deduplication
 
-**Output** → `5_analysis_report/align_validation/`: `<sample>_curves.csv` (one row per tile × region × channel × axis × Δ), `<sample>_summary.csv` (peak location, half-width, edge drop per curve), and a 3-panel PNG per channel × metric (thin lines = individual regions, thick = mean). The console summary's two key columns are `peak_hit` (fraction of regions whose peak lands on Δ=0) and `drop` (relative fall at the sweep edges).
+When Stage 3 is enabled, [`scripts/run_inference.py`](scripts/run_inference.py) currently loads the final-frame geometry from `paths.pATHXML`. If that path is unset, it tries `xml_merging.xml` and then `xml_import.xml` in the first active channel's directory. Set `paths.pATHXML` explicitly to the geometry that matches the run; a stale channel XML changes the global coordinates. A named `xml_merging_<channel>.xml` is checked against `stitching_reference_channel`.
 
-Expect ~2 min/tile, dominated by z-linking dense TF channels — use `--workers`. Pass `--no-plots` where matplotlib is broken; CSVs are written before plotting, so a failure there never costs data.
-
-#### Comparing stitchings / stitching reference ≠ alignment reference
-
-Cell global coordinates are `XML tile position + tile-local coordinate in the alignment reference frame`, which is only right when the XML was stitched on the alignment reference channel. When the two differ (e.g. stitch on 488nm/Olig2 because its signal is dense, align on 640nm/GFP because that is the soma channel), the per-tile channel shift between them has to be accounted for. `scripts/compare_stitching.py` measures how well each candidate stitching — and that chain — actually lines up:
-
-```bash
-# before the second stitching exists: self-report + seam residuals of the 640 one
-python scripts/compare_stitching.py --sample Y:/Fengyi/EGFR_brain/T4 --xml 640nm:GFP
-# both stitchings + GFP cells carried into the 488 frame through the Stage 2.5 offsets
-python scripts/compare_stitching.py --sample Y:/Fengyi/EGFR_brain/T4 \
-    --xml 640nm:GFP --xml 488nm:Olig2 --also GFP --workers 4
-```
-
-`--xml NAME[:CHANNEL][=PATH]`: `NAME` labels the stitching and defaults its directory to `<sample>/<NAME>`; `CHANNEL` is the `channels_routing` id whose raw images were stitched. Each part runs as soon as its inputs exist:
-
-| Part | Needs | Measures |
-|------|-------|----------|
-| A. self-report | TeraStitcher XMLs | per adjacent pair: fraction of axes replaced by the mechanical default (`xml_displthres`), spread of the per-subblock displacements (`xml_displcomp`), and `placed − pair displacement` in `xml_merging` (loop inconsistency). NCC/reliability values depend on image content, so don't compare their absolute level across channels |
-| B. seam residual | + `1_tile_2d_raw` | independent of TeraStitcher: the same cells detected by both tiles of an overlap are z-linked, placed with the XML, and matched; the median `B − A` is that seam's error (ideal 0). `--also CH` first moves `CH` into the XML channel's frame (`raw + s_CH − s_frame`), i.e. the error cells will actually have on that stitched image |
-| C. cross-check | two XMLs with channels + Stage 2.5 offsets | `pos_A(t) − pos_B(t)` should equal `s_a(t) − s_b(t)` up to a constant; a residual std well below the position-difference std means stitching and channel alignment corroborate each other, and flagged tiles are where one of them is wrong |
-
-B uses the raw (unshifted) detection CSVs, so it can run while detection is still in progress — seams whose CSVs are missing are reported as `missing_csv`. Output → `5_analysis_report/stitch_compare/` (`<NAME>_pairs.csv`, `seams.csv`, `cross_<A>_vs_<B>.csv`, and grid/scatter PNGs). Plots are drawn only after every CSV is written; use the `antsreg` env for plotting or pass `--no-plots`.
-
----
-
-## Pipeline Stages
-
-| Stage | Description | Checkpoint (skip if exists) |
-|-------|-------------|----------------------------|
-| 2 | Per-tile detection (YOLO + StarDist), parallel per GPU | `1_tile_2d_raw/<tile>_<ch>_result.csv` |
-| 2.5 | Point-cloud channel alignment *(pre_align only)* | `0_channel_alignment/_align_done.flag` |
-| 2.75 | Per-tile bbox size/intensity filtering | `1_tile_2d_filtered/<tile>_<ch>_result.csv` |
-| 3 | Global stitching → Z-linking → 3D colocalization | `4_colocalization/coloc_result.csv` |
-| 4 | Per-class centroid files + summary statistics | `5_analysis_report/global_summary_statistics.csv` |
-
-Each stage is a **linear checkpoint**: if its output already exists, it is skipped automatically. To re-run a stage, delete its checkpoint file/folder.
-
-To re-run from Stage 3 only (e.g. after changing colocalization parameters), delete `4_colocalization/` and `5_analysis_report/`, then set `"start_from_stage": 3` in config.
-
----
-
-## Running the Pipeline
-
-```bash
-# Default config (config/config.json):
-python scripts/run_inference.py
-
-# Custom config:
-python scripts/run_inference.py --config /path/to/config.json
-```
-
----
-
-## Configuration (`config/config.json`)
-
-> Config files support `//` line comments.
-
-### `models`
-| Key | Description |
-|-----|-------------|
-| `yolo_path` | YOLO model weight path (relative to project root) |
-| `stardist_basedir` | StarDist model root directory (relative to project root) |
-| `stardist_name` | StarDist model subdirectory name |
-
-### `model_classes`
-Maps YOLO output indices to class names. Currently `{"0": "neuron", "1": "glia"}`.
-
-### `channels_routing`
-Array defining each channel's detection strategy. Order matters — the first entry is the anchor channel.
-
-| Field | Values | Description |
-|-------|--------|-------------|
-| `id` | e.g. `"RFP"` | Channel name, used as label prefix throughout |
-| `type` | `"soma"` / `"tf"` | `soma` → YOLO; `tf` → StarDist nucleus detection |
-| `model` | `"yolo"` / `"stardist"` | Inference backend |
-| `dir_key` | key in `paths` | Points to this channel's tile directory |
-| `active` | `true` / `false` | Set `false` to skip a channel entirely |
-| `double_exposure` | `true` / `false` | Optional. When `true`, this channel has a second exposure/laser-power image that gets fused in at the raw per-tile 2D level before filtering (Stage 2.6) |
-| `second_intensity_id` | e.g. `"GFP_25"` | Required if `double_exposure=true`. Internal id for the second exposure (used for its raw CSV filename and in logs) |
-| `second_intensity_dir_key` | key in `paths` | Required if `double_exposure=true`. Points to the second exposure's tile directory |
-| `fusion_iou_thresh` | float, default `0.3` | Per-z-slice IoU threshold used to match low/high exposure boxes during fusion |
-
-### `paths`
-| Key | Description |
-|-----|-------------|
-| `rfp_dir`, `gfp_dir`, `sox9_dir`, `olig2_dir` | Per-channel tile root directories |
-| `pATHRESULT` | Output root directory |
-
-### `pipeline_mode`
-`"post_align"` (default) or `"pre_align"`. See [Pipeline Modes](#pipeline-modes).
-
-### `start_from_stage`
-| Value | Behavior |
-|-------|----------|
-| `1` | Full pipeline from scratch; scans tile directories over the network |
-| `2` | Skip network scan; infer tile list from existing CSVs in `1_tile_2d_raw/` |
-| `3` | Skip detection and filtering entirely; load directly from `3_channel_3d/` pkl files |
-
-Use `3` to re-run only colocalization and downstream steps without re-running detection.
-
-### `stop_after_detection`
-`true` = exit immediately after Stage 2 (tile detection). Useful to run GPU-heavy detection on HPC, then run the CPU-only stages locally.
-
-### `stop_before_stitching`
-`true` = run all per-tile stages (detection, 2.5 alignment, 2.6 fusion, 2.75 filtering, 2.8 histograms), then exit before Stage 3. None of these stages need the TeraStitcher XML, so a sample whose stitching isn't finished yet can be processed up to here; set back to `false` once `xml_merging.xml` exists and re-run — finished stages are skipped by their checkpoints. The XML is looked up from `paths.pATHXML` first, then `xml_merging.xml` / `xml_import.xml` in the anchor channel directory.
-
-### `ENABLE_Z_LINKER`
-`true` (default) = run Z-axis tracking. `false` = output raw 2D detections only.
-
-### `stage3_n_workers`
-Stage 3 stitches and z-links every channel in its own process; this caps how many run at once (default: all channels, limited by `$SLURM_CPUS_PER_TASK`). Dense TF channels hold several GB each while they run, so lower it if the job runs out of memory. Cross-channel colocalization (3A/3B/3C) stays in the main process.
-
-**Z-linker solver.** Each slice's Hungarian matching is solved separately inside every connected group of boxes with IoU > 0 (`run_z_linker(..., solver='sparse')`, the default) instead of on one whole-brain cost matrix. This is the same optimum — the number of forced cross-type pairs doesn't depend on which positive-IoU pairs are chosen — so results only differ where two assignments have exactly equal cost. On sample18, soma channels came out identical and Sox9 differed in 2 of 3.69 M cells; Sox9 z-linking went from 56 min to ~3.5 min. `solver='dense'` keeps the original for comparison.
-
-### Alignment reference and stitching frame
-
-Set `pre_align_params.reference_channel` to the MADM soma channel (`GFP` or `RFP`), and set the top-level `stitching_reference_channel` to the channel whose tile positions and XML define the final global frame. The latter defaults to the alignment reference if omitted. `paths.pATHXML` must be the merging XML for that stitching channel.
-
-For each tile, Stage 2.5 measures raw-to-MADM shifts `t_c`, then saves `s_c = t_c - t_frame` in the aligned CSV and offsets JSON. Thus `s_frame = 0` even if the two references differ. Global coordinates use the frame XML position `P_frame`: `x_global = x_raw + s_x + P_x`, `y_global = y_raw + s_y + P_y`, and `z_global = z_raw + s_z - P_z`, where `P_z = z_start - ABS_D` and raw Z is 1-based. Named solver XMLs and saved alignment offsets are checked against the configured frame before stitching.
-
-`solve_tile_positions.py` also takes the stitching frame from this config field unless `--frame` overrides it. The local T4 wrapper reads the full T4 config; the separate Olig2/Sox9 redetection config stops before stitching and does not perform Stage 2.5.
-
-### `pre_align_params` *(pre_align mode only)*
-| Key | Default | Description |
-|-----|---------|-------------|
-| `reference_channel` | first soma channel | Soma channel every other channel is shifted onto |
-| `tf_align_mode` | `"chain"` | `"chain"`: TF-N → first TF → reference; `"direct"`: each TF → reference independently (see [pre_align](#pre_align)) |
-| `sample_z_center_count` | 50 | Z slices from tile center used to build alignment point cloud |
-| `voxel_bin_size_px` | 4 | Voxel bin size for 3D FFT alignment (px); smaller = more precise but slower |
-| `xy_search_range_px` | 30 | FFT coarse-search XY radius (px) |
-| `z_search_range_slices` | 5 | FFT coarse-search Z range (±slices); soft cap 5, hard cap 10 |
-| `xy_fine_search_px` | 8 | Fine-search XY range around FFT peak (px) |
-| `z_fine_search_slices` | 2 | Fine-search Z range around FFT peak (slices) |
-| `containment_coarse` | `"displacement_hist"` | Coarse search of the soma↔TF containment step; `"fft"` reproduces results aligned before this option existed (see [pre_align](#pre_align)) |
-| `tile_overlap_pct` | 15 | Tile overlap % (fallback grid calculation when TeraStitcher XML is absent) |
-| `n_workers` | `$SLURM_CPUS_PER_TASK`, else CPU count | Stage 2.5 CPU processes, one tile each. Stage 2.5 never uses a GPU, so run it in a CPU job (`scripts/inference_cpu.slurm`) rather than holding GPUs. Not part of `_align_settings.json` — changing it never invalidates finished tiles |
-
-Stage 2.5 resumes per tile: a tile counts as finished when its `_offsets.json` exists (written last) and every aligned CSV has as many lines as its raw CSV. A killed or timed-out job just needs resubmitting.
-
-### `z_linker`
-Parameters are split by channel type (`soma` / `tf`):
-
-| Key | Description |
-|-----|-------------|
-| `iou_thresh` | Minimum 2D bbox IoU for cross-z frame matching |
-| `min_z_layers` | Minimum z-layers to qualify as a 3D cell |
-| `max_cell_z_span` | Maximum z-span per cell (prevents over-merging) |
-
-Additional soma-only keys:
-
-| Key | Description |
-|-----|-------------|
-| `iou_thresh_3d` | 3D IoU threshold for cross-channel soma matching |
-| `z_pad_3d` | One-sided z-gap tolerance (slices) for 3D soma matching; only bridges a real gap between non-overlapping boxes, never inflates boxes that already overlap in z |
-| `cross_class_iou_thresh` | neuron–glia overlap threshold; glia takes priority |
-
-Additional tf-only keys:
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `gmm_p_thresh` | 0.5 | GMM colocalization probability threshold *(visualization in-memory path only)* |
-| `max_center_dist_ratio` | 0.5 | Hard gate for soma–TF colocalization: the TF nucleus centroid must be within `ratio × soma_radius` of the soma centroid. Prevents edge-overlap false positives when soma bboxes are large. |
-
-### `detection_params`
-
-**Physical resolution:**
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `xy_resolution_um` | 0.65 | XY pixel size (µm/pixel) |
-| `z_resolution_um` | 8 | Z slice spacing (µm) |
-
-**Detection thresholds:**
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `conf_thresh` | 0.3 | YOLO confidence threshold |
-| `nms_iou` | 0.3 | NMS IoU threshold |
-
-**Inference patch:**
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `xsize` / `ysize` | 512 | Inference patch width/height (px) |
-| `step` | 384 | Sliding window stride (px); overlap = xsize − step |
-| `tILESIZE` | 2048 | TeraStitcher tile edge length (px) |
-
-**Processing range:**
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `sTARTID` / `eNDID` | null | Tile index range (`null` = all) |
-| `DOWNSAMPLE` | false | Skip-frame mode for fast debug runs |
-| `DOWNSAMPLE_Z_STEP` | 41 | Skip interval when `DOWNSAMPLE=true` |
-
-**Image normalization:**
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `normalize_PERCENTILE_LOW` | 0.1 | Lower percentile for 16-bit → 8-bit stretch |
-| `normalize_PERCENTILE_HIGH` | 99.9 | Upper percentile |
-
-**YOLO-specific filters** (`detection_params.yolo`):
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `bbox_min` / `bbox_max` | null | Width/height absolute limits (px); `null` = no filter |
-| `bbox_area_pct_min` | 10 | Drop boxes below this area percentile (within-tile) |
-| `bbox_mean_pct_min` | null | Drop boxes below this intensity percentile |
-| `bbox_mean_min` | 0 | Absolute intensity floor (raw 16-bit value) |
-
-**StarDist-specific filters** (`detection_params.stardist`):
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `norm_low` / `norm_high` | 1 / 99.9 | Normalization percentiles for StarDist input |
-| `prob_thresh` | 0.5 | Instance probability threshold |
-| `nms_thresh` | 0.4 | NMS overlap threshold |
-| `n_tiles` | [4, 4] | Inference tiling [Y, X]; larger = lower peak VRAM |
-| `bbox_min` / `bbox_max` | 8 / 17 | Width/height limits (px) |
-| `bbox_area_pct_min` | 5 | Drop boxes below this area percentile |
-| `bbox_mean_pct_min` | null | Drop boxes below this intensity percentile |
-| `bbox_mean_min` | 0 | Absolute intensity floor |
-
----
-
-## Output Structure
+For a tile with XML values `ABS_H`, `ABS_V`, and `ABS_D`, the pipeline normalizes positions as follows. Local detection Z is one-based:
 
 ```text
-pATHRESULT/
-├── 0_channel_alignment/         # [pre_align only] per-tile offset JSONs + aligned CSVs
-│   ├── _align_settings.json     # resolved alignment settings; a re-run with different settings stops and asks you to delete this folder
-│   └── _align_done.flag         # checkpoint: alignment complete (not written if any detection CSV is missing)
-├── 1_tile_2d_raw/               # Per-tile 2D detection CSVs (one file per tile×channel)
-├── 1_tile_2d_filtered/          # Same CSVs after size/intensity filtering (Stage 2.75 output)
-├── 2_global_2d_raw/             # Globally stitched 2D detections (one CSV per channel)
-├── 3_channel_3d/                # Per-channel Z-linked 3D cells
-│   ├── <ch>_3d_tracked.csv      # Summary (center_z bbox per cell)
-│   └── <ch>_3d_tracked.pkl      # Full volumetric vol_list
-├── 4_colocalization/            # Colocalization results
-│   ├── coloc_result.csv         # All 3D soma cells with colocalized TF class labels
-│   └── <class>.csv              # Per-class split of coloc_result.csv
-└── 5_analysis_report/
-    ├── global_summary_statistics.csv
-    ├── align_validation/            # [optional] validate_align_shifts.py: curves CSV + summary + PNGs
-    ├── stitch_compare/              # [optional] compare_stitching.py: pair / seam / cross-check CSVs + PNGs
-    └── cell_centroids/
-        └── <class>_centroids.csv         # Physical centroids (µm) per cell class
+P_x = ABS_H - min_tile(ABS_H)
+P_y = ABS_V - min_tile(ABS_V)
+P_z = max_tile(ABS_D) - ABS_D
+
+x_global = x_raw + s_x + P_x
+y_global = y_raw + s_y + P_y
+z_global = z_raw + s_z - P_z
 ```
 
-**Class label convention**: `{soma_type}_{channel}_{TF}`, e.g. `neuron_RFP_Sox9` for an RFP+ neuron colocalized with Sox9. Multi-positive soma channels and TF markers are joined with `_` in sorted order.
+All four channels' saved global detections use the **same final frame geometry**. The source image channel used for a whole-brain mosaic does not by itself select the detection coordinate frame. For tile viewing, `CoordinateContext` reverses the corresponding frame position: `x_local = x_global - P_x`, `y_local = y_global - P_y`, and `z_local_0based = z_global + P_z - 1`.
 
----
+Stage 3 performs several distinct kinds of overlap handling:
 
-## Visualization
+1. [`combine_predictions()`](src/core/stitcher.py) converts filtered tile detections to global positions and discards boxes whose centers fall in the left or upper neighbor's overlap region. This current cross-tile rule is a geometric mask, not IoU-based union of duplicate boxes.
+2. [`run_z_linker()`](src/core/z_linker.py) links same-channel boxes across Z using one-to-one XY IoU matching. A track becomes one 3D cell, with a representative box at the median Z. `z_linker.soma` and `z_linker.tf` provide separate IoU, minimum-layer, maximum-span, and gap settings. With `min_z_layers: 1`, isolated single-slice detections remain.
+3. [`match_soma_3d_iou()`](src/core/stitcher.py) matches soma cells across channels using 3D IoU or IoMin and combines their marker labels. A later neuron/glia overlap pass gives glia priority. TF nuclei then annotate containing soma cells; the final `coloc_result.csv` contains soma cells with their marker combinations.
+
+`3_channel_3d/<channel>_3d_tracked.csv` contains one representative row per Z-linked cell; the adjacent PKL holds its per-Z boxes and 3D extent. `4_colocalization/coloc_result.csv` contains the cross-channel soma result.
+
+**Configuration fields to treat carefully:** `ENABLE_Z_LINKER` and `detection_params.cross_tile_iomin_thresh` are present in some configs, but the current Python pipeline does not read them. Setting either one does not change Stage 3 behavior. The current code also does not read the solver's `tile_positions.csv` for global conversion.
+
+Changing alignment references, frame geometry, or `paths.pATHXML` after global checkpoints exist requires a fresh result directory or regeneration of the affected checkpoints. The pipeline checks saved runtime provenance to prevent reuse in a different frame.
+
+## Visualize results
+
+[`src/utils/visualize.py`](src/utils/visualize.py) reads `config/vis_config.json` by default. It supports three modes:
+
+| Mode | Displays | XML needed by current viewer? |
+| --- | --- | --- |
+| `2d` | Aligned raw or filtered tile-local 2D boxes and shifted images | No |
+| `prealign` | Tile alignment QC, optional raw boxes, in-memory Z linking, and colocalization previews | Yes: the current entry point builds `CoordinateContext` |
+| `post` | Saved filtered 2D boxes, Z-linked cells, and final colocalization results | Yes: global boxes are mapped back to the selected tile |
 
 ```bash
-python src/utils/visualize.py
-python src/utils/visualize.py --config config/vis/vis_config.json
+python src/utils/visualize.py --config config/vis_config.json --mode 2d --2d-source raw
+python src/utils/visualize.py --config config/vis_config.json --mode 2d --2d-source filtered
+python src/utils/visualize.py --config config/vis_config.json --mode post
 ```
 
-Edit `config/vis/vis_config.json` to select mode, tile, Z range, and which napari layers to show. The viewer supports two modes:
+For `prealign` and `post`, use the same final-frame geometry as the run that created the saved results. Set the visualization sample's `frame_channel` to that frame and `paths.pATHXML` to its XML. The viewer checks frame and tile compatibility and reports the selected coordinate context. A different channel's XML is interchangeable only when its normalized tile positions are identical.
 
-- **`post`**: loads saved results from `3_channel_3d/` and `4_colocalization/`. Layers: `[s1]` raw 2D · `[s3]` Z-linked · `[s4]` colocalization.
-- **`prealign`**: runs Z-linking and colocalization in memory for a single tile; useful for parameter QC without re-running the full pipeline.
+## Code map
 
-Key `vis_config.json` settings:
+- [`scripts/run_inference.py`](scripts/run_inference.py): pipeline orchestration, checkpoints, and global frame selection.
+- [`src/core/point_cloud_aligner.py`](src/core/point_cloud_aligner.py): per-tile pre-alignment and four-channel shift modes.
+- [`scripts/solve_tile_positions.py`](scripts/solve_tile_positions.py): detection-based seam measurement and global tile position solving.
+- [`src/core/channel_stage3.py`](src/core/channel_stage3.py): per-channel global 2D construction and Z-link calls.
+- [`src/core/z_linker.py`](src/core/z_linker.py): across-Z tracking.
+- [`src/core/stitcher.py`](src/core/stitcher.py): overlap handling, soma matching, and TF annotation.
+- [`src/utils/coordinate_context.py`](src/utils/coordinate_context.py): global-to-tile visualization coordinates.
+- [`src/utils/visualize.py`](src/utils/visualize.py): napari tile viewer.
 
-| Key | Description |
-|-----|-------------|
-| `mode` | `"post"` or `"prealign"` |
-| `tile` | Tile directory name; `null` = interactive selection |
-| `z_range` | `[start, end]` absolute slice indices; `null` = auto-center |
-| `stage` | `"all"` / `"s1"` / `"s3"` / `"s4"` — which result layers to load |
-| `show_coloc` | Show colocalization layer *(prealign mode)* |
-| `filter` | Per-type bbox size/intensity filters applied at display time only |
-
-## Detection CSV filtering
-
-`1_tile_2d_raw/` is the complete detector output: it includes only detector-native
-post-processing (YOLO patch stitching/model NMS or StarDist instance NMS), never
-configurable size, percentile, intensity, or containment filtering. Stage 2.75 always
-reads raw/post-alignment CSVs (or fused CSVs for a double-exposure logical channel),
-applies the shared filter once, and atomically writes `1_tile_2d_filtered/`. Stage 3
-reads only that filtered directory.
-
-Model defaults live in `detection_params.yolo` / `detection_params.stardist`. A
-`channel_filter_overrides.<channel-id>` object overrides only explicitly present keys;
-`null` deliberately disables an inherited filter. This permits Olig2-specific tuning
-without changing Sox9. `prob_thresh` is the StarDist inference threshold that determines
-which candidates enter raw CSVs. `score_min` filters the raw CSV `score` column during
-postprocessing with `score >= score_min`; it applies to StarDist probability or YOLO
-confidence and does not rerun inference. Channel overrides can set a different value or
-`null` to disable it. After a parameter change, filtered and all downstream stages are
-stale; regenerate filtered output before rerunning Stage 3 onward.
-
-To regenerate without loading images or models:
-
-```bash
-python scripts/refilter_detections.py --config config/config_EGFR_t4_local_gpu.json --channels Olig2 --dry-run
-python scripts/refilter_detections.py --config config/config_EGFR_t4_local_gpu.json --channels Olig2 --overwrite
-```
-
-The CLI reads the correct raw/aligned/fused CSV source by pipeline mode, uses the CSV
-`mean` column, writes CSVs atomically, and warns instead of deleting downstream output.
-The 2-D visualizer uses the same implementation and, when present, resolves parameters
-from `runtime_config.json`; its layers distinguish source, preview-kept, and preview-
-rejected boxes.
+Legacy `post_align` and XML comparison tools remain in the repository for older datasets. The workflow above describes the current `pre_align` path and its checked-in integration limits.
