@@ -664,3 +664,38 @@ Olig2 逐 tile 包含数中位数 54 → 122。
 - 已改为按全局框与当前 tile 的空间相交关系选择 Stage 3/4 结果，且不再对全局去重后的结果重复应用 tile 左/上重叠边缘隐藏规则；同时移除保存的 Stage 3 loader 中引用未定义 `preview_rejected` 的代码。Stage 4 CSV 只在代表 Z 层画框，本例需看 local z=506，而不是 RFP 的代表层 z=508。当前 T4 QC 配置继续使用 `coloc_source: "saved"`。
 - 回归测试覆盖“来源是相邻 tile、框位于当前 tile 内”的 Stage 3/4 显示；实际 T4 CSV 复核后，当前 tile 的 GFP+RFP 图层可以选出该区域的正式结果。正式检测、Z-link 和 Stage 4 CSV 未改动。
 - 后续真实 CSV 验证还暴露保存的 Stage 3 可视化 loader 调用已不存在的 `_filter_df_by_size_and_intensity`；现改用共享 `filter_detection_df` 处理可视化筛选，并保留被筛掉的灰色框。实际 T4 RFP/GFP Stage 3 CSV 均可在该 tile 加载；新增测试覆盖此筛选分支。
+
+---
+
+## 2026-10-02 Saved-result prealign GUI
+
+### Completed
+- Reworked the prealign visualization path to load saved outputs from the current detection pipeline instead of running Z linker or channel colocalization during GUI startup.
+- Added local tile and global coordinate views. The global view uses the saved runtime configuration, XML tile positions, and channel alignment offsets to place images and results consistently; missing metadata is reported instead of guessed.
+- Added readers for saved tile/global 2D detections, Stage 3 cells, and Stage 4 colocalization results. Stage 4 layers show the recorded marker combinations and representative Z positions without recomputing matches.
+- Kept per-Z Stage 3 track boxes available through the saved PKL files on cell selection. Added safeguards for ambiguous CSV-to-PKL matches, duplicate global rows, and invalid Z ranges.
+- Updated the visualization config example and README for the new view options. The active local visualization config was also adjusted, while its sample data path remains unchanged until the new pipeline outputs exist.
+
+### Verification and follow-up
+- Synthetic tests: 12 new saved-result GUI tests passed; 5 coordinate-context tests and 1 tile-selection test passed. Visualization configs parsed, and git diff --check passed.
+- A full Napari window smoke test could not run in the current environment because Qt could not create an OpenGL context. Real EGFR T4 outputs from the revised pipeline are not available yet, so image/result alignment and Stage 4 display still need validation against a complete saved dataset.
+
+
+---
+
+## 2026-10-02 Pre-align tile-position pipeline and filter configuration
+
+### Completed
+
+- Stage 2 can resume from existing 1_tile_2d_raw CSVs when start_from_stage is 2; it does not need a separate raw-detection path parameter.
+- In pre_align, Stage 2.25 filters raw tile detections into 1_tile_2d_prefiltered before channel alignment. Stage 2.5 estimates shifts from those filtered cells. Stage 2.75 publishes aligned single-channel CSVs into 1_tile_2d_filtered without filtering them again; fused double-exposure results are filtered at publication. Post-align filters raw CSVs directly into 1_tile_2d_filtered. The unused stage_2_75_enabled setting and its passthrough comments were removed from the T70/T4 local configs and example config.
+- Optional Stage 2.9 now invokes the detection-based tile-position solver after tile filtering/alignment and before Stage 3, including when stop_before_stitching is true. It reads filtered, unaligned detections and reuses the per-tile Stage 2.5 offsets. Stage 3 automatically loads the solved frame XML for global cell coordinates.
+- The two meaningful references are pre_align_params.reference_channel (channel-shift measurement, GFP for T70) and stitching_reference_channel (tile/global coordinate frame, Olig2/488 nm for T70). Stage 2.5 rebases shifts into the latter. The duplicate tile_position_params.reference_channel key was removed.
+- The solver writes xml_merging_<channel>.xml into the tile-position report and publishes xml_merging.xml into each original channel image directory. An existing source XML is preserved as xml_merging.original.xml. Channel image XMLs use seam-derived tile geometry plus the global channel translation; local cell-alignment residuals stay with cell coordinates.
+- tile_position_params.workers controls CPU parallelism for tile seam measurement. It is separate from pre_align_params.n_workers, which controls tile-level channel alignment. The stages run sequentially, and the solver falls back to the alignment worker count when its own count is omitted.
+- Solver input/output provenance is recorded in _pipeline_manifest.json. A changed solver input or XML is rejected while global Stage 3/4 checkpoints exist, preventing mixed coordinate systems.
+
+### Verification and follow-up
+
+- Earlier implementation verification: 32 unit tests passed, including different-reference conversion, XML output/backup, and changed-input checkpoint protection. The T70 dataset itself was not rerun during that verification.
+- In this checkout, config/config_EGFR_t70.json is absent while scripts/inference_t70.slurm defaults to that path. Confirm that the T70 config exists at the submission location before running sbatch.

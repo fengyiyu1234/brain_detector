@@ -25,11 +25,13 @@ venv/
 *.h5
 *.md
 *.cmd
+*.err
 images/
 labels/
 models/
 scripts/logs/
 config/
+
 
 # 本地一次性脚本，不纳入版本控制
 local_scripts/
