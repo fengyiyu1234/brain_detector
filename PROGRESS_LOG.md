@@ -646,3 +646,21 @@ Olig2 逐 tile 包含数中位数 54 → 122。
 ### 未完成的人工验收
 - Napari 视觉抽查尚未完成；需要人工检查候选目录里的信号强/暗边缘/高背景 tile。
 - 不同阈值（null/0.25/0.40）的额外候选比较未生成，本次计划只指定了 score030 的输出目录。
+
+---
+
+## 2026-10-01 EGFR T4 共定位 QC：GFP/RFP 漏显排查
+
+- 样本 EGFR T4、tile `371500_361200`、local z=510：RFP `glia_RFP`（中心约 652.1, 781.0；z=510–511）与 GFP `glia_GFP`（中心约 643.3, 788.5；z=510）的框满足 Stage 3 soma 3D 匹配条件。对已保存的 `3_channel_3d/*_3d_tracked.pkl` 复核，`match_soma_3d_iou` 能将两者配对。
+- 已保存的 `4_colocalization/coloc_result.csv` 中存在 `glia_GFP_RFP`；global z=507 经该 tile 的 z offset=4 转换为 local z=510，tile-local 中心约 (643.3, 788.5)。可视化的 tile、z、marker 和边界筛选也保留该记录，`[coloc] GFP+RFP` 图层中包含它。
+- 本例的“漏检”发生在显示环节：共定位图层创建时默认为 `visible=False`。已修改 `src/utils/visualize.py`，使加载的共定位图层默认可见；prealign 模式新增 `coloc_source`，可选 `saved`（Stage 4 CSV）或 `preview`（用当前 filtered tile CSV 与 [zlinked] 同源计算）。当前本地 `config/vis_config.json` 设为 `saved`；示例配置设为 `preview`。更新了 README。正式 T4 检测及 Stage 3/4 结果文件未改动。
+- 验证：用报告的两个框确认 3D 匹配；用小型 CSV 确认 global z=507 映射到显示索引 10（local z=510）且图层可见；项目配置 loader 可解析两份可视化配置，`py_compile` 与 `git diff --check` 通过。
+- 这只证实所报细胞已在正式结果中；其他可疑细胞仍需逐例对照 Stage 3/4 数据，不能由本例推断全部共定位匹配均正确。
+
+### 同日后续：tile 348800_361200 的重叠区案例
+
+- 用户给出的 local RFP `glia_RFP`（中心约 259.4, 360.5, z=508；z-span 506–510）和 GFP `glia_GFP`（中心约 262.3, 370.5, z=506；z-span 505–508）从该 tile 的 filtered CSV 重新 Z-link 后，`match_soma_3d_iou` 确实将两者匹配成 `glia_GFP_RFP`。
+- 正式 Stage 4 也在同一物理区域有 `glia_GFP_RFP`（映射到当前 tile 后中心约 247.4, 373.9，local z=506），但其 `tile_name` 为相邻的 `348800_349900`：全局去重保留了相邻 tile 来源的检测。此前可视化优先按当前 `tile_name` 筛选，因此漏显该结果。
+- 已改为按全局框与当前 tile 的空间相交关系选择 Stage 3/4 结果，且不再对全局去重后的结果重复应用 tile 左/上重叠边缘隐藏规则；同时移除保存的 Stage 3 loader 中引用未定义 `preview_rejected` 的代码。Stage 4 CSV 只在代表 Z 层画框，本例需看 local z=506，而不是 RFP 的代表层 z=508。当前 T4 QC 配置继续使用 `coloc_source: "saved"`。
+- 回归测试覆盖“来源是相邻 tile、框位于当前 tile 内”的 Stage 3/4 显示；实际 T4 CSV 复核后，当前 tile 的 GFP+RFP 图层可以选出该区域的正式结果。正式检测、Z-link 和 Stage 4 CSV 未改动。
+- 后续真实 CSV 验证还暴露保存的 Stage 3 可视化 loader 调用已不存在的 `_filter_df_by_size_and_intensity`；现改用共享 `filter_detection_df` 处理可视化筛选，并保留被筛掉的灰色框。实际 T4 RFP/GFP Stage 3 CSV 均可在该 tile 加载；新增测试覆盖此筛选分支。

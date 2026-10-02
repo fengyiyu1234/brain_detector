@@ -89,6 +89,7 @@
     "show_before": false,
     "show_zlinked": true,
     "show_coloc": false,
+    "coloc_source": "preview",
     "spheres": false,
     // Saved-result stage selection for post mode.
     "stage": "all",

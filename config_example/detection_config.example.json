@@ -46,23 +46,27 @@
             "active": true
         }
     ],
-    // Replace sample paths. pATHXML stays null during tile-level processing.
+    // The integrated tile solver supplies pATHXML automatically.
     "paths": {
         "rfp_dir": "/path/to/brain_sample/561nm",
         "gfp_dir": "/path/to/brain_sample/640nm",
         "sox9_dir": "/path/to/brain_sample/730nm",
         "olig2_dir": "/path/to/brain_sample/488nm",
         "pATHXML": null,
-        "pATHRESULT": "/path/to/brain_sample/detection_results",
-        "pATH_RAW_DETECTIONS": null
+        "pATHRESULT": "/path/to/brain_sample/detection_results"
     },
     "device": "cuda",
     // Detect raw tiles and align channels from detection results.
     "pipeline_mode": "pre_align",
     // Final global frame; it may differ from pre_align_params.reference_channel.
     "stitching_reference_channel": "RFP",
-    // Reference used to estimate channel shifts before rebasing to the stitching frame.
+    // Tile geometry is solved in RFP coordinates; Stage 2.5 shifts are rebased there.
+    "tile_position_params": {
+        "enabled": true,
+        "workers": 4
+    },
     "pre_align_params": {
+        // Reference used to measure channel shifts.
         "reference_channel": "GFP",
         "tf_align_mode": "sequential_joint",
         "sample_z_center_count": 50,
@@ -75,12 +79,10 @@
         "n_workers": 4
     },
     "stop_after_detection": false,
-    // True runs through tile-level alignment and filtering without XML.
+    // True writes the solved XMLs, then exits before global cell stitching.
     "stop_before_stitching": true,
-    // Use 1 for a new run; use 2 with pATH_RAW_DETECTIONS to reuse raw detections.
+    // Use 1 for detection; use 2 to read pATHRESULT/1_tile_2d_raw and skip detection.
     "start_from_stage": 1,
-    // Keep false when the detector already applied the same filter.
-    "stage_2_75_enabled": false,
     "ENABLE_Z_LINKER": true,
     "stage3_n_workers": null,
     // Z linking and cross-channel matching settings.

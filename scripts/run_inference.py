@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 #python scripts/run_inference.py --config config/config.json
 import argparse
+import json
 import os
+import shutil
 import sys
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
@@ -30,6 +32,7 @@ from src.core.detection_filter import (
 )
 from src.core.stitcher import fuse_dual_intensity_2d
 from src.core.channel_stage3 import stitch_and_link_channel
+from src.core.tile_position_pipeline import run_tile_position_stage, tile_position_frame
 from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_containment,
                                _merge_class, suppress_cross_class_overlap)
 from src.core.point_cloud_aligner import (
@@ -125,6 +128,83 @@ def run_align_pool(tile_paths, n_workers, det_dir, align_dir, routing, settings)
     return missing
 
 
+def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filtered_dir):
+    """Filter raw tile detections before estimating pre-align channel shifts."""
+    os.makedirs(filtered_dir, exist_ok=True)
+    logical_channels = {ch['id']: ch for ch in config['channels_routing']}
+    for ch in config['channels_routing']:
+        if ch.get('double_exposure'):
+            logical_channels[ch['second_intensity_id']] = ch
+    jobs = [(tile, ch) for tile in tile_names for ch in detect_routing]
+    params_by_channel = {
+        ch['id']: resolve_filter_params(config, logical_channels[ch['id']])
+        for ch in detect_routing
+    }
+    settings_file = os.path.join(filtered_dir, "_filter_settings.json")
+    try:
+        with open(settings_file, encoding="utf-8") as handle:
+            same_settings = json.load(handle) == params_by_channel
+    except (OSError, ValueError):
+        same_settings = False
+    missing = [os.path.join(raw_dir, f"{tile}_{ch['id']}_result.csv")
+               for tile, ch in jobs
+               if not os.path.isfile(os.path.join(raw_dir, f"{tile}_{ch['id']}_result.csv"))]
+    if missing:
+        raise FileNotFoundError(
+            f"Pre-align filtering needs {len(missing)} raw detection CSV(s); "
+            f"first missing: {missing[0]}")
+    for tile, ch in tqdm(jobs, desc="Filter raw tiles for alignment"):
+        name = f"{tile}_{ch['id']}_result.csv"
+        target = os.path.join(filtered_dir, name)
+        if (same_settings and os.path.isfile(target) and
+                os.path.getmtime(target) >= os.path.getmtime(
+                    os.path.join(raw_dir, name))):
+            continue
+        source = os.path.join(raw_dir, name)
+        params = params_by_channel[ch['id']]
+        filtered, stats = filter_detection_df(
+            pd.read_csv(source), params, return_stats=True, context=source)
+        atomic_write_csv(filtered, target)
+        logging.info("[2.25][%s][%s] %s -> %s", tile, ch['id'],
+                     stats['before'], stats['after'])
+
+    part = settings_file + ".part"
+    with open(part, "w", encoding="utf-8") as handle:
+        json.dump(params_by_channel, handle, indent=2)
+    os.replace(part, settings_file)
+
+
+def validate_global_checkpoints(derived, tile_names, routing):
+    """Refuse cached global outputs older than the filtered tile CSVs."""
+    newest_input = 0
+    for ch in routing:
+        cid = ch['id']
+        source_times = [
+            os.path.getmtime(os.path.join(
+                derived['pATH_DET_FILTERED'], f"{tile}_{cid}_result.csv"))
+            for tile in tile_names
+        ]
+        newest = max(source_times, default=0)
+        newest_input = max(newest_input, newest)
+        global_csv = os.path.join(derived['pATH_GLOBAL_2D'], f"{cid}_2d_global.csv")
+        tracked = os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.pkl")
+        if os.path.isfile(global_csv) and os.path.getmtime(global_csv) < newest:
+            raise RuntimeError(
+                f"Stale Stage 3 checkpoint: {global_csv}. Archive/regenerate this "
+                "channel's global 2D, 3D, and downstream results.")
+        if os.path.isfile(tracked) and (
+                not os.path.isfile(global_csv)
+                or os.path.getmtime(tracked) < os.path.getmtime(global_csv)):
+            raise RuntimeError(
+                f"Stale Stage 3 checkpoint: {tracked}. Archive/regenerate this "
+                "channel's 3D and downstream results.")
+    coloc = os.path.join(derived['pATH_COLOCALIZATION'], "coloc_result.csv")
+    if os.path.isfile(coloc) and os.path.getmtime(coloc) < newest_input:
+        raise RuntimeError(
+            f"Stale colocalization checkpoint: {coloc}. Archive/regenerate "
+            "Stage 3/4 results after changing filtered tile inputs.")
+
+
 def run_detection_pool(tasks, gpu_ids, config):
     """并行执行 tile 检测：每块 GPU 一个槽位，每个 tile 在全新的子进程里跑完即退出。
 
@@ -196,19 +276,18 @@ if __name__ == '__main__':
     pipeline_mode = config.get('pipeline_mode', 'post_align')  # "post_align" | "pre_align"
     start_from_stage = config.get('start_from_stage', 1)
     pre_align_cfg = config.get('pre_align_params', {})
-    raw_source = paths.get('pATH_RAW_DETECTIONS')
-    if raw_source:
-        if start_from_stage < 2:
-            raise ValueError(
-                "paths.pATH_RAW_DETECTIONS is read-only; use start_from_stage >= 2")
-        if not os.path.isdir(raw_source):
-            raise FileNotFoundError(
-                f"Raw detection source does not exist: {raw_source}")
-
+    tile_position_cfg = config.get('tile_position_params', {})
+    solve_tile_positions = pipeline_mode == 'pre_align' and tile_position_cfg.get('enabled', False)
+    if solve_tile_positions:
+        frame = tile_position_frame(config)
+        paths['pATHXML'] = os.path.join(
+            base_res_path, '5_analysis_report', 'tile_positions',
+            f'xml_merging_{frame}.xml')
     derived = {}
     derived['pATH_ALIGN_OFFSETS'] = os.path.join(base_res_path, "0_channel_alignment")
-    derived['pATH_DET_RES']      = raw_source or os.path.join(base_res_path, "1_tile_2d_raw")
+    derived['pATH_DET_RES']      = os.path.join(base_res_path, "1_tile_2d_raw")
     derived['pATH_DET_FILTERED'] = os.path.join(base_res_path, "1_tile_2d_filtered")
+    derived['pATH_DET_PREALIGN_FILTERED'] = os.path.join(base_res_path, "1_tile_2d_prefiltered")
     derived['pATH_DET_FUSED']    = os.path.join(base_res_path, "1_tile_2d_fused")
     derived['pATH_GLOBAL_2D']    = os.path.join(base_res_path, "2_global_2d_raw")
     derived['pATH_CHANNEL_3D']    = os.path.join(base_res_path, "3_channel_3d")
@@ -243,6 +322,10 @@ if __name__ == '__main__':
     align_settings = None
     if pipeline_mode == 'pre_align':
         align_settings = resolve_align_settings(config, routing_config)
+        align_settings['input_stage'] = 'filtered_2d_v1'
+        align_settings['filter_params'] = {
+            ch['id']: resolve_filter_params(config, ch) for ch in routing_config
+        }
         validate_measurement_source(derived['pATH_ALIGN_OFFSETS'], align_settings)
         check_align_settings(derived['pATH_ALIGN_OFFSETS'], align_settings)
         validate_stitching_xml_frame(paths.get('pATHXML'), align_settings['stitching_reference_channel'])
@@ -315,11 +398,11 @@ if __name__ == '__main__':
             tasks_to_run.append((i, path, config))
 
     if tasks_to_run:
-        if raw_source:
+        if start_from_stage >= 2:
             raise FileNotFoundError(
-                f"Read-only raw detection source {raw_source} is missing "
-                f"{len(tasks_to_run)} tile(s); complete Stage 2 in its original "
-                "result directory before reusing it")
+                f"start_from_stage={start_from_stage} reuses raw detections in "
+                f"{derived['pATH_DET_RES']}; {len(tasks_to_run)} tile(s) have missing "
+                "CSV files. Complete Stage 2 before resuming.")
         num_gpus = torch.cuda.device_count()
         num_processes = max(1, num_gpus)
         logging.info(f"阶段 2: 发现 {len(tasks_to_run)} 个缺失结果，启动 {num_processes} 个进程 ({num_gpus} GPU)...")
@@ -337,8 +420,18 @@ if __name__ == '__main__':
     # 阶段 2.5: 点云通道对齐 (仅 pre_align 模式)
     # ==========================================
     if pipeline_mode == 'pre_align':
+        prepare_alignment_inputs(
+            config, [os.path.basename(p) for p in pATHTILE_all],
+            detect_routing_config, derived['pATH_DET_RES'],
+            derived['pATH_DET_PREALIGN_FILTERED'])
+
+    if pipeline_mode == 'pre_align':
         align_done_flag = os.path.join(derived['pATH_ALIGN_OFFSETS'], "_align_done.flag")
-        if os.path.exists(align_done_flag):
+        if (os.path.exists(align_done_flag) and all(
+                tile_alignment_done(os.path.basename(p),
+                                    derived['pATH_DET_PREALIGN_FILTERED'],
+                                    derived['pATH_ALIGN_OFFSETS'], routing_config)
+                for p in pATHTILE_all)):
             logging.info("✔️ Checkpoint 2.5 达成: 通道点云对齐已完成，直接读取对齐结果。")
         else:
             logging.info("阶段 2.5: 开始点云通道对齐 (pre_align 模式)...")
@@ -350,12 +443,12 @@ if __name__ == '__main__':
 
             # 已完成的 tile 直接跳过（offsets JSON 是最后写的完成标记，另核对 CSV 行数）
             todo = [p for p in pATHTILE
-                    if not tile_alignment_done(os.path.basename(p), derived['pATH_DET_RES'],
+                    if not tile_alignment_done(os.path.basename(p), derived['pATH_DET_PREALIGN_FILTERED'],
                                                derived['pATH_ALIGN_OFFSETS'], routing_cfg_align)]
             n_workers = align_worker_count(pre_align_cfg, len(todo))
             logging.info(f"  [2.5] {len(pATHTILE) - len(todo)} 个 tile 已完成，剩余 {len(todo)} 个，"
                          f"{n_workers} 个 CPU 进程并行（纯 CPU 计算，不占 GPU）")
-            missing_csvs = run_align_pool(todo, n_workers, derived['pATH_DET_RES'],
+            missing_csvs = run_align_pool(todo, n_workers, derived['pATH_DET_PREALIGN_FILTERED'],
                                           derived['pATH_ALIGN_OFFSETS'], routing_cfg_align, align_settings)
 
             if missing_csvs:
@@ -369,9 +462,8 @@ if __name__ == '__main__':
 
     # ==========================================
     # 阶段 2.6: 双曝光强度融合 (Dual-Intensity Fusion)
-    # 输入: 0_channel_alignment (pre_align) 或 1_tile_2d_raw (post_align) —— 与 Stage 2.75 相同的
-    #       原始来源，在过滤之前完成两个曝光的融合。
-    # 输出: 1_tile_2d_fused/{tile}_{primary_id}_result.csv （落在 Stage 2.75 期望主通道数据的位置）
+    # Input: aligned filtered CSVs (pre_align) or raw CSVs (post_align).
+    # Fusion feeds the final filtered tile directory used by Stage 3.
     # ==========================================
     if pipeline_mode == 'pre_align':
         validate_alignment_frame(
@@ -394,10 +486,12 @@ if __name__ == '__main__':
 
         _fusion_done = all(
             os.path.exists(os.path.join(_fusion_dst, f"{tn}_{ch['id']}_result.csv"))
+            and os.path.getmtime(os.path.join(_fusion_dst, f"{tn}_{ch['id']}_result.csv"))
+                >= max(os.path.getmtime(os.path.join(_fusion_src, f"{tn}_{cid}_result.csv"))
+                       for cid in (ch['id'], ch['second_intensity_id']))
             for tn in _tile_names_all
             for ch in _de_channels
         )
-
         if _fusion_done:
             logging.info("✔️ Checkpoint 2.6 达成: 融合后 tile CSV 已全部存在。")
         else:
@@ -409,7 +503,10 @@ if __name__ == '__main__':
                     ch_id = ch['id']
                     second_id = ch['second_intensity_id']
                     out_csv = os.path.join(_fusion_dst, f"{_tn}_{ch_id}_result.csv")
-                    if os.path.exists(out_csv):
+                    if (os.path.exists(out_csv) and
+                            os.path.getmtime(out_csv) >= max(
+                                os.path.getmtime(os.path.join(_fusion_src, f"{_tn}_{cid}_result.csv"))
+                                for cid in (ch_id, second_id))):
                         continue
                     low_csv  = os.path.join(_fusion_src, f"{_tn}_{ch_id}_result.csv")
                     high_csv = os.path.join(_fusion_src, f"{_tn}_{second_id}_result.csv")
@@ -423,7 +520,7 @@ if __name__ == '__main__':
                     fused_df, n_low, n_high, n_fused = fuse_dual_intensity_2d(
                         low_df, high_df, iou_thresh=ch.get('fusion_iou_thresh', 0.3)
                     )
-                    fused_df.to_csv(out_csv, index=False)
+                    atomic_write_csv(fused_df, out_csv)
 
                     n_matched = n_low + n_high - n_fused
                     _agg[ch_id]['low']   += n_low
@@ -454,11 +551,25 @@ if __name__ == '__main__':
 
 
     # ==========================================
-    # Stage 2.75: mandatory tile-level filtering.
-    # Stage 3 consumes only this directory; raw output is never passed through.
+    # Stage 2.75: publish filtered, aligned tile CSVs for Stage 3.
+    # Pre-align copies already-filtered single channels; fused channels are filtered here.
     # ==========================================
+    _filter_params_by_channel = {
+        ch['id']: resolve_filter_params(config, ch) for ch in routing_config
+    }
+    _filter_signature = {
+        'pipeline_mode': pipeline_mode,
+        'input_stage': 'aligned_filtered_v1' if pipeline_mode == 'pre_align' else 'raw_v1',
+        'params': _filter_params_by_channel,
+    }
     _filter_dst = derived['pATH_DET_FILTERED']
     os.makedirs(_filter_dst, exist_ok=True)
+    _filter_settings_file = os.path.join(_filter_dst, "_filter_settings.json")
+    try:
+        with open(_filter_settings_file, encoding="utf-8") as handle:
+            _same_filter_settings = json.load(handle) == _filter_signature
+    except (OSError, ValueError):
+        _same_filter_settings = False
     _tile_names_all = [os.path.split(p)[-1] for p in pATHTILE_all]
     _expected_filter_inputs = [
         (_tn, _ch, source_dir_for_channel(derived, pipeline_mode, _ch))
@@ -476,8 +587,10 @@ if __name__ == '__main__':
             f"missing {len(_missing_sources)} file(s):\n  {preview}"
         )
 
-    _filter_done = bool(_expected_filter_inputs) and all(
+    _filter_done = _same_filter_settings and bool(_expected_filter_inputs) and all(
         os.path.isfile(os.path.join(_filter_dst, f"{_tn}_{_ch['id']}_result.csv"))
+        and os.path.getmtime(os.path.join(_filter_dst, f"{_tn}_{_ch['id']}_result.csv"))
+            >= os.path.getmtime(os.path.join(_src, f"{_tn}_{_ch['id']}_result.csv"))
         for _tn, _ch, _src in _expected_filter_inputs
     )
     if _filter_done:
@@ -489,9 +602,15 @@ if __name__ == '__main__':
             _ch_id = _ch['id']
             _in_csv = os.path.join(_src, f"{_tn}_{_ch_id}_result.csv")
             _out_csv = os.path.join(_filter_dst, f"{_tn}_{_ch_id}_result.csv")
-            if os.path.isfile(_out_csv):
+            if (_same_filter_settings and os.path.isfile(_out_csv) and
+                    os.path.getmtime(_out_csv) >= os.path.getmtime(_in_csv)):
                 continue
-            _params = resolve_filter_params(config, _ch)
+            if pipeline_mode == 'pre_align' and not _ch.get('double_exposure'):
+                part = _out_csv + '.part'
+                shutil.copyfile(_in_csv, part)
+                os.replace(part, _out_csv)
+                continue
+            _params = _filter_params_by_channel[_ch_id]
             _filtered_df, _stats = filter_detection_df(
                 pd.read_csv(_in_csv), _params, return_stats=True,
                 context=f"{_in_csv} ({_ch_id})",
@@ -504,6 +623,10 @@ if __name__ == '__main__':
                 _stats["removed_total"], _stats["removed"]["score_min"], _params,
             )
         logging.info("[2.75] filtered %s box(es).", _n_filtered_total)
+        part = _filter_settings_file + ".part"
+        with open(part, "w", encoding="utf-8") as handle:
+            json.dump(_filter_signature, handle, indent=2)
+        os.replace(part, _filter_settings_file)
 
     pATH_SRC_CSV = _filter_dst
 
@@ -557,10 +680,23 @@ if __name__ == '__main__':
     # 可选停止点：tile 级阶段（检测 / 2.5 对齐 / 2.6 融合 / 2.75 过滤 / 2.8 直方图）都不需要
     # TeraStitcher XML。拼接还没做完的样本设 stop_before_stitching=true 先跑到这里；
     # 拼接完成后改回 false 重跑，前面各阶段按 checkpoint 自动跳过，从 Stage 3 继续。
-    # ==========================================
+    # Stage 2.9: optionally solve tile geometry and publish XMLs before Stage 3.
+    # The stop point below leaves the generated XMLs ready for image merging.
+    if solve_tile_positions:
+        report_dir = os.path.join(derived['pATH_REPORT'], 'tile_positions')
+        solver_script = os.path.join(project_root, 'scripts', 'solve_tile_positions.py')
+        frame_xml, recomputed = run_tile_position_stage(
+            config, os.path.abspath(args.config), base_res_path,
+            derived['pATH_DET_PREALIGN_FILTERED'], derived['pATH_ALIGN_OFFSETS'],
+            report_dir, [os.path.basename(p) for p in pATHTILE_all],
+            routing_config, solver_script)
+        paths['pATHXML'] = frame_xml
+        logging.info("Stage 2.9 tile positions %s: %s",
+                     "computed" if recomputed else "reused", frame_xml)
+
     if config.get('stop_before_stitching', False):
-        logging.info("🛑 stop_before_stitching=true：tile 级阶段（检测/对齐/过滤）已完成，"
-                     "在需要 XML 的全局拼接之前退出。拼接完成后改为 false 重跑即可。")
+        logging.info("stop_before_stitching=true: tile stages and enabled tile "
+                     "position solving are complete; exiting before Stage 3.")
         sys.exit(0)
 
     # 加载 TeraStitcher XML
@@ -626,6 +762,8 @@ if __name__ == '__main__':
     # ==========================================
     # 阶段 3: 线性 Checkpoint - 全局拼接与 Z-Linker共定位
     # ==========================================
+    validate_global_checkpoints(
+        derived, [os.path.basename(p) for p in pATHTILE_all], routing_config)
     bbox_path = os.path.join(derived['pATH_COLOCALIZATION'], "coloc_result.csv")
     final_results = None
 

@@ -14,7 +14,7 @@ A. TeraStitcher 自评（只要 XML）
    注意：nccPeak / reliability 的绝对值受图像内容影响（稠密核信号天然偏高），不宜跨通道直接比，
    replaced 比例和 comp_std 更可比。
 
-B. 接缝残差（需要 XML + 1_tile_2d_raw 检测结果）——独立于 TeraStitcher 的检验
+B. 接缝残差（需要 XML + 1_tile_2d_prefiltered 检测结果）——独立于 TeraStitcher 的检验
    相邻 tile 重叠区里，同一个细胞在两个 tile 各被检测一次。只取重叠区的检测做轻量 z-link，
    用 XML 把两边的 3D 细胞质心放到全局坐标，先用差值直方图找粗略平移，再做互为最近邻配对，
    配对差值的中位数 (B − A) 就是这条接缝的拼接误差，理想值为 0。
@@ -607,7 +607,7 @@ def parse_args():
                     help='逗号分隔的通道：先用对齐偏移换到每份 XML 的通道坐标系再测接缝（B 部分）')
     ap.add_argument('--config', default=None, help='默认 <results_dir>/runtime_config.json')
     ap.add_argument('--det-dir', default=None,
-                    help='原始（未对齐）检测 CSV 目录，默认 <results_dir>/1_tile_2d_raw')
+                    help='原始（未对齐）检测 CSV 目录，默认 <results_dir>/1_tile_2d_prefiltered')
     ap.add_argument('--out-dir', default=None,
                     help='默认 <results_dir>/5_analysis_report/stitch_compare')
     ap.add_argument('--tile-size', type=int, default=None, help='tile 边长 px，默认读 config 的 tILESIZE')
@@ -648,7 +648,10 @@ def main():
     out_dir = args.out_dir or (os.path.join(results_dir, '5_analysis_report', 'stitch_compare')
                                if results_dir else os.path.join(sample_dir, 'stitch_compare'))
     os.makedirs(out_dir, exist_ok=True)
-    det_dir = args.det_dir or (os.path.join(results_dir, '1_tile_2d_raw') if results_dir else None)
+    default_csv_dir = ('1_tile_2d_prefiltered'
+                       if config.get('pipeline_mode') == 'pre_align'
+                       else '1_tile_2d_filtered')
+    det_dir = args.det_dir or (os.path.join(results_dir, default_csv_dir) if results_dir else None)
     offsets = load_offsets(os.path.join(results_dir, '0_channel_alignment') if results_dir else None)
 
     warns = []

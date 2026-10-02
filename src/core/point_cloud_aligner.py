@@ -1197,7 +1197,8 @@ def tile_alignment_done(tile_name, det_dir, align_dir, routing):
     offsets JSON 最后写，是完成标记；另外核对每个通道的对齐 CSV 与原始 CSV 行数一致
     （apply_shift_to_csv 不增删行），防止旧版本流程先写 JSON、CSV 写到一半被杀的情况被当成已完成。
     """
-    if not os.path.isfile(os.path.join(align_dir, f"{tile_name}_offsets.json")):
+    offsets_file = os.path.join(align_dir, f"{tile_name}_offsets.json")
+    if not os.path.isfile(offsets_file):
         return False
     primary = {ch['id'] for ch in routing}
     for cid in _aligned_channel_ids(routing):
@@ -1207,7 +1208,11 @@ def tile_alignment_done(tile_name, det_dir, align_dir, routing):
             if cid in primary:
                 return False   # 让 align_tile 重跑并把缺失报出来，而不是悄悄当成已完成
             continue
-        if not os.path.isfile(out_csv) or _count_lines(in_csv) != _count_lines(out_csv):
+        if os.path.getmtime(offsets_file) < os.path.getmtime(in_csv):
+            return False
+        if (not os.path.isfile(out_csv)
+                or os.path.getmtime(out_csv) < os.path.getmtime(in_csv)
+                or _count_lines(in_csv) != _count_lines(out_csv)):
             return False
     return True
 

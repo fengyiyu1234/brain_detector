@@ -126,7 +126,7 @@ def list_tiles(align_dir):
     return sorted(f[:-len(suffix)] for f in os.listdir(align_dir) if f.endswith(suffix))
 
 
-def build_tile_vol_lists(raw_dir, tile_name, routing, settings):
+def build_tile_vol_lists(filtered_dir, tile_name, routing, settings):
     """
     与 Stage 2.5 同样的方式：每个通道读原始检测 CSV → 轻量 z-link → vol_list，
     并按同样的口径估 z_center（所有通道全部 3D 细胞 cz 的中位数）。
@@ -134,7 +134,7 @@ def build_tile_vol_lists(raw_dir, tile_name, routing, settings):
     per_ch, z_all = {}, []
     for ch in routing:
         cid, ctype = ch['id'], ch.get('type', 'soma')
-        csv_path = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
+        csv_path = os.path.join(filtered_dir, f"{tile_name}_{cid}_result.csv")
         if not os.path.isfile(csv_path):
             per_ch[cid] = []
             continue
@@ -273,7 +273,7 @@ def process_tile(tile_name, params):
     with open(offsets_path, encoding='utf-8') as f:
         offsets = json.load(f)
 
-    per_ch, z_center = build_tile_vol_lists(params['raw_dir'], tile_name, routing, settings)
+    per_ch, z_center = build_tile_vol_lists(params['filtered_dir'], tile_name, routing, settings)
     if z_center is None:
         return rows, [f"{tile_name}: 所有通道都没有 3D 细胞，跳过"]
     bounds = _cells_bounds(per_ch)
@@ -525,7 +525,7 @@ def main():
 
     params = {
         'settings': settings, 'routing': routing, 'align_dir': align_dir,
-        'raw_dir': os.path.join(results_dir, '1_tile_2d_raw'),
+        'filtered_dir': os.path.join(results_dir, '1_tile_2d_prefiltered'),
         'sweep': ((args.xy_range, args.xy_step), (args.xy_range, args.xy_step),
                   (args.z_range, args.z_step)),
         'regions_per_tile': args.regions_per_tile, 'xy_size': args.xy_size, 'z_size': args.z_size,

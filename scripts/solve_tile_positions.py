@@ -61,7 +61,7 @@ model='free' 则是每个通道各解各的（不加平滑约束），留作对�
 
 输入
 ----
-`1_tile_2d_raw/` 里的逐 tile 检测 CSV，以及 tile 目录名（台面坐标，单位 0.1 µm，
+`1_tile_2d_prefiltered/` 里的逐 tile 检测 CSV，以及 tile 目录名（台面坐标，单位 0.1 µm，
 见 src/utils/io.STAGE_UNIT_UM）当初值。**不需要任何 TeraStitcher XML。**
 
 输出（默认 <results_dir>/5_analysis_report/tile_positions/）
@@ -90,6 +90,7 @@ model='free' 则是每个通道各解各的（不加平滑约束），留作对�
 import argparse
 import json
 import os
+import shutil
 import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -740,6 +741,39 @@ def write_channel_xml(template_path, out_path, tiles, positions, common_origin, 
     return n_set, missing
 
 
+def channel_xml_positions(pos_df, frame, channel):
+    """Use seam geometry plus the global channel translation in frame coordinates."""
+    p_frame = np.column_stack([pos_df[f'P_{frame}_{ax}'].to_numpy() for ax in AXES])
+    p_channel = np.column_stack([pos_df[f'P_{channel}_{ax}'].to_numpy() for ax in AXES])
+    if channel == frame:
+        return p_frame
+    cell_shift = np.column_stack([pos_df[f's_{channel}_{ax}'].to_numpy() for ax in AXES])
+    constant = np.median(cell_shift - (p_channel - p_frame), axis=0)
+    return p_channel + constant
+
+
+def source_xml_template(channel_dir, fallback=None):
+    for name in ('xml_merging.original.xml', 'xml_merging.xml', 'xml_import.xml'):
+        candidate = os.path.join(channel_dir or '', name)
+        if channel_dir and os.path.isfile(candidate):
+            return candidate
+    return fallback
+
+
+def publish_channel_xml(report_xml, channel_dir, template):
+    """Keep the source XML once and atomically publish the solved layout."""
+    if not channel_dir or not os.path.isdir(channel_dir):
+        raise FileNotFoundError(f"Original channel image directory missing: {channel_dir}")
+    target = os.path.join(channel_dir, 'xml_merging.xml')
+    backup = os.path.join(channel_dir, 'xml_merging.original.xml')
+    if not os.path.isfile(backup):
+        shutil.copy2(template, backup)
+    staged = target + '.part'
+    shutil.copyfile(report_xml, staged)
+    os.replace(staged, target)
+    return target
+
+
 def write_aligned(out_dir, tiles, shifts, det_dir, tile_dirs, routing, mark_done):
     """
     按 0_channel_alignment 的格式写偏移 JSON + 平移后的检测 CSV。
@@ -781,7 +815,8 @@ def parse_args():
                          "per-tile offset from 0_channel_alignment and rebase it to --frame")
     ap.add_argument('--sample', required=True, help='样本根目录（或直接给 detection_results/）')
     ap.add_argument('--config', default=None, help='默认 <results_dir>/runtime_config.json')
-    ap.add_argument('--det-dir', default=None, help='原始检测 CSV 目录，默认 1_tile_2d_raw')
+    ap.add_argument('--det-dir', default=None,
+                    help='Filtered, unaligned tile CSVs in pre_align; defaults to 1_tile_2d_prefiltered')
     ap.add_argument('--out-dir', default=None,
                     help='默认 <results_dir>/5_analysis_report/tile_positions')
     ap.add_argument('--channels', default=None, help='逗号分隔；默认 config 里所有 active 通道')
@@ -834,6 +869,8 @@ def parse_args():
     ap.add_argument('--holdout-max-cells', type=int, default=300000,
                     help='held-out 对照最多用多少个核（两套偏移抽同一批，只为控制耗时/内存）')
     # 可选输出
+    ap.add_argument('--xml-into-channel-dirs', action='store_true',
+                    help='Publish solved xml_merging.xml in each original image directory')
     ap.add_argument('--write-xml', action='store_true', help='每通道写一份 xml_merging.xml')
     ap.add_argument('--xml-template', default=None,
                     help='XML 模板；默认找各通道目录下的 xml_merging.xml / xml_import.xml，'
@@ -887,7 +924,14 @@ def main():
     if frame not in channels:
         raise SystemExit(f"❌ 坐标系通道 {frame} 不在 --channels {channels} 里")
 
-    det_dir = args.det_dir or os.path.join(results_dir, '1_tile_2d_raw')
+    default_csv_dir = ('1_tile_2d_prefiltered'
+                       if config.get('pipeline_mode') == 'pre_align'
+                       else '1_tile_2d_filtered')
+    det_dir = args.det_dir or os.path.join(results_dir, default_csv_dir)
+    if not os.path.isdir(det_dir):
+        raise FileNotFoundError(
+            f"Filtered tile CSV directory does not exist: {det_dir}. "
+            "Run the detection pipeline's tile filtering stages first.")
     out_dir = args.out_dir or os.path.join(results_dir, '5_analysis_report', 'tile_positions')
     os.makedirs(out_dir, exist_ok=True)
 
@@ -924,8 +968,35 @@ def main():
     say(f"输出     : {out_dir}")
 
     # ── 接缝测量 ──
+    def csv_state(tile, channel):
+        stat = os.stat(os.path.join(det_dir, f"{tile}_{channel}_result.csv"))
+        return [stat.st_mtime_ns, stat.st_size]
+
+    source_state = {
+        'det_dir': os.path.abspath(det_dir),
+        'channels': channels,
+        'tile_files': {
+            f"{tile}_{ch}": csv_state(tile, ch)
+            for tile in tiles for ch in channels
+        },
+        'options': {
+            'tile_size': tile_size, 'n_slices': n_slices,
+            'xy_um': xy_um, 'z_um': z_um, 'channel_types': ch_types,
+            'z_link': settings['z_link'],
+            'edge_px': args.edge_px, 'win_xy': args.win_xy,
+            'win_z': args.win_z, 'bin_xy': args.bin_xy,
+            'match_z': args.match_z, 'min_matches': args.min_matches,
+            'match_xy_soma': args.match_xy_soma, 'match_xy_tf': args.match_xy_tf,
+        },
+    }
+    seam_source_file = os.path.join(out_dir, 'seams_source.json')
+    try:
+        with open(seam_source_file, encoding='utf-8') as handle:
+            same_seam_source = json.load(handle) == source_state
+    except (OSError, ValueError):
+        same_seam_source = False
     seam_csv = os.path.join(out_dir, 'seams.csv')
-    if os.path.isfile(seam_csv) and not args.redo_seams:
+    if os.path.isfile(seam_csv) and same_seam_source and not args.redo_seams:
         seams_all = add_measured(pd.read_csv(seam_csv), grid)
         say(f"\n接缝     : 复用 {seam_csv}（要重测加 --redo-seams）")
     else:
@@ -939,6 +1010,10 @@ def main():
             f"{len(channels)} 通道），{args.workers} 进程")
         seams_all = measure_seams(jobs, grid, args.workers)
         seams_all.to_csv(seam_csv, index=False)
+        part = seam_source_file + '.part'
+        with open(part, 'w', encoding='utf-8') as handle:
+            json.dump(source_state, handle, indent=2)
+        os.replace(part, seam_source_file)
 
     ok = seams_all[seams_all['status'] == 'ok'].reset_index(drop=True)
     say("\n接缝测量质量（成功的接缝）")
@@ -1295,45 +1370,37 @@ def main():
         json.dump(solution, f, indent=2, ensure_ascii=False)
 
     # ── 可选：各通道 XML ──
-    if args.write_xml:
-        say("\n写各通道 xml_merging.xml")
+    if args.write_xml or args.xml_into_channel_dirs:
+        say("Writing per-channel xml_merging.xml")
         common_origin = np.array([pos_df[f'P_{frame}_{ax}'].min() for ax in AXES])
-        ref_tmpl = args.xml_template
-        if not ref_tmpl:
-            for cand in ('xml_merging.xml', 'xml_import.xml'):
-                p = os.path.join(ch_dirs.get(ref, ''), cand)
-                if os.path.isfile(p):
-                    ref_tmpl = p
-                    break
+        ref_tmpl = args.xml_template or source_xml_template(ch_dirs.get(ref))
+        xml_jobs = []
         for ch in channels:
-            tmpl = None
-            for cand in ('xml_merging.xml', 'xml_import.xml'):
-                p = os.path.join(ch_dirs.get(ch, ''), cand)
-                if os.path.isfile(p):
-                    tmpl = p
-                    break
-            tmpl = tmpl or ref_tmpl
+            channel_dir = ch_dirs.get(ch)
+            tmpl = source_xml_template(channel_dir, ref_tmpl)
             if not tmpl:
-                say(f"  {ch:<8}跳过：找不到 XML 模板（用 --xml-template 指定）")
-                continue
+                raise FileNotFoundError(f"No XML template for {ch}; supply --xml-template")
+            if args.xml_into_channel_dirs and (not channel_dir or not os.path.isdir(channel_dir)):
+                raise FileNotFoundError(f"Original image directory missing for {ch}: {channel_dir}")
+            xml_jobs.append((ch, tmpl, channel_dir))
+        for ch, tmpl, channel_dir in xml_jobs:
             out_xml = os.path.join(out_dir, f'xml_merging_{ch}.xml')
-            P = np.column_stack([pos_df[f'P_{ch}_{ax}'].to_numpy() for ax in AXES])
+            P = channel_xml_positions(pos_df, frame, ch)
             n_set, missing = write_channel_xml(tmpl, out_xml, list(pos_df.tile), P,
-                                               common_origin, ch_dirs.get(ch, '').replace('/', '\\'))
-            note = f"，模板里有 {len(missing)} 个 tile 不在结果里" if missing else ""
-            say(f"  {ch:<8}{n_set} 个 tile ← 模板 {os.path.basename(tmpl)}"
-                f"{'（借用 ' + ref + ' 的）' if tmpl == ref_tmpl and ch != ref else ''}{note}")
-        say("  注意：TeraStitcher merge 会按各自 XML 的最小 ABS 再归一化一次，"
-            "细胞坐标必须和图像用同一份 XML 推。")
-        say(f"  细胞落在 {frame} 的坐标系里"
-            + (f"（通道对齐仍以 {ref} 为参考，只是最后换算过去）" if frame != ref else "") + "，所以：")
-        say(f"    1) 配准用的全脑图必须用 xml_merging_{frame}.xml merge（哪怕图像本身是别的通道）；")
-        say(f"    2) config 的 paths.pATHXML 指到同一份，否则流程会退回去捡通道目录里的旧 XML：")
-        say(f'       "pATHXML": "{os.path.join(out_dir, f"xml_merging_{frame}.xml")}"')
-        if frame == ref:
-            say(f"    想换个通道的几何当坐标系（比如拿 488 做配准），重跑时加 --frame <通道>。")
+                                               common_origin, (channel_dir or '').replace('/', chr(92)))
+            if missing or n_set != len(pos_df):
+                raise ValueError(f"XML template for {ch} covers {n_set}/{len(pos_df)} tiles; "
+                                 f"unmatched template tiles: {missing[:5]}")
+            say(f"  {ch}: {n_set} tiles -> {out_xml}")
+        if args.xml_into_channel_dirs:
+            for ch, _, channel_dir in xml_jobs:
+                target = publish_channel_xml(
+                    os.path.join(out_dir, f'xml_merging_{ch}.xml'), channel_dir,
+                    next(tmpl for cid, tmpl, _ in xml_jobs if cid == ch))
+                say(f"  Published {target}")
+        say(f"Stage 3 must use xml_merging_{frame}.xml for the {frame} frame.")
+        say("Channel XMLs preserve seam geometry plus global channel translation.")
 
-    # ── 可选：写 0_channel_alignment 格式 ──
     if args.write_aligned:
         aligned_dir = args.aligned_dir or os.path.join(results_dir, '0_channel_alignment_solved')
         if os.path.isdir(aligned_dir) and os.listdir(aligned_dir) and not args.force:
