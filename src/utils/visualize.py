@@ -754,16 +754,31 @@ def _load_tile_csv_shapes(csv_path, z_range=None, raw_vol=None, filt=None,
     return (list(arr), [_color(c) for c in classes], box_meta), rej_data
 
 
+def _global_rows_in_tile(df, tile_x0, tile_y0, canvas_w, canvas_h):
+    """Select global boxes intersecting the displayed tile, regardless of source tile.
+
+    tile_name records which tile supplied a detection; it does not describe every
+    tile on which that global cell is visible.
+    """
+    return df[
+        (df['x2'].astype(float) > tile_x0) &
+        (df['x1'].astype(float) < tile_x0 + canvas_w) &
+        (df['y2'].astype(float) > tile_y0) &
+        (df['y1'].astype(float) < tile_y0 + canvas_h)
+    ]
+
+
 def _load_global_csv_to_tile_shapes(csv_path, tile_name, tile_x0, tile_y0, tile_z0,
                                      z_range, canvas_w, canvas_h,
                                      raw_vol=None, filt=None,
                                      left_margin=0, top_margin=0):
     """Load a global 3D CSV (absolute x,y; tile-local 1-indexed z) → tile-local shapes.
 
-    Filters by tile_name column if present, otherwise by spatial bounding box.
+    Selects boxes by global spatial overlap, including cells sourced from neighboring tiles.
     z convention: z_local = z_csv + tile_z0 - z_range[0] - 1
-    raw_vol: optional float32 (Z,H,W) with 16-bit values for intensity filtering.
-    filt: optional shared filter params, including score_min; it filters the CSV score column.
+    filt: optional shared filter params applied to the saved box, mean, and score.
+    raw_vol and overlap-margin arguments are retained for existing callers; saved
+    global cells already have intensity values and resolved tile ownership.
     Returns ((shapes, colors, meta), (rej_shapes, rej_colors, rej_meta)).
     """
     _empty = ([], [], [])
@@ -772,15 +787,7 @@ def _load_global_csv_to_tile_shapes(csv_path, tile_name, tile_x0, tile_y0, tile_
     df = pd.read_csv(csv_path)
     if df.empty:
         return _empty, _empty
-    if 'tile_name' in df.columns:
-        df = df[df['tile_name'] == tile_name]
-    else:
-        df = df[
-            (df['x1'].astype(float) >= tile_x0) &
-            (df['x2'].astype(float) <  tile_x0 + canvas_w) &
-            (df['y1'].astype(float) >= tile_y0) &
-            (df['y2'].astype(float) <  tile_y0 + canvas_h)
-        ]
+    df = _global_rows_in_tile(df, tile_x0, tile_y0, canvas_w, canvas_h)
     if df.empty:
         return _empty, _empty
     z0 = z_range[0] if z_range is not None else 0
@@ -790,93 +797,43 @@ def _load_global_csv_to_tile_shapes(csv_path, tile_name, tile_x0, tile_y0, tile_
     df = df[(df['z_local'] >= 0) & (df['z_local'] < z1 - z0)]
     if df.empty:
         return _empty, _empty
-    n_before = len(df)
-    y1 = df['y1'].values.astype(float) - tile_y0
-    y2 = df['y2'].values.astype(float) - tile_y0
-    x1 = df['x1'].values.astype(float) - tile_x0
-    x2 = df['x2'].values.astype(float) - tile_x0
-    z  = df['z_local'].values
+    # Apply optional QC filters to the saved mean/score and box geometry.
+    # Stage 3 itself is read-only here; filtering changes only displayed rows.
+    rejected = df.iloc[0:0]
     if filt:
-        keep, comp_means = _filter_df_by_size_and_intensity(
-            x1, y1, x2, y2, z, raw_vol, filt)
-        rej_idx = np.where(~keep)[0]
-        idx     = np.where(keep)[0]
-        # Build rejected shapes
-        if len(rej_idx) > 0:
-            rx1, ry1 = x1[rej_idx], y1[rej_idx]
-            rx2, ry2 = x2[rej_idx], y2[rej_idx]
-            rz = z[rej_idx]; rn = len(rej_idx)
-            rarr = np.empty((rn, 4, 3), dtype=np.float64)
-            rarr[:, 0] = np.column_stack([rz, ry1, rx1])
-            rarr[:, 1] = np.column_stack([rz, ry1, rx2])
-            rarr[:, 2] = np.column_stack([rz, ry2, rx2])
-            rarr[:, 3] = np.column_stack([rz, ry2, rx1])
-            rdf = df.iloc[rej_idx]
-            rcls = rdf['class'].values if 'class' in rdf.columns else ['unknown'] * rn
-            rmeans = comp_means[rej_idx] if comp_means is not None else rdf['mean'].values.astype(float)
-            rej_meta = [
-                {'z': int(rz[i]), 'x1': float(rx1[i]), 'y1': float(ry1[i]),
-                 'x2': float(rx2[i]), 'y2': float(ry2[i]), 'cls': str(rcls[i]),
-                 'mean': float(rmeans[i])}
-                for i in range(rn)
-            ]
-            rej_data = (list(rarr), [_REJECTED_COLOR] * rn, rej_meta)
-        else:
-            rej_data = _empty
-        print(f"  [filter] {n_before} → {len(idx)} kept, {len(rej_idx)} rejected")
-        if not keep.any():
-            return _empty, rej_data
-        x1, y1, x2, y2, z = x1[idx], y1[idx], x2[idx], y2[idx], z[idx]
-        df    = df.iloc[idx]
-        means = comp_means[idx] if comp_means is not None else df['mean'].values.astype(float)
-    else:
-        means    = df['mean'].values.astype(float) if 'mean' in df.columns else np.zeros(n_before)
-        rej_data = _empty
-    if preview_rejected is not None and not preview_rejected.empty:
-        rejected = preview_rejected.copy()
-        rejected['z'] = rejected['z'].astype(float).astype(int) - 1
-        if z_range is not None:
-            rejected['z_local'] = rejected['z'] - z_range[0]
-            rejected = rejected[(rejected['z_local'] >= 0) & (rejected['z_local'] < z_range[1] - z_range[0])]
-            rz = rejected['z_local'].to_numpy() if not rejected.empty else np.array([])
-        else:
-            rz = rejected['z'].to_numpy() if not rejected.empty else np.array([])
-        if not rejected.empty:
-            rx1, ry1 = rejected['x1'].to_numpy(float), rejected['y1'].to_numpy(float)
-            rx2, ry2 = rejected['x2'].to_numpy(float), rejected['y2'].to_numpy(float)
-            if left_margin > 0 or top_margin > 0:
-                margin_keep = ((rx1 + rx2) / 2 >= left_margin) & ((ry1 + ry2) / 2 >= top_margin)
-                rejected, rz = rejected.iloc[np.where(margin_keep)[0]], rz[margin_keep]
-                rx1, ry1, rx2, ry2 = rx1[margin_keep], ry1[margin_keep], rx2[margin_keep], ry2[margin_keep]
-            if len(rejected):
-                rarr = np.empty((len(rejected), 4, 3), dtype=np.float64)
-                rarr[:, 0] = np.column_stack([rz, ry1, rx1]); rarr[:, 1] = np.column_stack([rz, ry1, rx2])
-                rarr[:, 2] = np.column_stack([rz, ry2, rx2]); rarr[:, 3] = np.column_stack([rz, ry2, rx1])
-                rej_data = (list(rarr), [_REJECTED_COLOR] * len(rejected), [])
-    # Margin filter: hide boxes whose center falls in the left/top tile overlap region
-    # x1/y1/x2/y2 are already tile-local (tile_x0/y0 subtracted above)
-    if left_margin > 0 or top_margin > 0:
-        cx = (x1 + x2) / 2; cy = (y1 + y2) / 2
-        m_keep = (cx >= left_margin) & (cy >= top_margin)
-        x1, y1, x2, y2 = x1[m_keep], y1[m_keep], x2[m_keep], y2[m_keep]
-        z = z[m_keep]; means = means[m_keep]
-        df = df.iloc[np.where(m_keep)[0].tolist()]
-    if len(df) == 0:
-        return _empty, rej_data
-    n = len(df)
-    arr = np.empty((n, 4, 3), dtype=np.float64)
-    arr[:, 0] = np.column_stack([z, y1, x1])
-    arr[:, 1] = np.column_stack([z, y1, x2])
-    arr[:, 2] = np.column_stack([z, y2, x2])
-    arr[:, 3] = np.column_stack([z, y2, x1])
-    classes = df['class'].values if 'class' in df.columns else ['unknown'] * n
-    box_meta = [
-        {'z': int(z[i]), 'x1': float(x1[i]), 'y1': float(y1[i]),
-         'x2': float(x2[i]), 'y2': float(y2[i]), 'cls': str(classes[i]),
-         'mean': float(means[i])}
-        for i in range(n)
-    ]
-    return (list(arr), [_color(c) for c in classes], box_meta), rej_data
+        source = df
+        params = {key: filt.get(key) for key in FILTER_KEYS}
+        df, stats = filter_detection_df(df, params, return_stats=True, context=csv_path)
+        rejected = source.loc[~source.index.isin(df.index)]
+        print(f"  [preview filter] {stats['before']} -> {stats['after']} kept; params={params}")
+
+    def _to_shapes(rows, rejected_color=False):
+        if rows.empty:
+            return _empty
+        n = len(rows)
+        x1 = rows['x1'].to_numpy(dtype=float) - tile_x0
+        y1 = rows['y1'].to_numpy(dtype=float) - tile_y0
+        x2 = rows['x2'].to_numpy(dtype=float) - tile_x0
+        y2 = rows['y2'].to_numpy(dtype=float) - tile_y0
+        z = rows['z_local'].to_numpy(dtype=int)
+        arr = np.empty((n, 4, 3), dtype=np.float64)
+        arr[:, 0] = np.column_stack([z, y1, x1])
+        arr[:, 1] = np.column_stack([z, y1, x2])
+        arr[:, 2] = np.column_stack([z, y2, x2])
+        arr[:, 3] = np.column_stack([z, y2, x1])
+        classes = rows['class'].astype(str).to_numpy() if 'class' in rows else ['unknown'] * n
+        means = rows['mean'].to_numpy(dtype=float) if 'mean' in rows else np.zeros(n)
+        meta = [
+            {'z': int(z[i]), 'x1': float(x1[i]), 'y1': float(y1[i]),
+             'x2': float(x2[i]), 'y2': float(y2[i]), 'cls': str(classes[i]),
+             'mean': float(means[i])}
+            for i in range(n)
+        ]
+        colors = ([_REJECTED_COLOR] * n if rejected_color
+                  else [_color(c) for c in classes])
+        return list(arr), colors, meta
+
+    return _to_shapes(df), _to_shapes(rejected, rejected_color=True)
 
 
 # ── Coloc helpers ─────────────────────────────────────────────────────────────
@@ -901,29 +858,11 @@ def _load_coloc_s4_shapes(coloc_csv, tile_name, z_range, s4_groups,
     needed = {'x1', 'y1', 'x2', 'y2', 'class', 'z'}
     if df.empty or not needed.issubset(df.columns):
         return None
-    # Primary filter: tile_name column
-    if 'tile_name' in df.columns:
-        df_tile = df[df['tile_name'] == tile_name]
-    else:
-        df_tile = pd.DataFrame()
-    # Fallback: spatial bounding box filter when tile_name column is missing or unhelpful
+    if canvas_w is None or canvas_h is None:
+        raise ValueError("canvas_w and canvas_h are required for global colocalization display")
+    df_tile = _global_rows_in_tile(df, tile_x0, tile_y0, canvas_w, canvas_h)
     if df_tile.empty:
-        if canvas_w is not None and canvas_h is not None:
-            df_tile = df[
-                (df['x1'].astype(float) >= tile_x0) &
-                (df['x2'].astype(float) <  tile_x0 + canvas_w) &
-                (df['y1'].astype(float) >= tile_y0) &
-                (df['y2'].astype(float) <  tile_y0 + canvas_h)
-            ]
-            if df_tile.empty:
-                print(f"  [coloc] no rows in tile bbox "
-                      f"x=[{tile_x0},{tile_x0+canvas_w}) y=[{tile_y0},{tile_y0+canvas_h})")
-                return []
-            print(f"  [coloc] tile_name filter skipped (CSV has no usable tile_name); "
-                  f"spatial fallback: {len(df_tile)} rows")
-        else:
-            print(f"  [coloc] no rows for tile_name='{tile_name}' and no canvas size for spatial filter")
-            return []
+        return []
     df = df_tile.copy()
     z0 = z_range[0] if z_range is not None else 0
     z1 = z_range[1] if z_range is not None else float('inf')
@@ -960,18 +899,8 @@ def _load_coloc_s4_shapes(coloc_csv, tile_name, z_range, s4_groups,
         y2v = df_grp['y2'].values.astype(float) - tile_y0
         x1v = df_grp['x1'].values.astype(float) - tile_x0
         x2v = df_grp['x2'].values.astype(float) - tile_x0
-        # Margin filter on tile-local coordinates
-        if left_margin > 0 or top_margin > 0:
-            cx = (x1v + x2v) / 2; cy = (y1v + y2v) / 2
-            m_keep = (cx >= left_margin) & (cy >= top_margin)
-            z_col  = z_col[m_keep]
-            y1v, y2v = y1v[m_keep], y2v[m_keep]
-            x1v, x2v = x1v[m_keep], x2v[m_keep]
-            bc       = bc.iloc[np.where(m_keep)[0].tolist()]
-            df_grp   = df_grp.iloc[np.where(m_keep)[0].tolist()]
-        if len(df_grp) == 0:
-            results.append((grp, [], [], [], []))
-            continue
+        # Stage 4 already resolves overlap ownership globally. Do not hide
+        # a cell just because its source was a neighboring tile.
         n = len(df_grp)
         arr = np.empty((n, 4, 3), dtype=np.float64)
         arr[:, 0] = np.column_stack([z_col, y1v, x1v])
@@ -1022,7 +951,7 @@ def _add_coloc_layers(viewer, coloc_csv, tile_name, z_range,
                 viewer, shapes_c, colors_c, canvas_shape,
                 dash_sizes=dash_c,
                 name=layer_name,
-                visible=False, opacity=coloc_opacity,
+                visible=True, opacity=coloc_opacity,
                 outline_width=grp.get('outline_width', outline_width),
             )
             if box_registry is not None:
@@ -1897,7 +1826,7 @@ def _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name)
 
     base_res     = paths['pATHRESULT']
     align_dir    = os.path.join(base_res, '0_channel_alignment')
-    raw_dir      = paths.get('pATH_RAW_DETECTIONS') or os.path.join(base_res, '1_tile_2d_raw')
+    raw_dir      = os.path.join(base_res, '1_tile_2d_raw')
     fused_dir    = os.path.join(base_res, '1_tile_2d_fused')
     filtered_dir = os.path.join(base_res, '1_tile_2d_filtered')
 
@@ -2147,7 +2076,12 @@ def _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name)
         tile_x0, tile_y0, tile_z0 = _get_runtime_tile_offset(context, tile_name)
         print(f"  [coloc] tile offset: x0={tile_x0}, y0={tile_y0}, z0={tile_z0}")
 
-        if os.path.isfile(coloc_csv):
+        coloc_source = vis_cfg.get('coloc_source', 'preview')
+        if coloc_source not in ('preview', 'saved'):
+            raise ValueError("coloc_source must be 'preview' or 'saved'")
+        if coloc_source == 'saved':
+            if not os.path.isfile(coloc_csv):
+                raise FileNotFoundError(f"Saved colocalization result not found: {coloc_csv}")
             _add_coloc_layers(
                 viewer, coloc_csv, tile_name, z_range,
                 tile_x0, tile_y0, tile_z0, canvas_shape,
@@ -2155,7 +2089,7 @@ def _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name)
                 left_margin=left_m, top_margin=top_m,
             )
         else:
-            print("\n[coloc] coloc_result.csv not found, running in-memory...")
+            print("\n[coloc] Preview from the same filtered CSVs as [zlinked]...")
             try:
                 coloc_vols = _run_tile_colocalization(
                     per_ch_vol_lists,
@@ -2180,7 +2114,7 @@ def _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name)
                                 viewer, shapes_c, colors_c, canvas_shape,
                                 dash_sizes=dash_c,
                                 name=layer_name_c,
-                                visible=False, opacity=coloc_opacity,
+                                visible=True, opacity=coloc_opacity,
                                 outline_width=grp.get('outline_width', outline_width),
                             )
                             for m in meta_c:
@@ -2337,7 +2271,7 @@ def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
     coloc_opacity = vis_cfg.get('coloc_opacity', 0.9)
 
     base_res     = paths['pATHRESULT']
-    raw_dir      = paths.get('pATH_RAW_DETECTIONS') or os.path.join(base_res, '1_tile_2d_raw')
+    raw_dir      = os.path.join(base_res, '1_tile_2d_raw')
     filtered_dir = os.path.join(base_res, '1_tile_2d_filtered')
     fused_dir    = os.path.join(base_res, '1_tile_2d_fused')
     s3_dir    = os.path.join(base_res, '3_channel_3d')
