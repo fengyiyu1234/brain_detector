@@ -2,13 +2,12 @@
 """
 Brain-detector unified single-tile visualizer.
 
-Reads config/vis_config.json and launches napari in one of two modes:
+Reads config/vis_config.json and launches napari in one of three modes:
 
   mode: "prealign"
-    Pre-alignment QC for one tile.  Images are shifted by channel-alignment
-    offsets; detection boxes come from 0_channel_alignment/ (shifted coords).
-    Optional [raw] boxes show pre-alignment positions for comparison.
-    [zlinked] and [coloc] are computed in-memory.
+    Saved-result QC in tile-local or global coordinates. Images use saved
+    channel offsets; 2D, 3D, and colocalization layers read pipeline files.
+    No z-linking or colocalization runs in the GUI.
 
   mode: "post"
     Post-pipeline results for one tile.  Raw (unshifted) images.
@@ -225,7 +224,9 @@ def load_frame_volume(tile_dir, frame_z_range, shift=(0, 0, 0), contrast_pct=(0.
     dx, dy, dz = (int(v) for v in shift)
     frame_z0, frame_z1 = frame_z_range
     raw_z0 = max(0, frame_z0 - dz)
-    raw_z1 = min(len(_list_tiffs(tile_dir)), frame_z1 - dz)
+    raw_z1 = max(0, min(len(_list_tiffs(tile_dir)), frame_z1 - dz))
+    if raw_z1 <= raw_z0:
+        return None, None
     source, climits = load_volume(tile_dir, (raw_z0, raw_z1), contrast_pct)
     if source is None:
         return None, None
@@ -1686,7 +1687,7 @@ def _load_second_intensity_image(ch, paths, anchor_dir, tile_path, z_range,
     return second_id, vol, climits, ch['id']
 
 
-# ── Mode: prealign ────────────────────────────────────────────────────────────
+# ── Tile-local 2D view ────────────────────────────────────────────────────────────
 
 def _run_2d(vis_cfg, paths, routing_config, tile_path, tile_name):
     """Show aligned raw or filtered tile-local detections without XML or z-linking."""
@@ -1801,463 +1802,6 @@ def _run_2d(vis_cfg, paths, routing_config, tile_path, tile_name):
         viewer.mouse_drag_callbacks.append(_on_click)
     viewer.reset_view()
 
-
-def _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name):
-    zl_cfg  = vis_cfg.get('z_linker', {})
-    zl_soma = zl_cfg.get('soma', {})
-    zl_tf   = zl_cfg.get('tf',   {})
-    soma_ch_ids = [ch['id'] for ch in routing_config if ch.get('type', 'soma') == 'soma']
-    tf_ch_ids   = [ch['id'] for ch in routing_config if ch.get('type') == 'tf']
-
-    contrast_pct = tuple(vis_cfg.get('contrast_pct', [0.1, 99.9]))
-    no_images    = vis_cfg.get('no_images',     False)
-    show_before  = vis_cfg.get('show_before',   False)
-    show_spheres = vis_cfg.get('spheres',       False)
-    show_zlinked = vis_cfg.get('show_zlinked',  False)
-    show_coloc   = vis_cfg.get('show_coloc',    False)
-    outline_width      = vis_cfg.get('outline_width',      2)
-    aligned_opacity    = vis_cfg.get('aligned_opacity',    0.8)
-    raw_opacity        = vis_cfg.get('raw_opacity',        0.6)
-    zlinked_opacity    = vis_cfg.get('zlinked_opacity',    0.7)
-    coloc_opacity      = vis_cfg.get('coloc_opacity',      0.9)
-    sphere_opacity     = vis_cfg.get('sphere_opacity',     0.6)
-    sphere_raw_opacity = vis_cfg.get('sphere_raw_opacity', 0.3)
-    sphere_colors_cfg  = vis_cfg.get('sphere_colors',      {})
-
-    base_res     = paths['pATHRESULT']
-    align_dir    = os.path.join(base_res, '0_channel_alignment')
-    raw_dir      = os.path.join(base_res, '1_tile_2d_raw')
-    fused_dir    = os.path.join(base_res, '1_tile_2d_fused')
-    filtered_dir = os.path.join(base_res, '1_tile_2d_filtered')
-
-    anchor_ch  = routing_config[0]
-    anchor_dir = os.path.abspath(paths[anchor_ch['dir_key']])
-    _, tile_paths = listTile(anchor_dir)
-
-    print(f"\nTile: {tile_name}")
-
-    z_range      = _resolve_z_range(vis_cfg, tile_path)
-    canvas_shape = _canvas_shape_from_tile(tile_path, z_range)
-    canvas_z, canvas_h, canvas_w = canvas_shape
-    print(f"Z-range: {z_range[0]} – {z_range[1]} ({z_range[1] - z_range[0]} slices)\n")
-
-    offsets = context.offsets_for_tile(tile_name)
-    context.print_provenance(tile_name, offsets)
-
-    print("=== Channel alignment summary ===")
-    for ch in routing_config:
-        cid = ch['id']
-        if cid in offsets:
-            o   = offsets[cid]
-            iou = o.get('iou_score')
-            tag = " [REFERENCE]" if (o['dx'] == 0 and o['dy'] == 0
-                                      and o['dz'] == 0 and iou is not None
-                                      and iou >= 1.0) else ""
-            shift_str = f"  [{cid:8s}]  shift=({o['dx']:+d}, {o['dy']:+d}, {o['dz']:+d})"
-            iou_str = f"   iou={iou:.4f}{tag}" if iou is not None else "   iou=N/A"
-            print(shift_str + iou_str)
-        else:
-            print(f"  [{cid:8s}]  (no offset data)")
-    print("=================================\n")
-
-    # ── Z-linking ─────────────────────────────────────────────────────────────
-    need_zlink = show_spheres or show_zlinked or show_coloc
-    per_ch_vol_lists = {}
-    if need_zlink:
-        print("Running z-linking in memory...")
-        for ch in routing_config:
-            cid   = ch['id']
-            ctype = ch.get('type', 'soma')
-            filtered_csv = os.path.join(filtered_dir, f"{tile_name}_{cid}_result.csv")
-            zl_p = zl_soma if ctype == 'soma' else zl_tf
-            vol_list = _run_zlink_for_csv(
-                filtered_csv, z_range,
-                iou_thresh=zl_p.get('iou_thresh', 0.35),
-                min_z_layers=zl_p.get('min_z_layers', 1),
-                max_cell_z_span=zl_p.get('max_cell_z_span', 5),
-                max_z_gap=zl_p.get('max_z_gap', 0),
-                ch_id=cid,
-            )
-            per_ch_vol_lists[cid] = vol_list
-            print(f"  [{cid}] z-linked: {len(vol_list)} cells")
-        print()
-
-    # ── Build merged soma/TF vol lists for Shift+click coloc trace ────────────
-    _debug_soma_vols = []
-    _debug_all_tf    = []
-    _debug_cp        = {}
-    if per_ch_vol_lists:
-        _debug_soma_vols, _debug_tf_dict = _build_merged_soma_vols(
-            per_ch_vol_lists, soma_ch_ids, tf_ch_ids, zl_soma)
-        _debug_all_tf = [dict(c, _cid=_tf_cid)
-                         for _tf_cid, _vols in _debug_tf_dict.items()
-                         for c in _vols]
-        _debug_cp = {
-            'z_pad':                 zl_tf.get('containment_z_pad', 2),
-            'xy_margin':             zl_tf.get('containment_xy_margin', 0),
-            'max_center_dist_ratio': zl_tf.get('max_center_dist_ratio', 0.5),
-        }
-        print(f"[trace] Shift+click any [coloc] box to trace.  "
-              f"({len(_debug_soma_vols)} soma, {len(_debug_all_tf)} TF)")
-
-    # ── Image layers ──────────────────────────────────────────────────────────
-    prepared_images = []
-    if not no_images:
-        for ch in routing_config:
-            cid      = ch['id']
-            ch_base  = os.path.abspath(paths[ch['dir_key']])
-            tile_dir = os.path.join(ch_base, os.path.relpath(tile_path, anchor_dir))
-            print(f"[img] Loading {cid}  ({tile_dir}) ...")
-            vol, climits = load_volume(tile_dir, z_range=z_range, contrast_pct=contrast_pct)
-            if vol is None:
-                print("  → not found, skipping")
-                continue
-            _check_image_contrast(climits, tile_name, cid, z_range)
-            canvas_shape = vol.shape
-            if cid in offsets:
-                o = offsets[cid]
-                dx, dy, dz = o['dx'], o['dy'], o['dz']
-                if dx != 0 or dy != 0 or dz != 0:
-                    vol = _shift_volume(vol, dx, dy, dz)
-                    print(f"  → shifted ({dx:+d}, {dy:+d}, {dz:+d})")
-            prepared_images.append((cid, vol, climits, cid))
-            print(f"  → {vol.shape}  contrast_limits={climits}")
-
-            second = _load_second_intensity_image(
-                ch, paths, anchor_dir, tile_path, z_range, contrast_pct,
-                offsets=offsets)
-            if second:
-                prepared_images.append(second)
-
-    viewer = napari.Viewer(title=f"Pre-Align QC — {tile_name}")
-    if not no_images:
-        img_layers = []
-        for cid, vol, climits, display_id in prepared_images:
-            img_layer = viewer.add_image(vol, name=f"[img] {cid}",
-                                         contrast_limits=climits, **_ch_vis(display_id))
-            img_layer.contrast_limits_range = (0, 65535)
-            img_layers.append((cid, img_layer))
-        _add_contrast_panel(viewer, img_layers)
-        if img_layers:
-            _add_current_image_name(viewer, tile_path, z_range,
-                                    offsets[routing_config[0]['id']]['dz'],
-                                    source_range=z_range)
-
-    box_registry = []  # {z, x1, y1, x2, y2, cls, layer_name} — populated below
-
-    # ── Load raw volumes for intensity filtering (prealign: apply shift) ──────
-    filter_cfg = vis_cfg.get('filter', {})
-    raw_vols   = {}
-    for ch in routing_config:
-        cid = ch['id']
-        if not _needs_raw_vol(filter_cfg, ch):
-            continue
-        ch_base  = os.path.abspath(paths[ch['dir_key']])
-        tile_dir = os.path.join(ch_base, os.path.relpath(tile_path, anchor_dir))
-        rv = load_raw_volume(tile_dir, z_range)
-        if rv is not None and cid in offsets:
-            o = offsets[cid]
-            if o['dx'] or o['dy'] or o['dz']:
-                rv = _shift_volume(rv, o['dx'], o['dy'], o['dz'])
-        if rv is not None:
-            raw_vols[cid] = rv
-            active = [k for k, v in (_get_ch_filter(filter_cfg, ch) or {}).items() if v is not None]
-            print(f"[raw_vol] [{cid}] loaded {rv.shape} — active filter: {active}")
-
-    # ── [aligned] & [raw] boxes ───────────────────────────────────────────────
-    left_m, top_m = _get_tile_overlap_margins(anchor_dir, tile_name, canvas_w, canvas_h)
-    if left_m > 0 or top_m > 0:
-        print(f"[overlap] hiding boxes in left={left_m}px / top={top_m}px margin")
-    _add_margin_overlay(viewer, canvas_shape, left_m, top_m)
-    for ch in routing_config:
-        cid     = ch['id']
-        iou = offsets.get(cid, {}).get('iou_score')
-        iou_str = f"  iou={iou:.3f}" if iou is not None else "  iou=N/A" if cid in offsets else ""
-        aligned_csv = os.path.join(fused_dir if ch.get('double_exposure') else align_dir, f"{tile_name}_{cid}_result.csv")
-        ch_filt = _get_ch_filter(filter_cfg, ch)
-        (shapes_a, colors_a, meta_a), (rej_sa, rej_ca, _) = _load_tile_csv_shapes(
-            aligned_csv, z_range,
-            raw_vol=raw_vols.get(cid), filt=ch_filt,
-            left_margin=left_m, top_margin=top_m)
-        if shapes_a:
-            layer_name_a = f"[aligned] {cid}{iou_str}"
-            _add_labels_layer(
-                viewer, shapes_a, colors_a, canvas_shape,
-                name=layer_name_a,
-                visible=False, opacity=aligned_opacity, outline_width=outline_width,
-            )
-            for m in meta_a:
-                box_registry.append({**m, 'layer_name': layer_name_a})
-            print(f"[aligned] {cid}: {len(shapes_a)} boxes")
-        if rej_sa:
-            _add_labels_layer(
-                viewer, rej_sa, rej_ca, canvas_shape,
-                name=f"[aligned rejected] {cid}",
-                visible=False, opacity=0.5, outline_width=outline_width,
-            )
-            print(f"[aligned rejected] {cid}: {len(rej_sa)} boxes (hidden)")
-        if show_before:
-            raw_csv = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
-            (shapes_r, colors_r, meta_r), _ = _load_tile_csv_shapes(
-                raw_csv, z_range,
-                raw_vol=raw_vols.get(cid), filt=ch_filt,
-                left_margin=left_m, top_margin=top_m)
-            if shapes_r:
-                layer_name_r = f"[raw] {cid}"
-                _add_labels_layer(
-                    viewer, shapes_r, colors_r, canvas_shape,
-                    name=layer_name_r, visible=False,
-                    opacity=raw_opacity, outline_width=outline_width,
-                )
-                for m in meta_r:
-                    box_registry.append({**m, 'layer_name': layer_name_r})
-                print(f"[raw]     {cid}: {len(shapes_r)} boxes (hidden)")
-
-    # ── [zlinked] boxes ───────────────────────────────────────────────────────
-    if show_zlinked:
-        for ch in routing_config:
-            cid = ch['id']
-            shapes_z, colors_z, meta_z = _vol_list_to_center_z_shapes(
-                per_ch_vol_lists.get(cid, []), z_range)
-            if shapes_z:
-                layer_name_z = f"[zlinked] {cid}"
-                _add_labels_layer(
-                    viewer, shapes_z, colors_z, canvas_shape,
-                    name=layer_name_z, visible=False,
-                    opacity=zlinked_opacity, outline_width=outline_width,
-                )
-                for m in meta_z:
-                    box_registry.append({**m, 'layer_name': layer_name_z})
-                print(f"[zlinked] {cid}: {len(shapes_z)} cells")
-
-    # ── [spheres] ─────────────────────────────────────────────────────────────
-    if show_spheres:
-        for ch in routing_config:
-            cid   = ch['id']
-            cid_mk = channel_marker(cid)
-            color = (sphere_colors_cfg.get(cid) or sphere_colors_cfg.get(cid_mk)
-                     or SPHERE_COLORS.get(cid) or SPHERE_COLORS.get(cid_mk, _DEFAULT_SPHERE_COLOR))
-            centers, sizes = _vol_list_to_points(per_ch_vol_lists.get(cid, []), z_range)
-            if centers is not None:
-                viewer.add_points(
-                    centers, size=sizes,
-                    face_color=[color] * len(centers),
-                    border_width=0, opacity=sphere_opacity,
-                    n_dimensional=True, name=f"[spheres] {cid}",
-                )
-                print(f"[spheres] {cid}: {len(centers)} cells")
-            if show_before:
-                raw_csv = os.path.join(raw_dir, f"{tile_name}_{cid}_result.csv")
-                ctype   = ch.get('type', 'soma')
-                zl_p    = zl_soma if ctype == 'soma' else zl_tf
-                vol_list_r = _run_zlink_for_csv(
-                    raw_csv, z_range,
-                    iou_thresh=zl_p.get('iou_thresh', 0.35),
-                    min_z_layers=1,
-                    max_cell_z_span=zl_p.get('max_cell_z_span', 5),
-                    max_z_gap=zl_p.get('max_z_gap', 0),
-                    ch_id=cid,
-                )
-                centers_r, sizes_r = _vol_list_to_points(vol_list_r, z_range)
-                if centers_r is not None:
-                    viewer.add_points(
-                        centers_r, size=sizes_r,
-                        face_color=[color] * len(centers_r),
-                        border_width=0, opacity=sphere_raw_opacity,
-                        n_dimensional=True, visible=False,
-                        name=f"[spheres-raw] {cid}",
-                    )
-        viewer.dims.ndisplay = 3
-        print("\nSphere view active — napari in 3-D mode.")
-
-    # ── [coloc] ───────────────────────────────────────────────────────────────
-    if show_coloc:
-        coloc_csv = os.path.join(base_res, '4_colocalization', 'coloc_result.csv')
-        tile_x0, tile_y0, tile_z0 = _get_runtime_tile_offset(context, tile_name)
-        print(f"  [coloc] tile offset: x0={tile_x0}, y0={tile_y0}, z0={tile_z0}")
-
-        coloc_source = vis_cfg.get('coloc_source', 'preview')
-        if coloc_source not in ('preview', 'saved'):
-            raise ValueError("coloc_source must be 'preview' or 'saved'")
-        if coloc_source == 'saved':
-            if not os.path.isfile(coloc_csv):
-                raise FileNotFoundError(f"Saved colocalization result not found: {coloc_csv}")
-            _add_coloc_layers(
-                viewer, coloc_csv, tile_name, z_range,
-                tile_x0, tile_y0, tile_z0, canvas_shape,
-                coloc_opacity, outline_width, box_registry=box_registry,
-                left_margin=left_m, top_margin=top_m,
-            )
-        else:
-            print("\n[coloc] Preview from the same filtered CSVs as [zlinked]...")
-            try:
-                coloc_vols = _run_tile_colocalization(
-                    per_ch_vol_lists,
-                    soma_ch_ids=soma_ch_ids, tf_ch_ids=tf_ch_ids,
-                    zl_soma_cfg=zl_soma, zl_tf_cfg=zl_tf,
-                )
-                print(f"  In-memory: {len(coloc_vols)} soma cells")
-                if coloc_vols:
-                    groups = _auto_groups_from_classes(
-                        [c.get('class', '') for c in coloc_vols],
-                        outline_width=outline_width,
-                    )
-                    if not groups:
-                        print("[coloc] no marker combinations found (no soma cell "
-                              "carries >=2 markers — check channel routing / z_linker.tf config)")
-                    any_shown = False
-                    for grp, shapes_c, colors_c, dash_c, meta_c in _vol_list_to_s4_shapes(
-                            coloc_vols, z_range, groups):
-                        if shapes_c:
-                            layer_name_c = f"[coloc] {grp['name']}"
-                            _add_labels_layer(
-                                viewer, shapes_c, colors_c, canvas_shape,
-                                dash_sizes=dash_c,
-                                name=layer_name_c,
-                                visible=True, opacity=coloc_opacity,
-                                outline_width=grp.get('outline_width', outline_width),
-                            )
-                            for m in meta_c:
-                                box_registry.append({**m, 'layer_name': layer_name_c})
-                            n_solid = sum(1 for d in dash_c if d == 0)
-                            print(f"[coloc] {grp['name']}: {len(shapes_c)} boxes "
-                                  f"({n_solid} neuron, {len(dash_c) - n_solid} glia)")
-                            any_shown = True
-                    if groups and not any_shown:
-                        print("[coloc] no cells in z-range for any group")
-                else:
-                    print("[coloc] no soma cells produced by in-memory merge — "
-                          "check soma channel routing/config")
-            except Exception as exc:
-                print(f"[coloc] WARNING: in-memory coloc failed — {exc}")
-
-        # ── Overlap suppression overlay ───────────────────────────────────────
-        if left_m > 0 or top_m > 0:
-            ovl = np.zeros((canvas_z, canvas_h, canvas_w), dtype=np.uint8)
-            if left_m > 0: ovl[:, :, :left_m] = 255
-            if top_m  > 0: ovl[:, :top_m, :]  = 255
-            viewer.add_image(
-                ovl, name=f"[overlap] left={left_m}px top={top_m}px",
-                colormap='cyan', opacity=0.25, blending='additive', visible=True,
-            )
-
-    # ── Click-to-inspect  /  Shift+click traces  /  Ctrl+click FN annotation ────
-    print(f"\n[info] Click any detection box → dimensions in status bar.")
-    print(f"[info] Shift+click [coloc]   box → TF colocalization trace in terminal.")
-    print(f"[info] Shift+click [zlinked] box → per-z span highlighted in yellow + info.")
-    fn_record = _make_fn_recorder(vis_cfg, paths, routing_config, anchor_dir,
-                                  tile_path, tile_name, z_range, offsets=offsets)
-    print(f"[info] {len(box_registry)} boxes indexed across all layers.")
-
-    @viewer.bind_key('Shift')
-    def _shift_hint(v):
-        v.status = "⇧ Shift held — click a [zlinked] or [coloc] box to trace"
-        yield
-        v.status = ""
-
-    @viewer.bind_key('Control')
-    def _ctrl_hint(v):
-        v.status = "⌃ Ctrl held — click anywhere to mark a false-negative position"
-        yield
-        v.status = ""
-
-    def _on_click(viewer, event):
-        if event.type != 'mouse_press':
-            return
-        try:
-            mods = [str(m).lower() for m in event.modifiers]
-            is_shift = any('shift' in m for m in mods)
-            is_ctrl  = any('ctrl' in m or 'control' in m for m in mods)
-        except Exception:
-            is_shift = is_ctrl = False
-        pos = viewer.cursor.position
-        if len(pos) < 3:
-            return
-        z_cur = int(round(pos[0]))
-        y_cur = float(pos[1])
-        x_cur = float(pos[2])
-
-        if is_ctrl:
-            if fn_record is None:
-                viewer.status = "⌃ Ctrl+click disabled — set 'fn_ann_path' in vis_config.json"
-            else:
-                fn_record(viewer, z_cur, x_cur, y_cur, box_registry)
-            return
-
-        hits = [
-            b for b in box_registry
-            if b['z'] == z_cur
-            and b['x1'] <= x_cur <= b['x2']
-            and b['y1'] <= y_cur <= b['y2']
-        ]
-        if hits:
-            candidates = hits
-            active_layer = viewer.layers.selection.active
-            if active_layer is not None:
-                active_hits = [b for b in candidates if b.get('layer_name') == active_layer.name]
-                if active_hits:
-                    candidates = active_hits
-            best = min(candidates, key=lambda b: (b['x2'] - b['x1']) * (b['y2'] - b['y1']))
-            w = best['x2'] - best['x1']
-            h = best['y2'] - best['y1']
-            lname = best.get('layer_name', '')
-            mean_str = f"  mean={best['mean']:.0f}" if best.get('mean', 0) != 0 else ""
-            if not is_shift:
-                viewer.status = (f"[{lname}] {best['cls']}  "
-                                 f"w={w:.0f}px  h={h:.0f}px  z={best['z']}{mean_str}")
-            elif lname.startswith('[coloc]'):
-                if _debug_soma_vols:
-                    soma_idx = _find_soma_idx_for_box(best, z_range, _debug_soma_vols)
-                    if soma_idx is not None:
-                        res = _trace_coloc_for_soma(
-                            soma_idx, _debug_soma_vols, _debug_all_tf, **_debug_cp)
-                        _print_coloc_trace(res, _debug_cp)
-                        _print_coloc_all_channels(res, soma_ch_ids, per_ch_vol_lists)
-                        viewer.status = f"⇧ coloc trace for soma #{soma_idx} → see terminal"
-                    else:
-                        cx = (best['x1'] + best['x2']) / 2
-                        cy = (best['y1'] + best['y2']) / 2
-                        print(f"[trace] no soma matched — box cx={cx:.0f} cy={cy:.0f} z={best['z']}")
-                        viewer.status = f"⇧ [coloc] no soma matched at cx={cx:.0f} cy={cy:.0f} z={best['z']}"
-                else:
-                    print("[trace] vol_lists not built — enable show_coloc/show_zlinked/spheres")
-                    viewer.status = "⇧ [coloc] vol_lists not available — see terminal"
-            elif lname.startswith(('[s3]', '[zlinked]')):
-                for lyr in list(viewer.layers):
-                    if lyr.name == '[debug] s3 span':
-                        viewer.layers.remove(lyr)
-                cell, cid = _find_vollist_entry_for_box(
-                    best, z_range, per_ch_vol_lists, lname)
-                if cell is not None:
-                    _print_s3_cell_info(cell, cid)
-                    sh, co = _build_s3_span_shapes(cell, z_range, canvas_shape)
-                    if sh:
-                        _add_labels_layer(viewer, sh, co, canvas_shape,
-                                          name='[debug] s3 span', visible=True,
-                                          opacity=0.9, outline_width=2)
-                    viewer.status = (f"⇧ [{cid}] s3 info → terminal  "
-                                     f"cz={cell['cz']}  z=[{cell['z_min']}-{cell['z_max']}]")
-                else:
-                    cx = (best['x1'] + best['x2']) / 2
-                    cy = (best['y1'] + best['y2']) / 2
-                    print(f"[trace] no vol_list match for s3 box "
-                          f"cx={cx:.0f} cy={cy:.0f} z={best['z']}")
-                    viewer.status = (f"⇧ no match in vol_list for {lname}  "
-                                     f"cx={cx:.0f} cy={cy:.0f} z={best['z']} — see terminal")
-            else:
-                viewer.status = f"⇧ {lname} is not traceable — use [zlinked] or [coloc]"
-        else:
-            if is_shift:
-                viewer.status = f"⇧ Shift+click: no box at z={z_cur} x={x_cur:.0f} y={y_cur:.0f}"
-            else:
-                viewer.status = f"(no box at z={z_cur} x={x_cur:.0f} y={y_cur:.0f})"
-
-    viewer.mouse_drag_callbacks.append(_on_click)
-
-    viewer.reset_view()
-
-
-# ── Mode: post (single tile) ──────────────────────────────────────────────────
 
 def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
     zl_cfg  = vis_cfg.get('z_linker', {})
@@ -2626,6 +2170,14 @@ def main():
         if vis_cfg.get('2d_source', 'raw') not in ('raw', 'filtered'):
             sys.exit("2d_source must be 'raw' or 'filtered'.")
         context = None
+    elif mode == 'prealign':
+        from src.utils.saved_view import saved_run_context
+        try:
+            saved_run, context = saved_run_context(vis_cfg)
+        except (CoordinateContextError, OSError, ValueError) as exc:
+            sys.exit(f"Saved run error: {exc}")
+        paths = saved_run['paths']
+        routing_config = saved_run['channels_routing']
     else:
         try:
             context = CoordinateContext.from_vis_config(vis_cfg, vis_cfg_path)
@@ -2641,6 +2193,12 @@ def main():
     print(f"\n{len(selected_tiles)} tile(s) selected: "
           f"{', '.join(name for _, name in selected_tiles)}")
 
+    if mode == 'prealign':
+        from src.utils.saved_gui import run_saved_prealign
+        run_saved_prealign(vis_cfg, paths, routing_config, context, selected_tiles)
+        napari.run()
+        return
+
     # One napari.Viewer() (= one OS window) per tile, all built up-front; napari.run()
     # is called once at the end so every window stays open and you can Alt-Tab / click
     # between them, instead of blocking on a single tile at a time.
@@ -2651,8 +2209,6 @@ def main():
         try:
             if mode == '2d':
                 _run_2d(vis_cfg, paths, routing_config, tile_path, tile_name)
-            elif mode == 'prealign':
-                _run_prealign(vis_cfg, paths, routing_config, context, tile_path, tile_name)
             else:
                 _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name)
         except InvalidImageContrastError as exc:

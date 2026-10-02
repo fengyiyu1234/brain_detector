@@ -1,9 +1,13 @@
 // Example visualization config. Copy to config/vis_config.json and replace sample paths.
-// Set mode to post only after global results exist and pATHXML identifies their exact geometry.
+// prealign reads saved pipeline outputs. Global view requires final-frame XML.
 {
     // The 2d mode previews tile-local detections without XML.
-    "mode": "2d",
-    // Choose raw or filtered aligned tile detections.
+    "mode": "prealign",
+    // "local" shows a tile's final-frame coordinates; "global" places selected tiles
+    // on the saved final-frame XML axes.
+    "view_space": "local",
+    "global_z_start": null,
+    // Choose raw or filtered aligned tile detections in 2d mode.
     "2d_source": "filtered",
     // Set a CSV path to save false-negative annotations.
     "fn_ann_path": null,
@@ -89,7 +93,7 @@
     "show_before": false,
     "show_zlinked": true,
     "show_coloc": false,
-    "coloc_source": "preview",
+    "show_filtered_2d": false,
     "spheres": false,
     // Saved-result stage selection for post mode.
     "stage": "all",

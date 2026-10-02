@@ -124,23 +124,37 @@ Changing alignment references, frame geometry, or `paths.pATHXML` after global c
 
 ## Visualize results
 
-[`src/utils/visualize.py`](src/utils/visualize.py) reads `config/vis_config.json` by default. It supports three modes:
+src/utils/visualize.py reads config/vis_config.json by default.
 
-| Mode | Displays | XML needed by current viewer? |
+| Mode | Displays | Geometry |
 | --- | --- | --- |
-| `2d` | Aligned raw or filtered tile-local 2D boxes and shifted images | No |
-| `prealign` | Tile alignment QC, optional raw boxes, in-memory Z linking, and colocalization previews | Yes: the current entry point builds `CoordinateContext` |
-| `post` | Saved filtered 2D boxes, Z-linked cells, and final colocalization results | Yes: global boxes are mapped back to the selected tile |
+| 2d | Tile-local saved 2D detections and shifted images | No XML needed |
+| prealign | Saved tile 2D, stitched 2D, per-channel 3D, and Stage 4 results | Uses runtime_config.json, saved offsets, and the final-frame XML |
+| post | Legacy single-tile saved-result view | Uses the XML selected in visualization config |
 
-```bash
-python src/utils/visualize.py --config config/vis_config.json --mode 2d --2d-source raw
-python src/utils/visualize.py --config config/vis_config.json --mode 2d --2d-source filtered
-python src/utils/visualize.py --config config/vis_config.json --mode post
-```
+The prealign view performs no Z linking, channel matching, or detection
+filtering. It reads the run's channel order and final coordinate frame from
+the result directory's runtime_config.json. Visualization sample paths locate
+the TIFFs and results on the current machine. If the final XML is not
+available yet, the local view shows saved tile 2D stages only. Missing later
+checkpoints are reported and never calculated by the GUI.
 
-In `prealign`, set `show_coloc: true` and `coloc_source: "preview"` to compute colocalization from the same filtered tile CSVs as the displayed Z-linked cells. Use `coloc_source: "saved"` to inspect the existing Stage 4 CSV. Colocalization layers are visible when loaded. Saved Stage 3/4 cells are shown in every tile their global boxes overlap, even when the CSV `tile_name` names a neighboring tile. Stage 4 draws each cell only on its representative Z slice. `post` always reads the saved Stage 4 CSV.
+Set view_space to local to view each selected tile in final-frame tile
+coordinates. Set it to global to place all selected tiles in one viewer on
+the final-frame XML axes. The global view loads selected tile images and
+result rows intersecting their footprints and displayed Z range.
+global_z_start may set the global zero-based first slice; otherwise it is
+derived from the first selected tile and z_start.
 
-For `prealign` and `post`, use the same final-frame geometry as the run that created the saved results. Set the visualization sample's `frame_channel` to that frame and `paths.pATHXML` to its XML. The viewer checks frame and tile compatibility and reports the selected coordinate context. A different channel's XML is interchangeable only when its normalized tile positions are identical.
+The saved Stage 3 CSV contains a summary box at the track's representative
+Z. Shift-click its layer to load that channel's saved PKL and show the
+track's actual per-Z boxes. The PKL is loaded only on demand and may take
+time for dense channels. Stage 4 CSV stores only one representative-Z box
+per cell. Stage 4 layers show exact marker combinations; each cell appears
+in one combination layer. Clicking a Stage 4 box reports its saved row
+without inferring a new pairing.
+
+    python src/utils/visualize.py --config config/vis_config.json --mode prealign
 
 ## Code map
 
