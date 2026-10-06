@@ -55,6 +55,10 @@ def saved_run_context(vis_config: dict) -> tuple[dict, CoordinateContext | None]
                 runtime_xml_inside_result = True
                 candidates.append(os.path.join(result_dir, *relative.split("/")))
     if frame:
+        frame_route = next((ch for ch in routing if ch["id"] == frame), None)
+        if frame_route and frame_route.get("dir_key") and paths.get(frame_route["dir_key"]):
+            candidates.append(os.path.join(
+                paths[frame_route["dir_key"]], "xml_merging.xml"))
         candidates.append(os.path.join(
             result_dir, "5_2d_global", "tile_positions",
             f"xml_merging_{frame}.xml"))

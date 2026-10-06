@@ -282,9 +282,9 @@ if __name__ == '__main__':
     migrate_result_layout(base_res_path)
     if solve_tile_positions:
         frame = tile_position_frame(config)
-        paths['pATHXML'] = os.path.join(
-            base_res_path, '5_2d_global', 'tile_positions',
-            f'xml_merging_{frame}.xml')
+        frame_dir_key = next(ch['dir_key'] for ch in config['channels_routing']
+                             if ch.get('active', True) and ch['id'] == frame)
+        paths['pATHXML'] = os.path.join(paths[frame_dir_key], 'xml_merging.xml')
     derived = result_paths(base_res_path)
     # 将构建好的字典挂载回 config，供 worker.py 及后续流程使用
     config['derived_paths'] = derived

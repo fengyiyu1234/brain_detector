@@ -72,6 +72,7 @@ class CoordinateContext:
     frame_positions: dict[str, TilePosition]
     channel_positions: dict[str, dict[str, TilePosition]]
     image_positions: dict[str, dict[str, TilePosition]]
+    channel_xml_paths: dict[str, str]
 
 
     @classmethod
@@ -150,9 +151,27 @@ class CoordinateContext:
                     for name, p in raw.items()}
 
         xml_dir = os.path.dirname(frame_xml)
-        per_channel = {ch["id"]: os.path.join(xml_dir, f"xml_merging_{ch['id']}.xml")
-                       for ch in routing}
+        frame_route = next(ch for ch in routing if ch["id"] == frame_channel)
+        frame_dir_key = frame_route.get("dir_key")
+        frame_channel_dir = paths.get(frame_dir_key) if frame_dir_key else None
+        channel_dir_layout = (
+            os.path.basename(frame_xml).lower() == "xml_merging.xml"
+            and frame_channel_dir
+            and os.path.normcase(os.path.abspath(xml_dir)) ==
+                os.path.normcase(os.path.abspath(frame_channel_dir))
+        )
+        if channel_dir_layout:
+            per_channel = {
+                ch["id"]: os.path.join(paths[ch["dir_key"]], "xml_merging.xml")
+                for ch in routing
+            }
+        else:
+            per_channel = {ch["id"]: os.path.join(xml_dir, f"xml_merging_{ch['id']}.xml")
+                           for ch in routing}
         available = {ch: path for ch, path in per_channel.items() if os.path.isfile(path)}
+        if channel_dir_layout and len(available) != len(per_channel):
+            missing = sorted(set(per_channel) - set(available))
+            raise CoordinateContextError(f"Missing per-channel XML: {missing}")
         if available and len(available) != len(per_channel):
             missing = sorted(set(per_channel) - set(available))
             raise CoordinateContextError(f"Missing per-channel XML beside '{frame_xml}': {missing}")
@@ -188,6 +207,7 @@ class CoordinateContext:
             tile_size=int((config.get("detection_params") or {}).get("tILESIZE", 2048)),
             frame_positions=normalize(raw_frame, frame_xml),
             channel_positions=channel_positions, image_positions=image_positions,
+            channel_xml_paths=per_channel,
         )
 
     @classmethod
@@ -249,7 +269,7 @@ class CoordinateContext:
     def position(self, tile_name: str, channel: str | None = None) -> TilePosition:
         positions = self.frame_positions if channel is None else self.channel_positions.get(channel)
         if positions is None or tile_name not in positions:
-            origin = self.frame_xml if channel is None else os.path.join(self.xml_dir, f"xml_merging_{channel}.xml")
+            origin = self.frame_xml if channel is None else self.channel_xml_paths.get(channel, self.frame_xml)
             raise CoordinateContextError(f"Tile '{tile_name}' not found in '{origin}'")
         return positions[tile_name]
 

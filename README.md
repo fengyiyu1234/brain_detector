@@ -30,7 +30,7 @@ The expected image layout is a channel directory containing row directories and 
 | 2.6 | Optionally fuse two exposures of one logical channel, one Z slice at a time | `3_2d_aligned_fusion/` |
 | 2.75 | Publish final filtered tile CSVs for Stage 3 | `4_2d_filtered/` |
 | 2.8 | Optionally save area and intensity histograms | `1_2d_raw/histograms/` |
-| 2.9 | Optionally solve tile positions and publish frame/channel XMLs | `5_2d_global/tile_positions/`, four `xml_merging_<channel>.xml` files |
+| 2.9 | Optionally solve tile positions and publish channel XMLs | Positions in `5_2d_global/tile_positions/`; one `xml_merging.xml` in each channel image directory |
 | 3 | Place filtered boxes in global coordinates, link detections across Z, and colocalize channels | `5_2d_global/`, `6_3d_global/`, `7_colocalization/` |
 | 4 | Save cell centroids and optional summary statistics | `7_colocalization/cell_centroids/` |
 
@@ -90,7 +90,7 @@ The default output directory is `<results_dir>/5_2d_global/tile_positions/`:
 
 `--ref` chooses the alignment measurement reference; `--frame` chooses the final coordinate frame. By default these come from `pre_align_params.reference_channel` and `stitching_reference_channel`. `--write-aligned` optionally creates pipeline-style aligned CSVs and offsets in a **separate** `3_2d_aligned_solved/` directory; it does not automatically replace Stage 2.5 output. `--write-xml` writes `xml_merging_<channel>.xml` in the report directory. `--xml-into-channel-dirs` also publishes each result as `xml_merging.xml` in its original channel image directory. Standalone XML export requires an XML template; integrated Stage 2.9 generates XML without one.
 
-In integrated mode, Stage 2.9 reads `2_2d_filtered/` and reuses Stage 2.5 offsets. Stage 3 loads the solved frame XML automatically; `paths.pATHXML` is not needed. Cell coordinates combine frame tile positions with rebased channel shifts. Per-channel image XMLs keep seam-derived geometry plus global channel translation; local cell-alignment residuals are not applied to image tiles. Changed geometry is rejected while global checkpoints exist. The summary report is disabled by default; set `generate_analysis_report: true` to write `7_colocalization/global_summary_statistics.csv`. Cell centroids are written regardless of this setting.
+In integrated mode, Stage 2.9 reads `2_2d_filtered/` and reuses Stage 2.5 offsets. It writes one `xml_merging.xml` into each original channel image directory; `stacks_dir` and `mdata_bin` use the corresponding `Y:/Fengyi/...` path on the shared filesystem. Stage 3 loads the solved reference-channel XML automatically; `paths.pATHXML` is not needed. Cell coordinates combine frame tile positions with rebased channel shifts. Per-channel image XMLs keep seam-derived geometry plus global channel translation; local cell-alignment residuals are not applied to image tiles. Changed geometry is rejected while global checkpoints exist. The summary report is disabled by default; set `generate_analysis_report: true` to write `7_colocalization/global_summary_statistics.csv`. Cell centroids are written regardless of this setting.
 
 ## Global coordinates and deduplication
 

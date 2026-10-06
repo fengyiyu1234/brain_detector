@@ -2,7 +2,7 @@
 r"""Generate TeraStitcher merging XMLs without reading an XML template.
 
 Input positions come from solve_tile_positions.py's tile_positions.csv.
-The generator writes XMLs into the chosen output directory and never modifies source images.
+Each channel XML is written beside its original image tiles.
 
 Example:
   python src/core/generate_merging_xml.py \
@@ -152,13 +152,22 @@ def formatted(value):
     return f"{value:g}"
 
 
+def xml_image_directory(channel_dir):
+    """Use the mounted Y: path in TeraStitcher XML on the shared filesystem."""
+    directory = str(channel_dir).replace("\\", "/").rstrip("/")
+    cluster_root = "/rsstu/users/a/agrinba/DeepDesign"
+    if directory == cluster_root or directory.startswith(cluster_root + "/"):
+        return "Y:" + directory[len(cluster_root):]
+    return directory
+
+
 def mechanical_step(coords):
     return statistics.median(b - a for a, b in zip(coords, coords[1:])) / 10 if len(coords) > 1 else 0
 
 
 def build_xml(channel_dir, grid, vs, hs, z_values, positions, xy_um, z_um, bytes_per_channel):
     root = ET.Element("TeraStitcher", volume_format="TiledXY|2Dseries", input_plugin="tiff2D")
-    directory = str(channel_dir).rstrip("/\\")
+    directory = xml_image_directory(channel_dir)
     ET.SubElement(root, "stacks_dir", value=directory)
     ET.SubElement(root, "mdata_bin", value=directory + "/mdata.bin")
     ET.SubElement(root, "ref_sys", ref1="1", ref2="2", ref3="3")
@@ -205,7 +214,7 @@ def write_xml(root, path):
         temporary.unlink(missing_ok=True)
 
 
-def generate(config_path, positions_path, out_dir, bytes_per_channel=2, force=False):
+def generate(config_path, positions_path, bytes_per_channel=2, force=False):
     config = load_config(config_path)
     routing = [ch for ch in config["channels_routing"] if ch.get("active", True)]
     channels = [ch["id"] for ch in routing]
@@ -228,7 +237,7 @@ def generate(config_path, positions_path, out_dir, bytes_per_channel=2, force=Fa
         channel = ch["id"]
         channel_dir = Path(config["paths"][ch["dir_key"]])
         images[channel] = (channel_dir, validate_images(channel_dir, rows))
-        outputs[channel] = out_dir / f"xml_merging_{channel}.xml"
+        outputs[channel] = channel_dir / "xml_merging.xml"
         if outputs[channel].exists() and not force:
             raise FileExistsError(f"Output exists; pass --force to replace: {outputs[channel]}")
     if len({z for _, z in images.values()}) != 1:
@@ -237,7 +246,6 @@ def generate(config_path, positions_path, out_dir, bytes_per_channel=2, force=Fa
     trees = {ch: build_xml(directory, grid, vs, hs, z_values, positions[ch],
                            xy_um, z_um, bytes_per_channel)
              for ch, (directory, z_values) in images.items()}
-    out_dir.mkdir(parents=True, exist_ok=True)
     for ch, tree in trees.items():
         write_xml(tree, outputs[ch])
         print(f"{ch}: {len(rows)} tiles -> {outputs[ch]}")
@@ -251,7 +259,6 @@ def main():
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--positions", type=Path,
                         help="tile_positions.csv; default: config result directory")
-    parser.add_argument("--out-dir", type=Path, help="Default: directory containing positions CSV")
     parser.add_argument("--bytes-per-channel", type=int, default=2,
                         help="TIFF bytes per channel, default 2 for 16-bit images")
     parser.add_argument("--force", action="store_true", help="Replace existing generated XMLs")
@@ -259,8 +266,7 @@ def main():
     config = load_config(args.config)
     positions = args.positions or (Path(config["paths"]["pATHRESULT"]) /
                                    "5_2d_global/tile_positions/tile_positions.csv")
-    generate(args.config, positions, args.out_dir or positions.parent,
-             args.bytes_per_channel, args.force)
+    generate(args.config, positions, args.bytes_per_channel, args.force)
 
 
 if __name__ == "__main__":

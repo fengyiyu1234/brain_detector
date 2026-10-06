@@ -105,7 +105,7 @@ class TilePositionPipelineTests(unittest.TestCase):
                     (report / 'solution.json').write_text('{}')
                 else:
                     for ch in channels:
-                        (report / f"xml_merging_{ch['id']}.xml").write_text('<root/>')
+                        (Path(paths[ch['dir_key']]) / "xml_merging.xml").write_text('<root/>')
 
             call = lambda: run_tile_position_stage(
                 config, str(cfg), str(root), str(det), str(align), str(report),
@@ -113,22 +113,30 @@ class TilePositionPipelineTests(unittest.TestCase):
             with patch('src.core.tile_position_pipeline.subprocess.run', side_effect=fake_run):
                 frame_xml, computed = call()
                 self.assertTrue(computed)
-                self.assertTrue(frame_xml.endswith('xml_merging_Olig2.xml'))
+                self.assertEqual(frame_xml, str(root / 'Olig2' / 'xml_merging.xml'))
                 self.assertEqual(len(calls), 2)
                 self.assertIn('--alignment-from', calls[0])
                 self.assertNotIn('--xml-into-channel-dirs', calls[0])
                 self.assertIn('--positions', calls[1])
-                self.assertFalse(any((Path(path) / 'xml_merging.xml').exists()
-                                     for path in paths.values()))
+                self.assertTrue(all((Path(path) / 'xml_merging.xml').exists()
+                                    for path in paths.values()))
                 self.assertFalse(call()[1])
-                source = det / 't0_GFP_result.csv'
-                source.write_text('z,x\n1,2\n2,3\n')
+                xml_script.write_text('updated XML serializer')
+                self.assertTrue(call()[1])
+                self.assertEqual(len(calls), 3)
+                self.assertEqual(calls[-1][1], str(xml_script))
                 global_dir = root / '5_2d_global'
                 global_dir.mkdir(exist_ok=True)
                 (global_dir / 'GFP_2d_global.csv').write_text('global')
+                xml_script.write_text('updated XML serializer again')
+                self.assertTrue(call()[1])
+                self.assertEqual(len(calls), 4)
+                self.assertEqual(calls[-1][1], str(xml_script))
+                source = det / 't0_GFP_result.csv'
+                source.write_text('z,x\n1,2\n2,3\n')
                 with self.assertRaisesRegex(RuntimeError, 'global checkpoints'):
                     call()
-                self.assertEqual(len(calls), 2)
+                self.assertEqual(len(calls), 4)
 
 if __name__ == '__main__':
     unittest.main()

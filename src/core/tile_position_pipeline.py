@@ -34,6 +34,17 @@ def _canonical_manifest(value, script, xml_script):
             for key, item in value.items() if key not in (script, xml_script)
         }
     return value
+
+
+def _solver_signature(signature, xml_script):
+    """Compare geometry inputs while allowing XML format/location changes."""
+    value = {key: item for key, item in signature.items()
+             if key not in ('version', 'xml_command')}
+    value['inputs'] = {path: stamp for path, stamp in value['inputs'].items()
+                       if path != xml_script}
+    return value
+
+
 def solver_command(script, config_path, results_dir, det_dir, ref, frame, workers, options):
     command = [sys.executable, script, '--sample', results_dir, '--config', config_path,
                '--det-dir', det_dir, '--alignment-from', 'old-offsets',
@@ -80,7 +91,7 @@ def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir
     os.makedirs(report_dir, exist_ok=True)
     position_csv = os.path.join(report_dir, 'tile_positions.csv')
     xml_command = [sys.executable, xml_script, '--config', config_path,
-                   '--positions', position_csv, '--out-dir', report_dir,
+                   '--positions', position_csv,
                    '--bytes-per-channel', str(params.get('xml_bytes_per_channel', 2)),
                    '--force']
     files = {}
@@ -106,8 +117,9 @@ def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir
     files[script] = _stamp(script)
     files[xml_script] = _stamp(xml_script)
     outputs = [position_csv, os.path.join(report_dir, 'solution.json')]
-    outputs.extend(os.path.join(report_dir, f"xml_merging_{ch}.xml") for ch in channels)
-    signature = {'version': 3, 'reference_channel': ref, 'frame_channel': frame,
+    outputs.extend(os.path.join(config['paths'][ch['dir_key']], 'xml_merging.xml')
+                   for ch in routing)
+    signature = {'version': 4, 'reference_channel': ref, 'frame_channel': frame,
                  'solver_command': command, 'xml_command': xml_command, 'inputs': files,
                  'geometry_config': {
                      'detection_params': {key: config.get('detection_params', {}).get(key)
@@ -121,7 +133,8 @@ def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir
             previous = json.load(handle)
     except (OSError, ValueError):
         previous = None
-    frame_xml = os.path.join(report_dir, f'xml_merging_{frame}.xml')
+    frame_dir = config['paths'][next(ch['dir_key'] for ch in routing if ch['id'] == frame)]
+    frame_xml = os.path.join(frame_dir, 'xml_merging.xml')
     output_stamps = {path: _stamp(path) for path in outputs} if all(
         os.path.isfile(path) for path in outputs) else None
     if previous and output_stamps:
@@ -134,16 +147,26 @@ def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir
                 _canonical_manifest(previous.get('outputs'), script, xml_script) ==
                 _canonical_manifest(output_stamps, script, xml_script)):
             return frame_xml, False
-    global_dirs = ('5_2d_global', '6_3d_global', '7_colocalization')
-    if any(os.path.isdir(os.path.join(results_dir, d)) and
-           any(name.endswith(('.csv', '.pkl')) for name in os.listdir(os.path.join(results_dir, d)))
-           for d in global_dirs):
-        raise RuntimeError("Tile positions or their inputs changed while global checkpoints exist. "
-                           "Archive/regenerate global 2D, 3D, and colocalization outputs first.")
-    subprocess.run(command, check=True)
-    if not os.path.isfile(position_csv):
-        raise RuntimeError(f"Tile solver finished without positions CSV: {position_csv}")
-    subprocess.run(xml_command, check=True)
+    positions_reusable = bool(previous) and all(
+        os.path.isfile(path) and previous.get('outputs', {}).get(path) == _stamp(path)
+        for path in outputs[:2])
+    solver_unchanged = (positions_reusable and isinstance(previous.get('signature'), dict) and
+                        _solver_signature(previous['signature'], xml_script) ==
+                        _solver_signature(signature, xml_script))
+    if solver_unchanged:
+        # A changed XML destination or serialization does not change tile geometry.
+        subprocess.run(xml_command, check=True)
+    else:
+        global_dirs = ('5_2d_global', '6_3d_global', '7_colocalization')
+        if any(os.path.isdir(os.path.join(results_dir, d)) and
+               any(name.endswith(('.csv', '.pkl')) for name in os.listdir(os.path.join(results_dir, d)))
+               for d in global_dirs):
+            raise RuntimeError("Tile positions or their inputs changed while global checkpoints exist. "
+                               "Archive/regenerate global 2D, 3D, and colocalization outputs first.")
+        subprocess.run(command, check=True)
+        if not os.path.isfile(position_csv):
+            raise RuntimeError(f"Tile solver finished without positions CSV: {position_csv}")
+        subprocess.run(xml_command, check=True)
     if not all(os.path.isfile(path) for path in outputs):
         raise RuntimeError("Tile solver/XML generator finished without all expected outputs")
     part = manifest_path + '.part'

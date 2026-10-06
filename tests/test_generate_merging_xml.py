@@ -8,7 +8,7 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
-from src.core.generate_merging_xml import generate, grid_for_tiles
+from src.core.generate_merging_xml import generate, grid_for_tiles, xml_image_directory
 
 
 class GenerateMergingXmlTests(unittest.TestCase):
@@ -59,19 +59,21 @@ class GenerateMergingXmlTests(unittest.TestCase):
     def test_generates_templateless_channel_xmls(self):
         stderr = StringIO()
         with redirect_stderr(stderr):
-            outputs = generate(self.config, self.positions, self.root / "out")
+            outputs = generate(self.config, self.positions)
         self.assertEqual(stderr.getvalue(), "")
         self.assertEqual(set(outputs), {"GFP", "Olig2"})
         for ch, path in outputs.items():
+            self.assertEqual(path, self.channels[ch] / "xml_merging.xml")
             data = path.read_bytes()
             self.assertIn(b'<!DOCTYPE TeraStitcher SYSTEM "TeraStitcher.DTD">', data)
             root = ET.parse(path).getroot()
             self.assertEqual(root.attrib, {
                 "volume_format": "TiledXY|2Dseries", "input_plugin": "tiff2D"
             })
-            self.assertEqual(root.find("stacks_dir").get("value"), str(self.channels[ch]))
+            self.assertEqual(root.find("stacks_dir").get("value"),
+                             xml_image_directory(self.channels[ch]))
             self.assertEqual(root.find("mdata_bin").get("value"),
-                             str(self.channels[ch]) + "/mdata.bin")
+                             xml_image_directory(self.channels[ch]) + "/mdata.bin")
             self.assertEqual(root.find("dimensions").attrib, {
                 "stack_rows": "2", "stack_columns": "2", "stack_slices": "2"
             })
@@ -94,7 +96,16 @@ class GenerateMergingXmlTests(unittest.TestCase):
         self.assertEqual(ET.parse(outputs["GFP"]).getroot().find("STACKS/Stack").get("ABS_H"), "5")
         self.assertEqual(ET.parse(outputs["Olig2"]).getroot().find("STACKS/Stack").get("ABS_H"), "0")
         with self.assertRaises(FileExistsError):
-            generate(self.config, self.positions, self.root / "out")
+            generate(self.config, self.positions)
+
+    def test_cluster_image_paths_use_y_drive(self):
+        self.assertEqual(
+            xml_image_directory(
+                "/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/T70/488nm"),
+            "Y:/Fengyi/EGFR_brain/T70/488nm")
+        self.assertEqual(
+            xml_image_directory(r"Y:\Fengyi\EGFR_brain\T70\640nm"),
+            "Y:/Fengyi/EGFR_brain/T70/640nm")
 
     def test_rejects_missing_tile_or_inconsistent_slices(self):
         with self.assertRaisesRegex(ValueError, "Incomplete tile grid"):
@@ -102,7 +113,7 @@ class GenerateMergingXmlTests(unittest.TestCase):
         bad = self.channels["GFP"] / "1000" / "1000_2000" / "1000_2000_3010.tiff"
         bad.unlink()
         with self.assertRaisesRegex(ValueError, "TIFF slice coordinates differ"):
-            generate(self.config, self.positions, self.root / "out")
+            generate(self.config, self.positions)
 
 
 if __name__ == "__main__":

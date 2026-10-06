@@ -42,6 +42,42 @@ class CoordinateContextTests(unittest.TestCase):
                        "Olig2": {"dx": 0, "dy": 0, "dz": 0}}, f)
         return tmp, CoordinateContext.from_result_dir(result)
 
+    def test_per_channel_xmls_in_image_directories(self):
+        with tempfile.TemporaryDirectory() as result:
+            channels = {}
+            for ch, positions in (
+                ("Olig2", {"origin": (0, 0, 11), self.tile: (3458, 8674, 6)}),
+                ("GFP", {"origin": (0, 0, 11), self.tile: (3466, 8668, 6)}),
+            ):
+                directory = os.path.join(result, ch)
+                os.makedirs(directory)
+                with open(os.path.join(directory, "xml_merging.xml"), "w",
+                          encoding="utf-8") as handle:
+                    handle.write(_xml(positions))
+                channels[ch] = directory
+            runtime = {
+                "pipeline_mode": "pre_align",
+                "stitching_reference_channel": "Olig2",
+                "paths": {
+                    "pATHXML": os.path.join(channels["Olig2"], "xml_merging.xml"),
+                    "gfp_dir": channels["GFP"],
+                    "olig2_dir": channels["Olig2"],
+                },
+                "channels_routing": [
+                    {"id": "GFP", "dir_key": "gfp_dir", "active": True},
+                    {"id": "Olig2", "dir_key": "olig2_dir", "active": True},
+                ],
+            }
+            with open(os.path.join(result, "runtime_config.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(runtime, handle)
+            context = CoordinateContext.from_result_dir(result)
+            self.assertEqual(
+                context.channel_xml_paths["GFP"],
+                os.path.join(channels["GFP"], "xml_merging.xml"))
+            self.assertEqual(tuple(context.position(self.tile, "GFP")),
+                             (3466, 8668, 5))
+
     def test_t4_coordinate_inverse_and_equivalent_expression(self):
         tmp, context = self._make_context()
         self.addCleanup(tmp.cleanup)

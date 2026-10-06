@@ -1437,9 +1437,20 @@ def validate_cached_geometry(previous, current, results_dir, settings):
         raise ValueError(
             f"Alignment reference changed {old_ref!r} -> {new_ref!r}; "
             "archive/regenerate 3_2d_aligned and downstream checkpoints")
+    frame_dir_key = next(
+        (ch.get('dir_key') for ch in current.get('channels_routing', [])
+         if ch.get('active', True) and ch['id'] == new_frame), None)
+    old_solver_xml = os.path.join(
+        results_dir, '5_2d_global', 'tile_positions',
+        f'xml_merging_{new_frame}.xml')
+    new_channel_xml = (os.path.join(current['paths'][frame_dir_key], 'xml_merging.xml')
+                       if frame_dir_key and current.get('paths', {}).get(frame_dir_key) else '')
+    def same_path(left, right):
+        return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+    relocated_xml = (frame_dir_key and same_path(old_xml, old_solver_xml)
+                     and same_path(new_xml, new_channel_xml))
     if has_global and (old_ref != new_ref or old_frame != new_frame or
-                       os.path.normcase(os.path.abspath(old_xml)) !=
-                       os.path.normcase(os.path.abspath(new_xml))):
+                       (not same_path(old_xml, new_xml) and not relocated_xml)):
         raise ValueError(
             "Stitching geometry/reference changed while global checkpoints exist; "
             "archive/regenerate 5_2d_global, 6_3d_global, 7_colocalization, "
