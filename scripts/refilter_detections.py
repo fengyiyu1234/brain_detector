@@ -1,4 +1,4 @@
-﻿"""Regenerate filtered tile CSVs from existing raw, aligned, or fused CSVs."""
+"""Regenerate filtered tile CSVs from existing raw, aligned, or fused CSVs."""
 
 from __future__ import annotations
 
@@ -28,10 +28,10 @@ def _derived_paths(config: dict) -> dict[str, str]:
     if not base:
         raise ValueError("Config is missing paths.pATHRESULT")
     return {
-        "pATH_DET_RES": os.path.join(base, "1_tile_2d_raw"),
-        "pATH_ALIGN_OFFSETS": os.path.join(base, "0_channel_alignment"),
-        "pATH_DET_FUSED": os.path.join(base, "1_tile_2d_fused"),
-        "pATH_DET_FILTERED": os.path.join(base, "1_tile_2d_filtered"),
+        "pATH_DET_RES": os.path.join(base, "1_2d_raw"),
+        "pATH_ALIGN_OFFSETS": os.path.join(base, "3_2d_aligned"),
+        "pATH_DET_FUSED": os.path.join(base, "3_2d_aligned_fusion"),
+        "pATH_DET_FILTERED": os.path.join(base, "4_2d_filtered"),
     }
 
 
@@ -51,7 +51,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--config", required=True, help="Pipeline JSON/JSONC config.")
     parser.add_argument("--channels", nargs="+", help="Logical channel IDs; default: all active.")
     parser.add_argument("--tiles", nargs="+", help="Tile names; default: discover from source CSVs.")
-    parser.add_argument("--output-dir", help="Destination; default: pATHRESULT/1_tile_2d_filtered.")
+    parser.add_argument("--output-dir", help="Destination; default: pATHRESULT/4_2d_filtered.")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs and report without writing.")
     parser.add_argument("--overwrite", action="store_true", help="Allow replacing existing target CSVs.")
     return parser.parse_args()
@@ -92,6 +92,9 @@ def main() -> int:
                 raise FileNotFoundError(
                     f"Required source for tile={tile}, channel={ch['id']} is missing: {source}"
                 )
+            if os.path.abspath(source) == os.path.abspath(target):
+                raise ValueError("Source and destination are the same aligned CSV. "
+                                 "Use a separate --output-dir or rerun the pipeline from Stage 2.25.")
             if os.path.exists(target) and not args.overwrite:
                 raise FileExistsError(f"Target exists (pass --overwrite): {target}")
             jobs.append((tile, ch, source, target))
@@ -129,7 +132,7 @@ def main() -> int:
         raise
 
     stale = [name for name in (
-        "2_global_2d_raw", "3_channel_3d", "4_colocalization", "5_analysis_report"
+        "5_2d_global", "6_3d_global", "7_colocalization"
     ) if os.path.exists(os.path.join(derived["pATH_DET_RES"], "..", name))]
     if stale:
         print("WARNING: downstream outputs may now be stale (not deleted): " + ", ".join(stale))

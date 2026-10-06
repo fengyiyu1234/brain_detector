@@ -46,11 +46,11 @@ def offsets(d):
  return {"count":len(files),"olig2_nonzero_or_missing":bad}
 def main():
  a=argparse.ArgumentParser();a.add_argument("--result-dir",required=True);a.add_argument("--xml",required=True);a.add_argument("--sample-id",default="T4");args=a.parse_args()
- result=Path(args.result_dir);xml=Path(args.xml);out=result/"5_analysis_report"/"global_qc";b=bounds(xml)
- s2={c:result/"2_global_2d_raw"/(c+"_2d_global.csv") for c in CH};s3={c:result/"3_channel_3d"/(c+"_3d_tracked.csv") for c in CH};coloc=result/"4_colocalization"/"coloc_result.csv"
- tracked=[xml,result/"runtime_config.json",result/"inference.log",coloc,result/"global_summary_statistics.csv",*s2.values(),*s3.values()]
+ result=Path(args.result_dir);xml=Path(args.xml);out=result/"5_2d_global"/"global_qc";b=bounds(xml)
+ s2={c:result/"5_2d_global"/(c+"_2d_global.csv") for c in CH};s3={c:result/"6_3d_global"/(c+"_3d_tracked.csv") for c in CH};coloc=result/"7_colocalization"/"coloc_result.csv"
+ tracked=[xml,result/"runtime_config.json",result/"inference.log",coloc,result/"7_colocalization"/"global_summary_statistics.csv",*s2.values(),*s3.values()]
  manifest={"sample_id":args.sample_id,"created_utc":datetime.now(timezone.utc).isoformat(),"alignment_reference":"GFP","global_coordinate_frame":"Olig2/488","files":[{"path":str(p.resolve()),"size_bytes":p.stat().st_size,"mtime_utc":datetime.fromtimestamp(p.stat().st_mtime,timezone.utc).isoformat(),"sha256":sha(p)} for p in tracked if p.is_file()]}
- q={"canvas":b,"stage2":{c:inspect(p,S2,b) for c,p in s2.items()},"stage3":{c:inspect(p,S3,b) for c,p in s3.items()},"coloc":inspect(coloc,S2,b),"offsets":offsets(result/"0_channel_alignment")}
+ q={"canvas":b,"stage2":{c:inspect(p,S2,b) for c,p in s2.items()},"stage3":{c:inspect(p,S3,b) for c,p in s3.items()},"coloc":inspect(coloc,S2,b),"offsets":offsets(result/"3_2d_aligned")}
  groups=[*q["stage2"].values(),*q["stage3"].values(),q["coloc"]];q["failures"]=[x["path"] for x in groups if not x["exists"] or not x["rows"] or x["schema_missing"] or x["nan_or_inf"] or x["invalid_box"]]
  if q["offsets"]["count"]!=45 or q["offsets"]["olig2_nonzero_or_missing"]:q["failures"].append("offsets")
  q["pass"]=not q["failures"];write(out/"t4_qc_manifest.json",manifest);write(out/"numeric_qc.json",q)

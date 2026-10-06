@@ -1,7 +1,7 @@
 """Standalone T70 test: fixed GFP/RFP/Sox9, joint Olig2 alignment.
 
 Reads existing raw detections and saved alignment, writes an independent result
-root containing 0_channel_alignment/*.csv and *_offsets.json for all channels.
+root containing 3_2d_aligned/*.csv and *_offsets.json for all channels.
 The main pipeline and its outputs are never changed.
 
 Example:
@@ -363,9 +363,9 @@ def main(argv=None):
     results = args.results_dir.resolve()
     output = (args.output_root or
               results.with_name(results.name + "_olig2_three_refs")).resolve()
-    original_align = results / "0_channel_alignment"
-    raw_dir = results / "1_tile_2d_raw"
-    output_align = output / "0_channel_alignment"
+    original_align = results / "3_2d_aligned"
+    raw_dir = results / "1_2d_raw"
+    output_align = output / "3_2d_aligned"
     if output in (results, original_align, raw_dir):
         parser.error("--output-root must be separate from original results")
     if not original_align.is_dir() or not raw_dir.is_dir():

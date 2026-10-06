@@ -316,9 +316,9 @@ def main():
 
     # 3. Load detection CSVs
     print("Loading detections...")
-    s2_dir = os.path.join(result_dir, '2_global_2d_raw')
-    s3_dir = os.path.join(result_dir, '3_channel_3d')
-    s4_dir = os.path.join(result_dir, '4_colocalization')
+    s2_dir = os.path.join(result_dir, '5_2d_global')
+    s3_dir = os.path.join(result_dir, '6_3d_global')
+    s4_dir = os.path.join(result_dir, '7_colocalization')
 
     det_2d, det_3d = {}, {}
     for ch in channels:

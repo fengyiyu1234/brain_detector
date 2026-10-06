@@ -5,12 +5,6 @@ from pathlib import Path
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
-import numpy as np
-import pandas as pd
-
-from scripts.solve_tile_positions import (
-    channel_xml_positions, write_channel_xml, publish_channel_xml,
-)
 from src.core.tile_position_pipeline import run_tile_position_stage, tile_position_frame
 
 
@@ -25,6 +19,14 @@ class TilePositionPipelineTests(unittest.TestCase):
             tile_position_frame(config)
 
     def test_image_xml_uses_seam_geometry_and_channel_translation(self):
+        try:
+            import numpy as np
+            import pandas as pd
+            from scripts.solve_tile_positions import (
+                channel_xml_positions, write_channel_xml, publish_channel_xml,
+            )
+        except ModuleNotFoundError as exc:
+            self.skipTest(str(exc))
         rows = pd.DataFrame({
             'tile': ['t0', 't1'],
             'P_GFP_x': [10, 110], 'P_GFP_y': [20, 20], 'P_GFP_z': [4, 6],
@@ -70,56 +72,63 @@ class TilePositionPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             det, align, report = (root / x for x in
-                                  ('1_tile_2d_prefiltered', '0_channel_alignment',
-                                   '5_analysis_report/tile_positions'))
+                                  ('2_2d_filtered', '3_2d_aligned',
+                                   '5_2d_global/tile_positions'))
             channels = [{'id': 'GFP', 'type': 'soma', 'dir_key': 'gfp'},
                         {'id': 'Olig2', 'type': 'tf', 'dir_key': 'olig2'}]
             paths = {}
             for ch in channels:
                 directory = root / ch['id']
-                directory.mkdir()
-                (directory / 'xml_import.xml').write_text('<root/>')
+                (directory / 't0' / 't0').mkdir(parents=True)
                 paths[ch['dir_key']] = str(directory)
             det.mkdir()
-            align.mkdir()
+            align.mkdir(parents=True)
             for ch in channels:
-                (det / f"t0_{ch['id']}_result.csv").write_text('z,x\\n1,2\\n')
+                (det / f"t0_{ch['id']}_result.csv").write_text('z,x\n1,2\n')
             (align / 't0_offsets.json').write_text('{}')
             script = root / 'solver.py'
             script.write_text('pass')
+            xml_script = root / 'generator.py'
+            xml_script.write_text('pass')
             cfg = root / 'config.json'
             cfg.write_text('{}')
             config = {'paths': paths, 'stitching_reference_channel': 'Olig2',
                       'pre_align_params': {'reference_channel': 'GFP'},
                       'tile_position_params': {'enabled': True}}
             calls = []
+
             def fake_run(command, check):
                 calls.append(command)
                 report.mkdir(parents=True, exist_ok=True)
-                for ch in channels:
-                    name = f"xml_merging_{ch['id']}.xml"
-                    (report / name).write_text('<root/>')
-                    (Path(paths[ch['dir_key']]) / 'xml_merging.xml').write_text('<root/>')
-                    (Path(paths[ch['dir_key']]) / 'xml_merging.original.xml').write_text('<root/>')
+                if command[1] == str(script):
+                    (report / 'tile_positions.csv').write_text('tile\n t0\n')
+                    (report / 'solution.json').write_text('{}')
+                else:
+                    for ch in channels:
+                        (report / f"xml_merging_{ch['id']}.xml").write_text('<root/>')
+
             call = lambda: run_tile_position_stage(
                 config, str(cfg), str(root), str(det), str(align), str(report),
-                ['t0'], channels, str(script))
+                ['t0'], channels, str(script), str(xml_script))
             with patch('src.core.tile_position_pipeline.subprocess.run', side_effect=fake_run):
                 frame_xml, computed = call()
                 self.assertTrue(computed)
                 self.assertTrue(frame_xml.endswith('xml_merging_Olig2.xml'))
+                self.assertEqual(len(calls), 2)
                 self.assertIn('--alignment-from', calls[0])
-                self.assertIn('--xml-into-channel-dirs', calls[0])
+                self.assertNotIn('--xml-into-channel-dirs', calls[0])
+                self.assertIn('--positions', calls[1])
+                self.assertFalse(any((Path(path) / 'xml_merging.xml').exists()
+                                     for path in paths.values()))
                 self.assertFalse(call()[1])
                 source = det / 't0_GFP_result.csv'
-                source.write_text('z,x\\n1,2\\n2,3\\n')
-                global_dir = root / '2_global_2d_raw'
-                global_dir.mkdir()
+                source.write_text('z,x\n1,2\n2,3\n')
+                global_dir = root / '5_2d_global'
+                global_dir.mkdir(exist_ok=True)
                 (global_dir / 'GFP_2d_global.csv').write_text('global')
                 with self.assertRaisesRegex(RuntimeError, 'global checkpoints'):
                     call()
-                self.assertEqual(len(calls), 1)
-
+                self.assertEqual(len(calls), 2)
 
 if __name__ == '__main__':
     unittest.main()

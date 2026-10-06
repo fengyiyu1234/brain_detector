@@ -110,7 +110,7 @@ def listTile(path):
 
 def listTile_from_local_csvs(det_res_path, anchor_ch_id, anchor_dir):
     """Fast alternative to listTile() when tile detection is already done.
-    Scans local 1_tile_2d_raw/ for *_{anchor_ch_id}_result.csv files,
+    Scans local 1_2d_raw/ for *_{anchor_ch_id}_result.csv files,
     extracts tile names, and reconstructs full paths by walking anchor_dir
     and matching on leaf-directory basename (handles both flat and nested
     tile directory layouts)."""

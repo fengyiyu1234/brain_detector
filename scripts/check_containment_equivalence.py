@@ -155,7 +155,7 @@ def parse_args():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--sample', required=True, help='样本根目录（或 detection_results/）')
     ap.add_argument('--config', default=None, help='默认 <results_dir>/runtime_config.json')
-    ap.add_argument('--det-dir', default=None, help='默认 <results_dir>/1_tile_2d_prefiltered')
+    ap.add_argument('--det-dir', default=None, help='默认 <results_dir>/2_2d_filtered')
     ap.add_argument('--tiles', default=None, help='逗号分隔的 tile 名；默认按细胞数自动挑')
     ap.add_argument('--n-tiles', type=int, default=2, help='自动挑几个 tile（默认 2）')
     ap.add_argument('--ref', default=None, help='soma 参考通道；默认 config 的 reference_channel')
@@ -171,13 +171,13 @@ def main():
     args = parse_args()
     sample = os.path.abspath(args.sample)
     results_dir = next((c for c in (os.path.join(sample, 'detection_results'), sample)
-                        if os.path.isdir(os.path.join(c, '1_tile_2d_raw'))), None)
+                        if os.path.isdir(os.path.join(c, '1_2d_raw'))), None)
     if results_dir is None:
-        raise SystemExit(f"❌ 在 {sample} 下找不到 1_tile_2d_raw")
+        raise SystemExit(f"❌ 在 {sample} 下找不到 1_2d_raw")
     config = load_config(args.config or os.path.join(results_dir, 'runtime_config.json'))
     routing = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
     settings = pca.resolve_align_settings(config, routing)
-    det_dir = args.det_dir or os.path.join(results_dir, '1_tile_2d_prefiltered')
+    det_dir = args.det_dir or os.path.join(results_dir, '2_2d_filtered')
     ref = args.ref or settings['reference_channel']
     tf_channels = ([c.strip() for c in args.tf_channels.split(',')] if args.tf_channels
                    else settings['tf_ch_ids'])

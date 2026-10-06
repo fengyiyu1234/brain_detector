@@ -11,7 +11,7 @@ Reads config/vis_config.json and launches napari in one of three modes:
 
   mode: "post"
     Post-pipeline results for one tile.  Raw (unshifted) images.
-    [s1] raw 2D detections, [s3] saved z-linked tracks from 3_channel_3d/,
+    [s1] raw 2D detections, [s3] saved z-linked tracks from 6_3d_global/,
     [s4] colocalization result.
 
   mode: "2d"
@@ -1661,7 +1661,7 @@ def _load_second_intensity_image(ch, paths, anchor_dir, tile_path, z_range,
 
     offsets: per-channel shift dict for prealign or 2d, keyed by channel id — the pipeline
     already copies the primary channel's shift onto second_intensity_id when writing
-    0_channel_alignment/*_offsets.json, so this needs no special-case resolution.
+    3_2d_aligned/*_offsets.json, so this needs no special-case resolution.
     Pass None in post mode (raw, unshifted images).
     Returns (second_id, volume, contrast_limits, display_id), or None.
     """
@@ -1695,12 +1695,12 @@ def _run_2d(vis_cfg, paths, routing_config, tile_path, tile_name):
     if source not in ('raw', 'filtered'):
         raise ValueError("2d_source must be 'raw' or 'filtered'")
     csv_dir = os.path.join(paths['pATHRESULT'], {
-        'raw': '0_channel_alignment',
-        'filtered': '1_tile_2d_filtered',
+        'raw': '3_2d_aligned',
+        'filtered': '4_2d_filtered',
     }[source])
     if not os.path.isdir(csv_dir):
         raise FileNotFoundError(f"2D {source} result directory does not exist: '{csv_dir}'")
-    offset_path = os.path.join(paths['pATHRESULT'], '0_channel_alignment',
+    offset_path = os.path.join(paths['pATHRESULT'], '3_2d_aligned',
                                f"{tile_name}_offsets.json")
     if not os.path.isfile(offset_path):
         raise FileNotFoundError(f"Channel alignment offsets do not exist: '{offset_path}'")
@@ -1815,11 +1815,11 @@ def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
     coloc_opacity = vis_cfg.get('coloc_opacity', 0.9)
 
     base_res     = paths['pATHRESULT']
-    raw_dir      = os.path.join(base_res, '1_tile_2d_raw')
-    filtered_dir = os.path.join(base_res, '1_tile_2d_filtered')
-    fused_dir    = os.path.join(base_res, '1_tile_2d_fused')
-    s3_dir    = os.path.join(base_res, '3_channel_3d')
-    coloc_csv = os.path.join(base_res, '4_colocalization', 'coloc_result.csv')
+    raw_dir      = os.path.join(base_res, '1_2d_raw')
+    filtered_dir = os.path.join(base_res, '4_2d_filtered')
+    fused_dir    = os.path.join(base_res, '3_2d_aligned_fusion')
+    s3_dir    = os.path.join(base_res, '6_3d_global')
+    coloc_csv = os.path.join(base_res, '7_colocalization', 'coloc_result.csv')
 
     anchor_ch  = routing_config[0]
     anchor_dir = os.path.abspath(paths[anchor_ch['dir_key']])
@@ -1898,7 +1898,7 @@ def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
         print(f"[overlap] hiding boxes in left={left_m}px / top={top_m}px margin")
     _add_margin_overlay(viewer, canvas_shape, left_m, top_m)
 
-    # ── [s1] 2D detections (from 1_tile_2d_filtered — regular channels are filtered
+    # ── [s1] 2D detections (from 4_2d_filtered — regular channels are filtered
     # directly, double_exposure channels are fused then filtered; either way this is
     # the single source of truth Stage 3 itself reads from) ──────────────────────
     if stage_cfg in ('all', 's1'):

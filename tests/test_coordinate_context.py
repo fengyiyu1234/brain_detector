@@ -35,7 +35,7 @@ class CoordinateContextTests(unittest.TestCase):
         }
         with open(os.path.join(result, "runtime_config.json"), "w", encoding="utf-8") as f:
             json.dump(runtime, f)
-        align = os.path.join(result, "0_channel_alignment")
+        align = os.path.join(result, "3_2d_aligned")
         os.makedirs(align)
         with open(os.path.join(align, f"{self.tile}_offsets.json"), "w", encoding="utf-8") as f:
             json.dump({"GFP": {"dx": 7, "dy": 28, "dz": -3},
@@ -141,7 +141,7 @@ class CoordinateContextTests(unittest.TestCase):
     def test_prealign_requires_complete_offsets(self):
         tmp, context = self._make_context()
         self.addCleanup(tmp.cleanup)
-        path = os.path.join(context.result_dir, "0_channel_alignment", f"{self.tile}_offsets.json")
+        path = os.path.join(context.result_dir, "3_2d_aligned", f"{self.tile}_offsets.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"Olig2": {"dx": 0, "dy": 0, "dz": 0}}, f)
         with self.assertRaisesRegex(CoordinateContextError, "GFP"):

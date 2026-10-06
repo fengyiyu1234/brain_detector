@@ -1,4 +1,4 @@
-﻿"""Read-only Napari review for raw TIFs with saved filtered detection boxes.
+"""Read-only Napari review for raw TIFs with saved filtered detection boxes.
 
 Tile selection is printed as a spatial grid in the terminal (the same interface as
 src.utils.visualize); comma-separated tile indices open multiple review windows.
@@ -40,7 +40,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--filtered-dir",
-        help="Directory containing <tile>_<channel>_result.csv; defaults to 1_tile_2d_filtered.",
+        help="Directory containing <tile>_<channel>_result.csv; defaults to 4_2d_filtered.",
     )
     return parser.parse_args()
 
@@ -157,8 +157,8 @@ def main() -> int:
         raise ValueError("Config requires paths and at least one active channels_routing entry.")
 
     base_result = paths["pATHRESULT"]
-    filtered_dir = os.path.abspath(args.filtered_dir or os.path.join(base_result, "1_tile_2d_filtered"))
-    align_dir = os.path.join(base_result, "0_channel_alignment")
+    filtered_dir = os.path.abspath(args.filtered_dir or os.path.join(base_result, "4_2d_filtered"))
+    align_dir = os.path.join(base_result, "3_2d_aligned")
     pipeline_mode = config.get("pipeline_mode", "post_align")
     anchor_dir = os.path.abspath(paths[channels[0]["dir_key"]])
     _, tile_paths = listTile(anchor_dir)

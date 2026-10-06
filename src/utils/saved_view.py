@@ -56,7 +56,7 @@ def saved_run_context(vis_config: dict) -> tuple[dict, CoordinateContext | None]
                 candidates.append(os.path.join(result_dir, *relative.split("/")))
     if frame:
         candidates.append(os.path.join(
-            result_dir, "5_analysis_report", "tile_positions",
+            result_dir, "5_2d_global", "tile_positions",
             f"xml_merging_{frame}.xml"))
     if vis_paths.get("pATHXML") and (
             not runtime_xml or

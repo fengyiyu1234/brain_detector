@@ -1401,10 +1401,10 @@ def validate_alignment_frame(align_dir, tile_names, channel_ids, frame_channel):
 
 def validate_cached_geometry(previous, current, results_dir, settings):
     """Reject reused alignment/global checkpoints after coordinate config changes."""
-    align_dir = os.path.join(results_dir, '0_channel_alignment')
+    align_dir = os.path.join(results_dir, '3_2d_aligned')
     has_alignment = os.path.isdir(align_dir) and any(
         name.endswith('_offsets.json') for name in os.listdir(align_dir))
-    downstream = ('2_global_2d_raw', '3_channel_3d', '4_colocalization')
+    downstream = ('5_2d_global', '6_3d_global', '7_colocalization')
     has_global = any(
         os.path.isdir(os.path.join(results_dir, stage)) and
         any(name.endswith(('.csv', '.pkl')) for name in os.listdir(os.path.join(results_dir, stage)))
@@ -1421,6 +1421,11 @@ def validate_cached_geometry(previous, current, results_dir, settings):
     old_ref = old_ref or (old_somas[0] if old_somas else None)
     old_xml = previous.get('paths', {}).get('pATHXML') or ''
     new_xml = current.get('paths', {}).get('pATHXML') or ''
+    # The directory rename changes only the stored XML path, not its geometry.
+    old_xml = old_xml.replace('5_analysis_report/tile_positions/',
+                              '5_2d_global/tile_positions/').replace(
+                                  '5_analysis_report\\tile_positions\\',
+                                  '5_2d_global\\tile_positions\\')
     name = os.path.basename(old_xml)
     named_frame = name[len('xml_merging_'):-len('.xml')] if (
         name.startswith('xml_merging_') and name.endswith('.xml')) else None
@@ -1431,13 +1436,13 @@ def validate_cached_geometry(previous, current, results_dir, settings):
     if has_alignment and old_ref != new_ref:
         raise ValueError(
             f"Alignment reference changed {old_ref!r} -> {new_ref!r}; "
-            "archive/regenerate 0_channel_alignment and downstream checkpoints")
+            "archive/regenerate 3_2d_aligned and downstream checkpoints")
     if has_global and (old_ref != new_ref or old_frame != new_frame or
                        os.path.normcase(os.path.abspath(old_xml)) !=
                        os.path.normcase(os.path.abspath(new_xml))):
         raise ValueError(
             "Stitching geometry/reference changed while global checkpoints exist; "
-            "archive/regenerate 2_global_2d_raw, 3_channel_3d, 4_colocalization, "
+            "archive/regenerate 5_2d_global, 6_3d_global, 7_colocalization, "
             "and downstream reports")
 
 ALIGN_SETTINGS_FILE = "_align_settings.json"

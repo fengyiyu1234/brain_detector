@@ -143,10 +143,10 @@ class AlignmentFrameTests(unittest.TestCase):
     def test_existing_cache_rejects_reference_or_xml_change(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            align = root / "0_channel_alignment"
-            align.mkdir()
+            align = root / "3_2d_aligned"
+            align.mkdir(parents=True)
             (align / "tile_a_offsets.json").write_text("{}", encoding="utf-8")
-            global_dir = root / "2_global_2d_raw"
+            global_dir = root / "5_2d_global"
             global_dir.mkdir()
             (global_dir / "GFP_2d_global.csv").touch()
             previous = {

@@ -42,7 +42,7 @@ z 深度不足以留出窗口外区域时会退化成「窗口内取样」并在
 （Agg 后端加载 DLL 失败，Windows 异常 0xc06d007f），antsreg 环境正常。CSV 在画图
 之前就已经写盘，崩了也不丢数据；这类环境加 --no-plots 跑，或换环境画图。
 
-输出（默认写到 <results_dir>/5_analysis_report/align_validation/）
+输出（默认写到 <results_dir>/5_2d_global/align_validation/）
   <sample>_curves.csv    每个 (tile, 区域, 通道, 轴, delta) 一行的原始曲线数据
   <sample>_summary.csv   每个 (tile, 通道, 指标, 轴) 一行的峰值/半高宽/跌幅汇总
   <sample>_<channel>_<metric>.png  曲线图：细线=单个区域，粗线=所有区域均值
@@ -88,19 +88,19 @@ _SOMA_PAD_PX = 64
 def resolve_results_dir(sample):
     """--sample 既可以是样本根目录，也可以直接是 detection_results 目录。"""
     for cand in (sample, os.path.join(sample, 'detection_results')):
-        if os.path.isdir(os.path.join(cand, '1_tile_2d_raw')):
+        if os.path.isdir(os.path.join(cand, '1_2d_raw')):
             return os.path.abspath(cand)
-    raise SystemExit(f"❌ 在 {sample} 下找不到 1_tile_2d_raw/，请确认 --sample 指向样本目录或 detection_results 目录。")
+    raise SystemExit(f"❌ 在 {sample} 下找不到 1_2d_raw/，请确认 --sample 指向样本目录或 detection_results 目录。")
 
 
 def load_settings(results_dir, config_path):
     """
     取回 Stage 2.5 实际用过的对齐设置。
 
-    优先读 0_channel_alignment/_align_settings.json（新版本流程会落盘，最可靠）；
+    优先读 3_2d_aligned/_align_settings.json（新版本流程会落盘，最可靠）；
     旧结果没有这个文件，就用 config 重新解析一份（要求 config 里的对齐参数没改过）。
     """
-    align_dir = os.path.join(results_dir, '0_channel_alignment')
+    align_dir = os.path.join(results_dir, '3_2d_aligned')
     cfg_path = config_path or os.path.join(results_dir, 'runtime_config.json')
     if not os.path.isfile(cfg_path):
         raise SystemExit(f"❌ 找不到配置文件 {cfg_path}，请用 --config 指定当初跑这个样本用的 config。")
@@ -464,7 +464,7 @@ def parse_args():
     ap.add_argument('--config', default=None,
                     help='对齐时用的 config；默认读 <results_dir>/runtime_config.json')
     ap.add_argument('--out-dir', default=None,
-                    help='输出目录；默认 <results_dir>/5_analysis_report/align_validation')
+                    help='输出目录；默认 <results_dir>/5_2d_global/align_validation')
     ap.add_argument('--tiles', default=None, help='逗号分隔的 tile 名；不给则从已对齐 tile 里随机抽')
     ap.add_argument('--n-tiles', type=int, default=5, help='随机抽多少个 tile（--tiles 未给时生效）')
     ap.add_argument('--regions-per-tile', type=int, default=2, help='每个 tile 取几个随机子区域')
@@ -511,7 +511,7 @@ def main():
                        settings['z_link']['tf']['max_cell_z_span'])
                    + settings['z_search_range_slices'] + settings['z_fine_search_slices'])
 
-    out_dir = args.out_dir or os.path.join(results_dir, '5_analysis_report', 'align_validation')
+    out_dir = args.out_dir or os.path.join(results_dir, '5_2d_global', 'align_validation')
     os.makedirs(out_dir, exist_ok=True)
 
     print(f"样本      : {sample_name}  ({results_dir})")
@@ -525,7 +525,7 @@ def main():
 
     params = {
         'settings': settings, 'routing': routing, 'align_dir': align_dir,
-        'filtered_dir': os.path.join(results_dir, '1_tile_2d_prefiltered'),
+        'filtered_dir': os.path.join(results_dir, '2_2d_filtered'),
         'sweep': ((args.xy_range, args.xy_step), (args.xy_range, args.xy_step),
                   (args.z_range, args.z_step)),
         'regions_per_tile': args.regions_per_tile, 'xy_size': args.xy_size, 'z_size': args.z_size,

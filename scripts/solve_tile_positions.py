@@ -61,10 +61,10 @@ model='free' 则是每个通道各解各的（不加平滑约束），留作对�
 
 输入
 ----
-`1_tile_2d_prefiltered/` 里的逐 tile 检测 CSV，以及 tile 目录名（台面坐标，单位 0.1 µm，
+`2_2d_filtered/` 里的逐 tile 检测 CSV，以及 tile 目录名（台面坐标，单位 0.1 µm，
 见 src/utils/io.STAGE_UNIT_UM）当初值。**不需要任何 TeraStitcher XML。**
 
-输出（默认 <results_dir>/5_analysis_report/tile_positions/）
+输出（默认 <results_dir>/5_2d_global/tile_positions/）
   seams.csv            每条 (通道, 接缝) 的实测位移与配对质量；再次运行时直接复用
   tile_positions.csv   每个 tile 的共用位置、各通道位置、各通道相对参考通道的偏移
                        （field_ = 通道场，refine_ = 逐 tile 精修增量，s_ = 搬到 frame 的总量）
@@ -73,7 +73,7 @@ model='free' 则是每个通道各解各的（不加平滑约束），留作对�
 
 可选输出
   --write-xml     每个通道写一份 xml_merging.xml（TeraStitcher 只跑 merge）
-  --write-aligned 写成 0_channel_alignment 的格式（offsets JSON + 平移后的 CSV），
+  --write-aligned 写成 3_2d_aligned 的格式（offsets JSON + 平移后的 CSV），
                   可以直接顶替 Stage 2.5 的结果；默认写到新目录，不覆盖原结果
 
 用法
@@ -669,7 +669,7 @@ def parse_const(specs):
 
 
 def load_old_offsets(align_dir):
-    """读已有的 0_channel_alignment 逐 tile 偏移 → {tile: {ch: {dx, dy, dz, ...}}}。"""
+    """读已有的 3_2d_aligned 逐 tile 偏移 → {tile: {ch: {dx, dy, dz, ...}}}。"""
     old = {}
     if not align_dir or not os.path.isdir(align_dir):
         return old
@@ -682,7 +682,7 @@ def load_old_offsets(align_dir):
 
 def const_from_offsets(align_dir, tiles, field, channels, ref):
     """
-    用已有的 0_channel_alignment 逐 tile 偏移定常数：a_c = median(旧偏移 − 通道场)。
+    用已有的 3_2d_aligned 逐 tile 偏移定常数：a_c = median(旧偏移 − 通道场)。
     返回 ({CH: (dx, dy, dz)}, {CH: 各轴的离散度})。旧偏移越可信，离散度越小。
     """
     old = load_old_offsets(align_dir)
@@ -776,7 +776,7 @@ def publish_channel_xml(report_xml, channel_dir, template):
 
 def write_aligned(out_dir, tiles, shifts, det_dir, tile_dirs, routing, mark_done):
     """
-    按 0_channel_alignment 的格式写偏移 JSON + 平移后的检测 CSV。
+    按 3_2d_aligned 的格式写偏移 JSON + 平移后的检测 CSV。
     shifts: {tile: {ch: (dx, dy, dz)}}，取整后写入（下游按整数像素/层处理）。
     """
     os.makedirs(out_dir, exist_ok=True)
@@ -812,13 +812,13 @@ def parse_args():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--alignment-from', choices=['solved', 'old-offsets'], default='solved',
                     help="solved=derive alignment here (default); old-offsets=preserve every "
-                         "per-tile offset from 0_channel_alignment and rebase it to --frame")
+                         "per-tile offset from 3_2d_aligned and rebase it to --frame")
     ap.add_argument('--sample', required=True, help='样本根目录（或直接给 detection_results/）')
     ap.add_argument('--config', default=None, help='默认 <results_dir>/runtime_config.json')
     ap.add_argument('--det-dir', default=None,
-                    help='Filtered, unaligned tile CSVs in pre_align; defaults to 1_tile_2d_prefiltered')
+                    help='Filtered, unaligned tile CSVs in pre_align; defaults to 2_2d_filtered')
     ap.add_argument('--out-dir', default=None,
-                    help='默认 <results_dir>/5_analysis_report/tile_positions')
+                    help='默认 <results_dir>/5_2d_global/tile_positions')
     ap.add_argument('--channels', default=None, help='逗号分隔；默认 config 里所有 active 通道')
     ap.add_argument('--ref', default=None,
                     help='通道对齐的参考通道（通道场和常数都相对它；MADM 可用 GFP 或 RFP）；'
@@ -850,7 +850,7 @@ def parse_args():
                     help='通道相对参考通道的全局常数偏移，可重复；接缝解不出这一项')
     ap.add_argument('--const-from', choices=['pooled', 'offsets', 'none'], default='pooled',
                     help="没给 --const 的通道怎么定常数：pooled=把全脑所有 tile 的细胞汇总起来"
-                         "一次估 3 个数（默认）；offsets=取已有 0_channel_alignment 的中位数；none=当作 0")
+                         "一次估 3 个数（默认）；offsets=取已有 3_2d_aligned 的中位数；none=当作 0")
     ap.add_argument('--const-z-window', type=int, default=None,
                     help='汇总估计取每个 tile 中心多少层；默认 pre_align_params.sample_z_center_count')
     ap.add_argument('--const-win-xy', type=float, default=60, help='常数粗搜索 XY 半径（px）')
@@ -863,7 +863,7 @@ def parse_args():
                     help='包含度粗搜索用多少细胞；粗搜索候选多、精度要求低，用更小的抽样')
     ap.add_argument('--const-seed', type=int, default=0, help='上面那个抽样的随机种子')
     ap.add_argument('--no-compare-old', action='store_true',
-                    help='不做 held-out 对照（默认只要有 0_channel_alignment 就做）')
+                    help='不做 held-out 对照（默认只要有 3_2d_aligned 就做）')
     ap.add_argument('--holdout-gap', type=float, default=1.5,
                     help='held-out z 段离中心窗多远，单位是窗厚；1.5 = 隔开半个窗（默认）')
     ap.add_argument('--holdout-max-cells', type=int, default=300000,
@@ -886,9 +886,9 @@ def parse_args():
     ap.add_argument('--refine-min-count', type=int, default=5,
                     help='精修得到的包含数低于此值就当没信息，退回全局解')
     ap.add_argument('--write-aligned', action='store_true',
-                    help='写 0_channel_alignment 格式的偏移 JSON + 平移后的 CSV')
+                    help='写 3_2d_aligned 格式的偏移 JSON + 平移后的 CSV')
     ap.add_argument('--aligned-dir', default=None,
-                    help='默认 <results_dir>/0_channel_alignment_solved（不覆盖原结果）')
+                    help='默认 <results_dir>/3_2d_aligned_solved（不覆盖原结果）')
     ap.add_argument('--mark-done', action='store_true',
                     help='在 --write-aligned 的目录里写 _align_done.flag，让流程跳过 Stage 2.5')
     ap.add_argument('--force', action='store_true', help='允许写入已有内容的目录')
@@ -900,7 +900,7 @@ def main():
     sample_dir = os.path.abspath(args.sample)
     results_dir = cs.resolve_results_dir(sample_dir)
     if results_dir is None:
-        raise SystemExit(f"❌ 在 {sample_dir} 下找不到 detection_results（要有 1_tile_2d_raw）")
+        raise SystemExit(f"❌ 在 {sample_dir} 下找不到 detection_results（要有 1_2d_raw）")
     cfg_path = args.config or os.path.join(results_dir, 'runtime_config.json')
     if not os.path.isfile(cfg_path):
         raise SystemExit(f"❌ 找不到 config：{cfg_path}")
@@ -924,15 +924,15 @@ def main():
     if frame not in channels:
         raise SystemExit(f"❌ 坐标系通道 {frame} 不在 --channels {channels} 里")
 
-    default_csv_dir = ('1_tile_2d_prefiltered'
+    default_csv_dir = ('2_2d_filtered'
                        if config.get('pipeline_mode') == 'pre_align'
-                       else '1_tile_2d_filtered')
+                       else '4_2d_filtered')
     det_dir = args.det_dir or os.path.join(results_dir, default_csv_dir)
     if not os.path.isdir(det_dir):
         raise FileNotFoundError(
             f"Filtered tile CSV directory does not exist: {det_dir}. "
             "Run the detection pipeline's tile filtering stages first.")
-    out_dir = args.out_dir or os.path.join(results_dir, '5_analysis_report', 'tile_positions')
+    out_dir = args.out_dir or os.path.join(results_dir, '5_2d_global', 'tile_positions')
     os.makedirs(out_dir, exist_ok=True)
 
     tiles, partial = discover_tiles(det_dir, channels)
@@ -1066,7 +1066,7 @@ def main():
     const_info = {}
     solution_cmp = {}
     solution_insample = {}
-    align_dir = os.path.join(results_dir, '0_channel_alignment')
+    align_dir = os.path.join(results_dir, '3_2d_aligned')
     use_old_alignment = args.alignment_from == 'old-offsets'
     todo = [] if use_old_alignment else [ch for ch in channels if ch != ref and ch not in const]
     # 下面三样在 --const-from pooled 时才有；逐 tile 精修和新旧对照都复用它们
@@ -1402,7 +1402,7 @@ def main():
         say("Channel XMLs preserve seam geometry plus global channel translation.")
 
     if args.write_aligned:
-        aligned_dir = args.aligned_dir or os.path.join(results_dir, '0_channel_alignment_solved')
+        aligned_dir = args.aligned_dir or os.path.join(results_dir, '3_2d_aligned_solved')
         if os.path.isdir(aligned_dir) and os.listdir(aligned_dir) and not args.force:
             raise SystemExit(f"❌ {aligned_dir} 非空；换个 --aligned-dir 或加 --force")
         missing_const = ([] if use_old_alignment else
@@ -1416,7 +1416,7 @@ def main():
         write_aligned(aligned_dir, tiles, shifts, det_dir, tile_dirs, routing, args.mark_done)
         say(f"  {len(tiles)} 个 tile × {len(channels)} 通道"
             + ("，已写 _align_done.flag" if args.mark_done else
-               "，没写 _align_done.flag（流程仍会跑 Stage 2.5，除非把这个目录顶替 0_channel_alignment）"))
+               "，没写 _align_done.flag（流程仍会跑 Stage 2.5，除非把这个目录顶替 3_2d_aligned）"))
 
     with open(os.path.join(out_dir, 'report.txt'), 'w', encoding='utf-8') as f:
         f.write('\n'.join(log) + '\n')

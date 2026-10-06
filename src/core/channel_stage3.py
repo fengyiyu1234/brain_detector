@@ -4,8 +4,8 @@ Stage 3 的单通道部分：全局 2D 拼接 → Z-Link → 落盘。
 
 各通道之间互不依赖，run_inference.py 把每个通道交给一个进程并行执行；跨通道的
 3D 共定位（3A/3B/3C）仍在主进程里做。每一步都保留原来的 checkpoint 语义：
-  2_global_2d_raw/<ch>_2d_global.csv  存在 → 不再拼接；tile/slice 溯源信息从它的 tile_name/slice_name 列恢复
-  3_channel_3d/<ch>_3d_tracked.pkl     存在 → 不再 Z-Link
+  5_2d_global/<ch>_2d_global.csv  存在 → 不再拼接；tile/slice 溯源信息从它的 tile_name/slice_name 列恢复
+  6_3d_global/<ch>_3d_tracked.pkl     存在 → 不再 Z-Link
 """
 
 import csv

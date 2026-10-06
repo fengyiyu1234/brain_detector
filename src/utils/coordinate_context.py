@@ -225,7 +225,7 @@ class CoordinateContext:
         return cls.from_vis_config(config, runtime_path)
 
     def offsets_for_tile(self, tile_name: str) -> dict:
-        path = os.path.join(self.result_dir, "0_channel_alignment", f"{tile_name}_offsets.json")
+        path = os.path.join(self.result_dir, "3_2d_aligned", f"{tile_name}_offsets.json")
         if not os.path.isfile(path):
             if self.pipeline_mode == "pre_align":
                 raise CoordinateContextError(f"Missing pre_align offsets for tile '{tile_name}': '{path}'")

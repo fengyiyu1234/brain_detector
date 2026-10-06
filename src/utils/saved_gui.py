@@ -1,4 +1,4 @@
-﻿"""Napari views of saved pre-align pipeline outputs.
+"""Napari views of saved pre-align pipeline outputs.
 
 All cell layers come from CSV/PKL checkpoints. Image shifts and coordinate
 translations are the only operations performed by this module.
@@ -151,10 +151,9 @@ def _add_images(viewer, vis_cfg, paths, routing, anchor_dir, tile_path,
 def _add_tile_2d(viewer, result_dir, tile_name, routing, offsets,
                  z_range, position, global_view, registry, width, vis_cfg):
     stages = (
-        ("1_tile_2d_raw", "raw", bool(vis_cfg.get("show_before", False)), True),
-        ("1_tile_2d_prefiltered", "prefiltered", False, True),
-        ("0_channel_alignment", "aligned", False, False),
-        ("1_tile_2d_filtered", "filtered",
+        ("1_2d_raw", "raw", bool(vis_cfg.get("show_before", False)), True),
+        ("2_2d_filtered", "prefiltered", False, True),
+        ("4_2d_filtered", "filtered",
          bool(vis_cfg.get("show_filtered_2d", False)), False),
     )
     for ch in routing:
@@ -166,9 +165,7 @@ def _add_tile_2d(viewer, result_dir, tile_name, routing, offsets,
             o = offsets.get(cid, offsets.get(
                 primary, {"dx": 0, "dy": 0, "dz": 0}))
             for directory, label, visible, needs_shift in stages:
-                if not is_primary and directory == "1_tile_2d_filtered":
-                    continue  # The fused logical channel owns the final 2D CSV.
-                if not offsets and directory != "1_tile_2d_raw":
+                if not offsets and directory != "1_2d_raw":
                     continue  # No saved transform for aligned stages yet.
                 path = os.path.join(
                     result_dir, directory, f"{tile_name}_{cid}_result.csv")
@@ -183,7 +180,7 @@ def _add_tile_2d(viewer, result_dir, tile_name, routing, offsets,
                     rows = _to_global_rows(rows, position)
                 _add_box_layer(
                     viewer, rows, f"[2d {label}] {tile_name} {cid}",
-                    visible=visible, width=width, registry=registry,
+                    visible=visible and is_primary, width=width, registry=registry,
                     channel=cid, source=directory)
 
 
@@ -193,8 +190,8 @@ def _add_global_results(viewer, result_dir, routing, xy_bounds,
     for ch in routing:
         cid = ch["id"]
         for directory, filename, label in (
-            ("2_global_2d_raw", f"{cid}_2d_global.csv", "global"),
-            ("3_channel_3d", f"{cid}_3d_tracked.csv", "s3"),
+            ("5_2d_global", f"{cid}_2d_global.csv", "global"),
+            ("6_3d_global", f"{cid}_3d_tracked.csv", "s3"),
         ):
             saved_path = os.path.join(result_dir, directory, filename)
             if not os.path.isfile(saved_path):
@@ -222,7 +219,7 @@ def _add_global_results(viewer, result_dir, routing, xy_bounds,
                     face_color=_ch_vis(cid).get("colormap", "white"),
                     n_dimensional=True)
     if show_coloc:
-        path = os.path.join(result_dir, "4_colocalization", "coloc_result.csv")
+        path = os.path.join(result_dir, "7_colocalization", "coloc_result.csv")
         rows = read_global_boxes(path, xy_bounds, global_z_range)
         rows = _intersects_any(rows, tile_bounds)
         if not global_view:
@@ -284,12 +281,12 @@ def _attach_clicks(viewer, registry, result_dir, context, tile_contexts,
                     f"score={row.get('score', float('nan')):.3f} "
                     f"mean={row.get('mean', float('nan')):.1f}")
         print(f"[saved row] {label}: {row}")
-        if not is_shift or row["source"] != "3_channel_3d":
+        if not is_shift or row["source"] != "6_3d_global":
             if is_shift and row["source"] == "s4":
                 v.status += " | Stage 4 stores representative z only"
             return
         cid = row["channel"]
-        pkl_path = os.path.join(result_dir, "3_channel_3d", f"{cid}_3d_tracked.pkl")
+        pkl_path = os.path.join(result_dir, "6_3d_global", f"{cid}_3d_tracked.pkl")
         if not os.path.isfile(pkl_path):
             v.status = f"Saved track unavailable: {pkl_path}"
             return
@@ -417,7 +414,7 @@ def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles):
 
 
 def _load_offsets_if_present(result_dir, tile_name):
-    path = os.path.join(result_dir, "0_channel_alignment", f"{tile_name}_offsets.json")
+    path = os.path.join(result_dir, "3_2d_aligned", f"{tile_name}_offsets.json")
     if not os.path.isfile(path):
         return {}
     import json

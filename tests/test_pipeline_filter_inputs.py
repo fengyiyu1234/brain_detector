@@ -17,8 +17,8 @@ COLUMNS = ["slice_name", "x1", "y1", "x2", "y2", "class", "score", "mean", "z"]
 class PipelineFilterInputTests(unittest.TestCase):
     def test_prefilter_removes_loose_detections_and_refreshes_changed_raw(self):
         with tempfile.TemporaryDirectory() as tmp:
-            raw = Path(tmp) / "1_tile_2d_raw"
-            filtered = Path(tmp) / "1_tile_2d_prefiltered"
+            raw = Path(tmp) / "1_2d_raw"
+            filtered = Path(tmp) / "2_2d_filtered"
             raw.mkdir()
             source = raw / "tile_a_GFP_result.csv"
             rows = [

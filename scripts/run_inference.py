@@ -21,6 +21,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 from src.config.loader import load_config, expand_double_exposure_channels
+from src.core.result_layout import migrate_result_layout, result_paths
 from src.utils.logger import setup_logging
 from src.utils.io import (listTile, listTile_from_local_csvs, loadTeraxml,
                           save_run_metadata, compute_grid_fallback_offsets)
@@ -278,24 +279,13 @@ if __name__ == '__main__':
     pre_align_cfg = config.get('pre_align_params', {})
     tile_position_cfg = config.get('tile_position_params', {})
     solve_tile_positions = pipeline_mode == 'pre_align' and tile_position_cfg.get('enabled', False)
+    migrate_result_layout(base_res_path)
     if solve_tile_positions:
         frame = tile_position_frame(config)
         paths['pATHXML'] = os.path.join(
-            base_res_path, '5_analysis_report', 'tile_positions',
+            base_res_path, '5_2d_global', 'tile_positions',
             f'xml_merging_{frame}.xml')
-    derived = {}
-    derived['pATH_ALIGN_OFFSETS'] = os.path.join(base_res_path, "0_channel_alignment")
-    derived['pATH_DET_RES']      = os.path.join(base_res_path, "1_tile_2d_raw")
-    derived['pATH_DET_FILTERED'] = os.path.join(base_res_path, "1_tile_2d_filtered")
-    derived['pATH_DET_PREALIGN_FILTERED'] = os.path.join(base_res_path, "1_tile_2d_prefiltered")
-    derived['pATH_DET_FUSED']    = os.path.join(base_res_path, "1_tile_2d_fused")
-    derived['pATH_GLOBAL_2D']    = os.path.join(base_res_path, "2_global_2d_raw")
-    derived['pATH_CHANNEL_3D']    = os.path.join(base_res_path, "3_channel_3d")
-    derived['pATH_COLOCALIZATION'] = os.path.join(base_res_path, "4_colocalization")
-    derived['pATH_REPORT'] = os.path.join(base_res_path, "5_analysis_report")
-    derived['pATH_CENTROIDS']   = os.path.join(derived['pATH_REPORT'], "cell_centroids")
-    derived['pATH_HISTOGRAMS']  = os.path.join(base_res_path, "1_tile_2d_histograms")
-
+    derived = result_paths(base_res_path)
     # 将构建好的字典挂载回 config，供 worker.py 及后续流程使用
     config['derived_paths'] = derived
 
@@ -606,6 +596,8 @@ if __name__ == '__main__':
                     os.path.getmtime(_out_csv) >= os.path.getmtime(_in_csv)):
                 continue
             if pipeline_mode == 'pre_align' and not _ch.get('double_exposure'):
+                if os.path.abspath(_in_csv) == os.path.abspath(_out_csv):
+                    continue
                 part = _out_csv + '.part'
                 shutil.copyfile(_in_csv, part)
                 os.replace(part, _out_csv)
@@ -633,7 +625,7 @@ if __name__ == '__main__':
     # ==========================================
     # 阶段 2.8: 生成过滤前 Raw 2D 直方图（强度 & 面积）
     # 输入: _filter_src (raw CSV)
-    # 输出: 1_tile_2d_histograms/{tile}_{ch}_hist.png
+    # 输出: 1_2d_raw/histograms/{tile}_{ch}_hist.png
     # 删除输出目录可强制重建；不影响过滤及后续流程
     # 开关: detection_params.generate_histograms (默认 true)
     # ==========================================
@@ -683,13 +675,14 @@ if __name__ == '__main__':
     # Stage 2.9: optionally solve tile geometry and publish XMLs before Stage 3.
     # The stop point below leaves the generated XMLs ready for image merging.
     if solve_tile_positions:
-        report_dir = os.path.join(derived['pATH_REPORT'], 'tile_positions')
+        report_dir = derived['pATH_TILE_POSITIONS']
         solver_script = os.path.join(project_root, 'scripts', 'solve_tile_positions.py')
+        xml_script = os.path.join(project_root, 'src', 'core', 'generate_merging_xml.py')
         frame_xml, recomputed = run_tile_position_stage(
             config, os.path.abspath(args.config), base_res_path,
             derived['pATH_DET_PREALIGN_FILTERED'], derived['pATH_ALIGN_OFFSETS'],
             report_dir, [os.path.basename(p) for p in pATHTILE_all],
-            routing_config, solver_script)
+            routing_config, solver_script, xml_script)
         paths['pATHXML'] = frame_xml
         logging.info("Stage 2.9 tile positions %s: %s",
                      "computed" if recomputed else "reused", frame_xml)
@@ -700,7 +693,7 @@ if __name__ == '__main__':
         sys.exit(0)
 
     # 加载 TeraStitcher XML
-    #    查找优先级: paths.pATHXML(显式) > anchor_dir/xml_merging.xml > anchor_dir/xml_import.xml
+    #    tile 位置求解开启时只用本次生成的 frame XML；其他模式沿用显式/原始目录候选。
     #
     #    为什么要能显式指定：拼接位移是在参考通道（如 730nm 自发荧光）上算出来的，检测通道目录里
     #    未必有这份 XML、或者放着一份 ABS_D 全为 0 的旧版本。细胞坐标必须和「真正 merge 出注册用
@@ -709,7 +702,8 @@ if __name__ == '__main__':
     xml_candidates = []
     if paths.get('pATHXML'):
         xml_candidates.append(paths['pATHXML'])
-    xml_candidates += [os.path.join(anchor_dir, n) for n in ('xml_merging.xml', 'xml_import.xml')]
+    if not solve_tile_positions:
+        xml_candidates += [os.path.join(anchor_dir, n) for n in ('xml_merging.xml', 'xml_import.xml')]
     if paths.get('pATHXML') and not os.path.isfile(paths['pATHXML']):
         raise FileNotFoundError(
             f"Explicit paths.pATHXML does not exist: {paths['pATHXML']}")
@@ -781,7 +775,7 @@ if __name__ == '__main__':
         BOX_COLS  = ["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]
 
         # ====== 1+2. 各通道独立：全局 2D 拼接 → Z-Link，每个通道一个进程 ======
-        # checkpoint 与以前相同：2_global_2d_raw/<ch>_2d_global.csv、3_channel_3d/<ch>_3d_tracked.pkl
+        # checkpoint 与以前相同：5_2d_global/<ch>_2d_global.csv、6_3d_global/<ch>_3d_tracked.pkl
         zl      = config.get('z_linker', {})
         zl_soma = zl.get('soma', {})
         zl_tf   = zl.get('tf', {})
@@ -946,13 +940,9 @@ if __name__ == '__main__':
     # ==========================================
     # 阶段 4: 生成分析级的统计报告与质心
     # ==========================================
-    report_path = os.path.join(derived['pATH_REPORT'], "global_summary_statistics.csv")
+    report_path = os.path.join(derived['pATH_COLOCALIZATION'], "global_summary_statistics.csv")
 
-    if os.path.exists(report_path):
-        logging.info("✔️ Checkpoint 3 达成: 全局统计报告已存在。")
-    elif final_results is not None and len(final_results) > 0:
-        logging.info("阶段 4: 开始生成动态标签质心文件与统计报告...")
-        
+    if final_results is not None and len(final_results) > 0:
         df_final = pd.read_csv(bbox_path)
         total_cells = len(df_final)
 
@@ -982,21 +972,22 @@ if __name__ == '__main__':
             marker_counts[m] = int(df_final['marker_set'].apply(lambda s: m in s).sum())
 
         # 2. 写入极其详细的层级分析报告
-        with open(report_path, 'w', encoding='utf-8') as f:
-            f.write("=== Base Cell Type (基础细胞类型) ===\n")
-            f.write("Type,Count,Percentage(%)\n")
-            for t, count in base_counts.items():
-                f.write(f"{t},{count},{count / total_cells * 100:.2f}%\n")
+        if config.get('generate_analysis_report', False):
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write("=== Base Cell Type (基础细胞类型) ===\n")
+                f.write("Type,Count,Percentage(%)\n")
+                for t, count in base_counts.items():
+                    f.write(f"{t},{count},{count / total_cells * 100:.2f}%\n")
             
-            f.write("\n=== Subtypes & Colocalization (具体组合) ===\n")
-            f.write("Subtype,Count,Percentage(%)\n")
-            for sub, count in combo_counts.items():
-                f.write(f"{sub},{count},{count / total_cells * 100:.2f}%\n")
+                f.write("\n=== Subtypes & Colocalization (具体组合) ===\n")
+                f.write("Subtype,Count,Percentage(%)\n")
+                for sub, count in combo_counts.items():
+                    f.write(f"{sub},{count},{count / total_cells * 100:.2f}%\n")
                 
-            f.write("\n=== Single Marker Positivity (各标记物全局阳性率) ===\n")
-            f.write("Marker,Count,Percentage(%)\n")
-            for m, count in marker_counts.items():
-                f.write(f"{m},{count},{count / total_cells * 100:.2f}%\n")
+                f.write("\n=== Single Marker Positivity (各标记物全局阳性率) ===\n")
+                f.write("Marker,Count,Percentage(%)\n")
+                for m, count in marker_counts.items():
+                    f.write(f"{m},{count},{count / total_cells * 100:.2f}%\n")
 
         # 3. 按最终组合输出质心 (用下划线替代特殊字符保证文件名合法)
         df_final['cx'] = (df_final['x1'] + df_final['x2']) / 2
@@ -1012,6 +1003,6 @@ if __name__ == '__main__':
             out_df.to_csv(save_path, index=False)
             
         logging.info(f"已生成所有 {len(combo_counts)} 种子类型的质心文件，保存在: {derived['pATH_CENTROIDS']}")
-        logging.info("阶段 4 完成: 全局统计报告生成完毕。")
+        logging.info("Stage 4 complete: cell centroids written.")
 
     logging.info(f"🎉 动态多通道推断全部完成！总耗时: {(time.time() - start_time)/60:.2f} 分钟。")

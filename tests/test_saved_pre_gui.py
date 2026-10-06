@@ -1,4 +1,4 @@
-﻿"""Saved pre-align GUI contracts using small synthetic pipeline outputs."""
+"""Saved pre-align GUI contracts using small synthetic pipeline outputs."""
 
 import json
 import os
@@ -67,7 +67,7 @@ class SavedPrealignTests(unittest.TestCase):
         root = Path(self.tmp.name)
         self.result = root / "results"
         self.result.mkdir()
-        xml_dir = self.result / "5_analysis_report" / "tile_positions"
+        xml_dir = self.result / "5_2d_global" / "tile_positions"
         xml_dir.mkdir(parents=True)
         xml = xml_dir / "xml_merging_GFP.xml"
         xml.write_text(
@@ -94,25 +94,25 @@ class SavedPrealignTests(unittest.TestCase):
             "channels_routing": routing,
             "paths": {
                 "pATHRESULT": "/rsstu/example/results",
-                "pATHXML": "/rsstu/example/results/5_analysis_report/"
+                "pATHXML": "/rsstu/example/results/5_2d_global/"
                             "tile_positions/xml_merging_GFP.xml",
             },
             "detection_params": {"tILESIZE": 16},
         }
         (self.result / "runtime_config.json").write_text(
             json.dumps(runtime), encoding="utf-8")
-        align_dir = self.result / "0_channel_alignment"
-        align_dir.mkdir()
+        align_dir = self.result / "3_2d_aligned"
+        align_dir.mkdir(parents=True)
         (align_dir / f"{self.tile}_offsets.json").write_text(
             json.dumps({"GFP": {"dx": 0, "dy": 0, "dz": 0},
                         "RFP": {"dx": 2, "dy": 3, "dz": 1}}), encoding="utf-8")
-        raw_dir = self.result / "1_tile_2d_raw"
+        raw_dir = self.result / "1_2d_raw"
         raw_dir.mkdir()
         pd.DataFrame([dict(x1=1, y1=2, x2=5, y2=6, z=3,
                            score=.8, mean=100, **{"class": "glia"})]).to_csv(
             raw_dir / f"{self.tile}_RFP_result.csv", index=False)
-        filtered = self.result / "1_tile_2d_filtered"
-        filtered.mkdir()
+        filtered = self.result / "4_2d_filtered"
+        filtered.mkdir(exist_ok=True)
         pd.DataFrame([dict(x1=3, y1=5, x2=7, y2=9, z=4,
                            score=.8, mean=100, **{"class": "glia"})]).to_csv(
             filtered / f"{self.tile}_RFP_result.csv", index=False)
@@ -120,12 +120,12 @@ class SavedPrealignTests(unittest.TestCase):
                           score=.8, mean=100, **{"class": "glia_GFP_RFP"},
                           tile_name="neighbor")
         for directory, name in (
-            ("2_global_2d_raw", "RFP_2d_global.csv"),
-            ("3_channel_3d", "RFP_3d_tracked.csv"),
-            ("4_colocalization", "coloc_result.csv"),
+            ("5_2d_global", "RFP_2d_global.csv"),
+            ("6_3d_global", "RFP_3d_tracked.csv"),
+            ("7_colocalization", "coloc_result.csv"),
         ):
             folder = self.result / directory
-            folder.mkdir()
+            folder.mkdir(exist_ok=True)
             pd.DataFrame([global_row]).to_csv(folder / name, index=False)
         self.vis = {
             "paths": {
@@ -148,11 +148,11 @@ class SavedPrealignTests(unittest.TestCase):
 
     def test_tile_and_global_z_and_xy(self):
         raw = read_tile_boxes(
-            str(self.result / "1_tile_2d_raw" / f"{self.tile}_RFP_result.csv"),
+            str(self.result / "1_2d_raw" / f"{self.tile}_RFP_result.csv"),
             (0, 5))
         self.assertEqual(int(raw.iloc[0]["display_z"]), 2)
         global_rows = read_global_boxes(
-            str(self.result / "4_colocalization" / "coloc_result.csv"),
+            str(self.result / "7_colocalization" / "coloc_result.csv"),
             (20, 30, 36, 46), (-2, 3))
         local = global_to_local_rows(global_rows, self.context.position(self.tile))
         self.assertEqual(int(local.iloc[0]["display_z"]), 3)
@@ -183,12 +183,12 @@ class SavedPrealignTests(unittest.TestCase):
             for z in range(5):
                 cv2.imwrite(str(folder / f"{z:04d}.tif"),
                             np.zeros((16, 16), dtype=np.uint16))
-        align = self.result / "0_channel_alignment" / f"{second}_offsets.json"
+        align = self.result / "3_2d_aligned" / f"{second}_offsets.json"
         align.write_text(
             json.dumps({"GFP": {"dx": 0, "dy": 0, "dz": 0},
                         "RFP": {"dx": 2, "dy": 3, "dz": 1}}),
             encoding="utf-8")
-        coloc = self.result / "4_colocalization" / "coloc_result.csv"
+        coloc = self.result / "7_colocalization" / "coloc_result.csv"
         data = pd.read_csv(coloc)
         data.loc[len(data)] = {
             **data.iloc[0].to_dict(),
@@ -217,7 +217,7 @@ class SavedPrealignTests(unittest.TestCase):
                  "score": .8, "mean": 100.0, "class": "glia_GFP_RFP",
                  "z_min": 2, "z_max": 2,
                  "per_z_boxes": {2: [23, 35, 27, 39]}}
-        path = self.result / "3_channel_3d" / "RFP_3d_tracked.pkl"
+        path = self.result / "6_3d_global" / "RFP_3d_tracked.pkl"
         with path.open("wb") as handle:
             pickle.dump([track], handle)
         class Viewer(FakeViewer):
@@ -264,7 +264,7 @@ class SavedPrealignTests(unittest.TestCase):
                             for l in FakeViewer.made[-1].layers))
         self.assertFalse(any(l.name.startswith("[s4")
                              for l in FakeViewer.made[-1].layers))
-        (self.result / "0_channel_alignment" /
+        (self.result / "3_2d_aligned" /
          f"{self.tile}_offsets.json").unlink()
         with patch("src.utils.saved_gui.napari.Viewer", Viewer):
             run_saved_prealign(
@@ -313,7 +313,7 @@ class SavedPrealignTests(unittest.TestCase):
 
     def test_second_exposure_saved_2d_is_available(self):
         second = "RFP2"
-        raw_path = self.result / "1_tile_2d_raw" / f"{self.tile}_{second}_result.csv"
+        raw_path = self.result / "1_2d_raw" / f"{self.tile}_{second}_result.csv"
         pd.DataFrame([dict(x1=1, y1=2, x2=5, y2=6, z=3,
                            score=.8, mean=100, **{"class": "glia"})]).to_csv(
             raw_path, index=False)

@@ -13,7 +13,7 @@ class RefilterCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             results = root / "results"
-            raw = results / "1_tile_2d_raw"
+            raw = results / "1_2d_raw"
             raw.mkdir(parents=True)
             config = {
                 "paths": {"pATHRESULT": str(results)},

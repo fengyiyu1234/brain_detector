@@ -1,4 +1,4 @@
-"""Checkpointed integration of detection-based tile positions into the pipeline."""
+"""Checkpointed, template-free tile geometry and merging XML generation."""
 import json
 import os
 import subprocess
@@ -10,19 +10,34 @@ def _stamp(path):
     return [st.st_size, st.st_mtime_ns]
 
 
-def _template(channel_dir):
-    for name in ('xml_merging.original.xml', 'xml_merging.xml', 'xml_import.xml'):
-        candidate = os.path.join(channel_dir, name)
-        if os.path.isfile(candidate):
-            return candidate
-    raise FileNotFoundError(f"No XML template in original image directory: {channel_dir}")
 
 
+_LAYOUT_NAMES = (
+    ('1_tile_2d_prefiltered', '2_2d_filtered'),
+    ('0_channel_alignment', '3_2d_aligned'),
+    ('5_analysis_report', '5_2d_global'),
+)
+
+
+def _canonical_manifest(value, script, xml_script):
+    """Compare migrated checkpoints by content while ignoring script edit times."""
+    if isinstance(value, str):
+        for old, new in _LAYOUT_NAMES:
+            value = value.replace(old, new)
+        return value
+    if isinstance(value, list):
+        return [_canonical_manifest(item, script, xml_script) for item in value]
+    if isinstance(value, dict):
+        return {
+            _canonical_manifest(key, script, xml_script):
+                _canonical_manifest(item, script, xml_script)
+            for key, item in value.items() if key not in (script, xml_script)
+        }
+    return value
 def solver_command(script, config_path, results_dir, det_dir, ref, frame, workers, options):
     command = [sys.executable, script, '--sample', results_dir, '--config', config_path,
                '--det-dir', det_dir, '--alignment-from', 'old-offsets',
-               '--ref', ref, '--frame', frame, '--workers', str(workers),
-               '--xml-into-channel-dirs']
+               '--ref', ref, '--frame', frame, '--workers', str(workers)]
     allowed = {'model', 'win_xy', 'win_z', 'bin_xy', 'match_xy_soma',
                'match_xy_tf', 'match_z', 'edge_px', 'min_matches',
                'prior_w', 'huber', 'iters', 'n_slices'}
@@ -49,8 +64,8 @@ def tile_position_frame(config):
 
 
 def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir,
-                            report_dir, tile_names, routing, script):
-    """Run the solver after tile alignment; reuse its XML only for identical inputs."""
+                            report_dir, tile_names, routing, script, xml_script):
+    """Solve positions, generate every channel XML, then reuse identical outputs."""
     params = config.get('tile_position_params', {})
     frame = tile_position_frame(config)
     ref = config.get('pre_align_params', {}).get('reference_channel') or next(
@@ -63,6 +78,11 @@ def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir
     command = solver_command(script, config_path, results_dir, det_dir, ref, frame,
                              workers, params.get('options') or {})
     os.makedirs(report_dir, exist_ok=True)
+    position_csv = os.path.join(report_dir, 'tile_positions.csv')
+    xml_command = [sys.executable, xml_script, '--config', config_path,
+                   '--positions', position_csv, '--out-dir', report_dir,
+                   '--bytes-per-channel', str(params.get('xml_bytes_per_channel', 2)),
+                   '--force']
     files = {}
     for tile in tile_names:
         for ch in channels:
@@ -74,18 +94,21 @@ def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir
         if not os.path.isfile(offset):
             raise FileNotFoundError(f"Tile solver needs channel alignment: {offset}")
         files[offset] = _stamp(offset)
-    outputs = []
     for ch in routing:
         channel_dir = config['paths'].get(ch['dir_key'])
         if not channel_dir or not os.path.isdir(channel_dir):
             raise FileNotFoundError(f"Original image directory missing for {ch['id']}: {channel_dir}")
-        template = _template(channel_dir)
-        files[template] = _stamp(template)
-        outputs.extend([os.path.join(report_dir, f"xml_merging_{ch['id']}.xml"),
-                        os.path.join(channel_dir, 'xml_merging.xml')])
+        for tile in tile_names:
+            tile_dir = os.path.join(channel_dir, tile.split('_')[0], tile)
+            if not os.path.isdir(tile_dir):
+                raise FileNotFoundError(f"Original image tile directory missing: {tile_dir}")
+            files[tile_dir] = _stamp(tile_dir)
     files[script] = _stamp(script)
-    signature = {'version': 2, 'reference_channel': ref, 'frame_channel': frame,
-                 'command': command, 'inputs': files,
+    files[xml_script] = _stamp(xml_script)
+    outputs = [position_csv, os.path.join(report_dir, 'solution.json')]
+    outputs.extend(os.path.join(report_dir, f"xml_merging_{ch}.xml") for ch in channels)
+    signature = {'version': 3, 'reference_channel': ref, 'frame_channel': frame,
+                 'solver_command': command, 'xml_command': xml_command, 'inputs': files,
                  'geometry_config': {
                      'detection_params': {key: config.get('detection_params', {}).get(key)
                                           for key in ('xy_resolution_um', 'z_resolution_um', 'tILESIZE')},
@@ -101,26 +124,28 @@ def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir
     frame_xml = os.path.join(report_dir, f'xml_merging_{frame}.xml')
     output_stamps = {path: _stamp(path) for path in outputs} if all(
         os.path.isfile(path) for path in outputs) else None
-    if (previous and previous.get('signature') == signature and
-            previous.get('outputs') == output_stamps):
-        return frame_xml, False
-    global_dirs = ('2_global_2d_raw', '3_channel_3d', '4_colocalization')
+    if previous and output_stamps:
+        if previous.get('signature') == signature and previous.get('outputs') == output_stamps:
+            return frame_xml, False
+        legacy = any(old in str(previous.get('signature')) for old, _ in _LAYOUT_NAMES)
+        if (legacy and
+                _canonical_manifest(previous.get('signature'), script, xml_script) ==
+                _canonical_manifest(signature, script, xml_script) and
+                _canonical_manifest(previous.get('outputs'), script, xml_script) ==
+                _canonical_manifest(output_stamps, script, xml_script)):
+            return frame_xml, False
+    global_dirs = ('5_2d_global', '6_3d_global', '7_colocalization')
     if any(os.path.isdir(os.path.join(results_dir, d)) and
            any(name.endswith(('.csv', '.pkl')) for name in os.listdir(os.path.join(results_dir, d)))
            for d in global_dirs):
         raise RuntimeError("Tile positions or their inputs changed while global checkpoints exist. "
                            "Archive/regenerate global 2D, 3D, and colocalization outputs first.")
     subprocess.run(command, check=True)
-    # The first publication creates stable original-template backups.
-    for ch in routing:
-        channel_dir = config['paths'][ch['dir_key']]
-        previous_paths = [path for path in files if os.path.dirname(path) == channel_dir]
-        for path in previous_paths:
-            files.pop(path)
-        template = _template(channel_dir)
-        files[template] = _stamp(template)
+    if not os.path.isfile(position_csv):
+        raise RuntimeError(f"Tile solver finished without positions CSV: {position_csv}")
+    subprocess.run(xml_command, check=True)
     if not all(os.path.isfile(path) for path in outputs):
-        raise RuntimeError("Tile solver finished without all channel XML outputs")
+        raise RuntimeError("Tile solver/XML generator finished without all expected outputs")
     part = manifest_path + '.part'
     with open(part, 'w', encoding='utf-8') as handle:
         json.dump({'signature': signature,

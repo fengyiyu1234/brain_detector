@@ -14,16 +14,16 @@ A. TeraStitcher 自评（只要 XML）
    注意：nccPeak / reliability 的绝对值受图像内容影响（稠密核信号天然偏高），不宜跨通道直接比，
    replaced 比例和 comp_std 更可比。
 
-B. 接缝残差（需要 XML + 1_tile_2d_prefiltered 检测结果）——独立于 TeraStitcher 的检验
+B. 接缝残差（需要 XML + 2_2d_filtered 检测结果）——独立于 TeraStitcher 的检验
    相邻 tile 重叠区里，同一个细胞在两个 tile 各被检测一次。只取重叠区的检测做轻量 z-link，
    用 XML 把两边的 3D 细胞质心放到全局坐标，先用差值直方图找粗略平移，再做互为最近邻配对，
    配对差值的中位数 (B − A) 就是这条接缝的拼接误差，理想值为 0。
    每份 XML 都用它自己那个通道的原始检测（NAME:CHANNEL 里的 CHANNEL）测一遍；
-   --also 里的通道则先用 0_channel_alignment 的逐 tile 偏移换到该通道坐标系再测：
+   --also 里的通道则先用 3_2d_aligned 的逐 tile 偏移换到该通道坐标系再测：
        p_frame = p_raw + s_ch(tile) − s_frame(tile)
    例如 --xml 488nm:Olig2 --also GFP 测的就是「GFP 细胞经对齐后放进 488 拼接」的最终误差。
 
-C. 两份 XML 交叉验证（需要两份带通道的 XML + 0_channel_alignment 偏移）
+C. 两份 XML 交叉验证（需要两份带通道的 XML + 3_2d_aligned 偏移）
    同一 tile 在两份 XML 里的位置差应等于两个通道的逐 tile 偏移差（外加一个全局常数）：
        pos_A(t) − pos_B(t) = s_a(t) − s_b(t) + C
    残差 R(t) 去掉中位数后应接近 0；R 的离散度明显小于位置差本身的离散度，说明两份拼接和
@@ -46,7 +46,7 @@ TeraStitcher 约定：邻居位置 − 本 tile 位置 = displ（EAST/SOUTH 分�
     CHANNEL  该拼接所用图像对应的检测通道 id（channels_routing 里的 id）；不给就只做 A 部分
     PATH     XML 所在目录或 xml_merging.xml 文件本身，不在默认位置时用
 
-输出（默认 <results_dir>/5_analysis_report/stitch_compare/）
+输出（默认 <results_dir>/5_2d_global/stitch_compare/）
   <NAME>_pairs.csv          A 部分，每对相邻 tile 一行
   seams.csv                 B 部分，每个 (XML, 通道, 接缝) 一行
   cross_<A>_vs_<B>.csv      C 部分，每个 tile 一行
@@ -96,7 +96,7 @@ def resolve_results_dir(sample):
     """--sample 可以是样本根目录，也可以直接是 detection_results；找不到返回 None。"""
     for cand in (os.path.join(sample, 'detection_results'), sample):
         if os.path.isfile(os.path.join(cand, 'runtime_config.json')) or \
-                os.path.isdir(os.path.join(cand, '1_tile_2d_raw')):
+                os.path.isdir(os.path.join(cand, '1_2d_raw')):
             return os.path.abspath(cand)
     return None
 
@@ -127,7 +127,7 @@ def load_channel_settings(results_dir, config_path):
         return None, None
     config = load_config(cfg_path)
     routing = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
-    saved = os.path.join(results_dir or '', '0_channel_alignment', ALIGN_SETTINGS_FILE)
+    saved = os.path.join(results_dir or '', '3_2d_aligned', ALIGN_SETTINGS_FILE)
     if results_dir and os.path.isfile(saved):
         with open(saved, encoding='utf-8') as f:
             settings = json.load(f)
@@ -438,7 +438,7 @@ def build_seam_jobs(spec, channel, frame, offsets, ts, z_link, params, warns):
             'z_link': z_link, 'params': params,
         })
     if n_skip:
-        warns.append(f"[{spec['name']}] {channel}→{frame}: {n_skip} 条接缝缺 0_channel_alignment 偏移，跳过")
+        warns.append(f"[{spec['name']}] {channel}→{frame}: {n_skip} 条接缝缺 3_2d_aligned 偏移，跳过")
     return jobs
 
 
@@ -607,9 +607,9 @@ def parse_args():
                     help='逗号分隔的通道：先用对齐偏移换到每份 XML 的通道坐标系再测接缝（B 部分）')
     ap.add_argument('--config', default=None, help='默认 <results_dir>/runtime_config.json')
     ap.add_argument('--det-dir', default=None,
-                    help='原始（未对齐）检测 CSV 目录，默认 <results_dir>/1_tile_2d_prefiltered')
+                    help='原始（未对齐）检测 CSV 目录，默认 <results_dir>/2_2d_filtered')
     ap.add_argument('--out-dir', default=None,
-                    help='默认 <results_dir>/5_analysis_report/stitch_compare')
+                    help='默认 <results_dir>/5_2d_global/stitch_compare')
     ap.add_argument('--tile-size', type=int, default=None, help='tile 边长 px，默认读 config 的 tILESIZE')
     ap.add_argument('--rel-thr', type=float, default=0.7, help='A 部分统计 comp_std 用的 reliability 阈值')
     ap.add_argument('--win-xy', type=float, default=60, help='B 部分粗搜索 XY 半径（px）')
@@ -645,14 +645,14 @@ def main():
         if (args.config or results_dir) else {}
     tile_size = args.tile_size or config.get('detection_params', {}).get('tILESIZE', 2048)
 
-    out_dir = args.out_dir or (os.path.join(results_dir, '5_analysis_report', 'stitch_compare')
+    out_dir = args.out_dir or (os.path.join(results_dir, '5_2d_global', 'stitch_compare')
                                if results_dir else os.path.join(sample_dir, 'stitch_compare'))
     os.makedirs(out_dir, exist_ok=True)
-    default_csv_dir = ('1_tile_2d_prefiltered'
+    default_csv_dir = ('2_2d_filtered'
                        if config.get('pipeline_mode') == 'pre_align'
-                       else '1_tile_2d_filtered')
+                       else '4_2d_filtered')
     det_dir = args.det_dir or (os.path.join(results_dir, default_csv_dir) if results_dir else None)
-    offsets = load_offsets(os.path.join(results_dir, '0_channel_alignment') if results_dir else None)
+    offsets = load_offsets(os.path.join(results_dir, '3_2d_aligned') if results_dir else None)
 
     warns = []
     specs, ts_by_name = [], {}
@@ -757,7 +757,7 @@ def main():
     if len(with_ch) < 2:
         print("\nC. 跳过交叉验证：需要至少两份带通道的 XML。")
     elif not offsets:
-        print("\nC. 跳过交叉验证：还没有 0_channel_alignment 偏移。")
+        print("\nC. 跳过交叉验证：还没有 3_2d_aligned 偏移。")
     else:
         for sa, sb in itertools.combinations(with_ch, 2):
             df, summ = cross_check(sa, ts_by_name[sa['name']], sb, ts_by_name[sb['name']],

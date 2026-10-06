@@ -386,7 +386,7 @@ def fuse_dual_intensity_2d(low_df, high_df, iou_thresh=0.3):
     downstream filtering.
 
     low_df/high_df: raw 9-col dataframes (slice_name,x1,y1,x2,y2,class,score,mean,z),
-    e.g. loaded from 1_tile_2d_raw or 0_channel_alignment.
+    e.g. loaded from 1_2d_raw or 3_2d_aligned.
 
     Classes are tagged internally before merging (so _merge_class's bare-token branch
     doesn't fire on plain untagged YOLO/StarDist classes like "neuron"/"glia" and
