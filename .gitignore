@@ -24,6 +24,7 @@ venv/
 *.slurm
 *.h5
 *.md
+!DETECTOR_WORKFLOW.md
 *.cmd
 *.err
 images/

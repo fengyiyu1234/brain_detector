@@ -4,7 +4,7 @@ import unittest
 
 from src.core.point_cloud_aligner import (
     _choose_joint_nucleus_shift, compute_tile_channel_shifts,
-    rebase_shifts, shifted_cell_boxes,
+    rebase_shifts, resolve_align_settings, shifted_cell_boxes,
 )
 
 
@@ -58,6 +58,49 @@ class SequentialJointTests(unittest.TestCase):
                 self.assertTrue(all(
                     abs(shifts[channel][axis] - target[axis]) <= 1
                     for axis in range(3)))
+                self.assertGreater(scores[channel], 0)
+
+    def test_rfp_reference_follows_configured_madm_order(self):
+        routing = [
+            {"id": "GFP", "type": "soma"},
+            {"id": "RFP", "type": "soma"},
+            {"id": "Sox9", "type": "tf"},
+            {"id": "Olig2", "type": "tf"},
+        ]
+        config = {
+            "pre_align_params": {"reference_channel": "RFP",
+                                 "tf_align_mode": "sequential_joint"},
+            "stitching_reference_channel": "Olig2",
+        }
+        settings = resolve_align_settings(config, routing)
+        self.assertEqual(settings["soma_ch_ids"], ["RFP", "GFP"])
+        sites = [(40, 40), (90, 45), (145, 70),
+                 (55, 130), (115, 145), (170, 160)]
+        cells = {
+            "GFP": [cell(x, y, 10, 24) for x, y in sites],
+            "RFP": [cell(x + 3, y - 2, 10, 24) for x, y in sites],
+            "Sox9": [cell(x - 4, y + 3, 10, 6) for x, y in sites],
+            "Olig2": [cell(x + 5, y - 4, 10, 6) for x, y in sites],
+        }
+        diagnostics = {}
+        shifts, scores = compute_tile_channel_shifts(
+            cells, settings["soma_ch_ids"], settings["tf_ch_ids"], 10, 5,
+            bin_size=2, xy_range_px=10, z_range_slices=1,
+            fine_xy_px=3, fine_z_slices=1,
+            max_center_dist_ratio=.5, containment_z_pad=0,
+            tf_align_mode="sequential_joint", diagnostics=diagnostics)
+        self.assertEqual(diagnostics["reference_channel"], "RFP")
+        self.assertIn("GFP", diagnostics)
+        self.assertIn("RFP", diagnostics["Sox9"]["seeds"])
+        self.assertIn("Sox9", diagnostics["Olig2"]["seeds"])
+        self.assertEqual(shifts["RFP"], (0, 0, 0))
+        expected = {"GFP": (3, -2, 0), "Sox9": (7, -5, 0),
+                    "Olig2": (-2, 2, 0)}
+        for channel, target in expected.items():
+            with self.subTest(channel=channel):
+                self.assertTrue(all(
+                    abs(shifts[channel][axis] - target[axis]) <= 2
+                    for axis in range(3)), (channel, shifts[channel], target))
                 self.assertGreater(scores[channel], 0)
 
     def test_rebase_keeps_relative_positions_with_non_gfp_frame(self):

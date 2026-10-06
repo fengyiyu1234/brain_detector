@@ -30,9 +30,10 @@ tf_align_mode='direct': Step 1a as above, then every TF channel is aligned
 independently to the reference soma channel with the cross-group containment
 search (no intra-TF step). Use when TF markers label different populations.
 
-tf_align_mode='sequential_joint': align RFP to GFP, Sox9 to the fixed GFP+RFP
-soma union, and Olig2 to that union plus the fixed Sox9 nuclei. Measurements
-stay in the GFP frame until the final stitching-frame rebase.
+tf_align_mode='sequential_joint': align the other soma channel to the
+configured reference, Sox9 to the fixed soma union, and Olig2 to that union
+plus the fixed Sox9 nuclei. Measurements stay in the configured reference
+frame until the final stitching-frame rebase.
 
 Step 2 uses containment-based scoring (find_shift_containment) rather than
 voxel-IoU: TF nucleus boxes (e.g. Sox9, ~8-17px) are much smaller than soma
@@ -856,34 +857,35 @@ def _nearest_displacement_seed(soma, nuclei, xy_range, z_range,
 def compute_sequential_joint_shifts(per_ch_vol_lists, z_center, z_half_window,
                                     align_kwargs, max_center_dist_ratio,
                                     containment_z_pad, containment_coarse,
-                                    joint_local_xy=2, joint_local_z=1,
+                                    soma_ch_ids, joint_local_xy=2, joint_local_z=1,
                                     joint_max_scored_cells=1500,
                                     joint_sox_radius=10.0,
                                     joint_sox_z_scale=6.0):
-    """GFP -> RFP -> Sox9 -> Olig2, keeping each solved reference fixed."""
+    """Reference soma -> other soma -> Sox9 -> Olig2; keep solved shifts fixed."""
     z_lo = z_center - z_half_window
     z_hi = z_center + z_half_window
     boxes = {ch: build_cell_boxes(per_ch_vol_lists.get(ch, []), z_lo, z_hi)
              for ch in ('GFP', 'RFP', 'Sox9', 'Olig2')}
     kwargs = dict(align_kwargs)
-    shifts = {'GFP': (0, 0, 0)}
-    scores = {'GFP': 1.0}
-    report = {'reference_channel': 'GFP',
+    ref, other = soma_ch_ids
+    shifts = {ref: (0, 0, 0)}
+    scores = {ref: 1.0}
+    report = {'reference_channel': ref,
               'cells_in_window': {ch: len(cells) for ch, cells in boxes.items()}}
-    if not boxes['GFP']:
-        for ch in ('RFP', 'Sox9', 'Olig2'):
+    if not boxes[ref]:
+        for ch in (other, 'Sox9', 'Olig2'):
             shifts[ch] = (0, 0, 0)
             scores[ch] = 0.0
-        report['status'] = 'missing_gfp_reference'
+        report['status'] = 'missing_reference'
         return shifts, scores, report
 
-    rfp_result = find_shift(boxes['GFP'], boxes['RFP'], **kwargs)
-    shifts['RFP'] = tuple(rfp_result[:3])
-    scores['RFP'] = rfp_result[3]
-    rfp = shifted_cell_boxes(boxes['RFP'], shifts['RFP'])
-    soma = boxes['GFP'] + rfp
-    report['RFP'] = {'shift': list(shifts['RFP']), 'iou_score': scores['RFP'],
-                     'status': 'aligned' if boxes['RFP'] else 'missing_cells'}
+    other_result = find_shift(boxes[ref], boxes[other], **kwargs)
+    shifts[other] = tuple(other_result[:3])
+    scores[other] = other_result[3]
+    other_aligned = shifted_cell_boxes(boxes[other], shifts[other])
+    soma = boxes[ref] + other_aligned
+    report[other] = {'shift': list(shifts[other]), 'iou_score': scores[other],
+                     'status': 'aligned' if boxes[other] else 'missing_cells'}
 
     def sampled(cells):
         if len(cells) <= joint_max_scored_cells:
@@ -899,11 +901,10 @@ def compute_sequential_joint_shifts(per_ch_vol_lists, z_center, z_half_window,
             coarse=containment_coarse, **kwargs)
 
     if boxes['Sox9']:
-        # The existing full-data GFP estimate is already reliable for T70.
-        # Use the union of fixed GFP/RFP somata to refine it; admit distant
-        # alternative seeds only if they improve full-data soma support.
-        gfp_seed = tuple(find_shift_containment(
-            boxes['GFP'], boxes['Sox9'],
+        # Start with a full-data estimate in the configured reference frame.
+        # Admit distant union seeds only if they improve full-data soma support.
+        reference_seed = tuple(find_shift_containment(
+            boxes[ref], boxes['Sox9'],
             max_center_dist_ratio=max_center_dist_ratio,
             xy_margin=0, z_pad=containment_z_pad,
             coarse=containment_coarse, **kwargs)[:3])
@@ -917,26 +918,26 @@ def compute_sequential_joint_shifts(per_ch_vol_lists, z_center, z_half_window,
             return _containment_score(
                 soma_idx, sox_arrays, *shift,
                 max_center_dist_ratio, 0, containment_z_pad)[0]
-        baseline_support = support(gfp_seed)
-        sox_seed = {'GFP': gfp_seed}
+        baseline_support = support(reference_seed)
+        sox_seed = {ref: reference_seed}
         for name, seed in (('GFP_RFP', union_seed),
                            ('nearest', nearest_seed)):
-            if seed == gfp_seed or support(seed) > baseline_support + max(
+            if seed == reference_seed or support(seed) > baseline_support + max(
                     3, round(0.1 * baseline_support)):
                 sox_seed[name] = seed
         sox_shift, sox_score, sox_report = _choose_joint_nucleus_shift(
-            soma, boxes['Sox9'], sox_seed, 'GFP',
+            soma, boxes['Sox9'], sox_seed, ref,
             max_center_dist_ratio, containment_z_pad,
             joint_local_xy, joint_local_z, joint_max_scored_cells)
         selected_support = support(sox_shift)
-        sox_report['gfp_baseline_support'] = baseline_support
+        sox_report['reference_baseline_support'] = baseline_support
         sox_report['sample_selected_full_support'] = selected_support
         if selected_support < baseline_support:
             # Subsampled ranking can be noisy on a dense Sox9 tile. Never
-            # replace a verified GFP estimate with worse full-data support.
-            sox_report['status'] = 'gfp_baseline_preserved'
+            # replace a verified reference estimate with worse full-data support.
+            sox_report['status'] = 'reference_baseline_preserved'
             sox_report['rejected_shift'] = list(sox_shift)
-            sox_shift = gfp_seed
+            sox_shift = reference_seed
             sox_score = baseline_support / len(boxes['Sox9'])
             sox_report['shift'] = list(sox_shift)
             sox_report['soma_fraction'] = sox_score
@@ -1035,7 +1036,8 @@ def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
     )
 
     if tf_align_mode == 'sequential_joint':
-        required = (soma_ch_ids == ['GFP', 'RFP']
+        required = (set(soma_ch_ids) == {'GFP', 'RFP'}
+                    and len(soma_ch_ids) == 2
                     and set(tf_ch_ids) == {'Sox9', 'Olig2'}
                     and len(tf_ch_ids) == 2)
         if not required:
@@ -1044,7 +1046,7 @@ def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
         shifts, scores, report = compute_sequential_joint_shifts(
             per_ch_vol_lists, z_center, z_half_window, align_kwargs,
             max_center_dist_ratio, containment_z_pad,
-            containment_coarse, **(joint_params or {}))
+            containment_coarse, soma_ch_ids, **(joint_params or {}))
         if diagnostics is not None:
             diagnostics.update(report)
         return shifts, scores
@@ -1466,10 +1468,10 @@ def resolve_align_settings(config, routing_config):
         raise ValueError(
             f"pre_align_params.tf_align_mode={mode!r} must be chain, direct, or sequential_joint")
     if mode == 'sequential_joint' and (
-            sorted(soma_ids) != ['GFP', 'RFP'] or sorted(tf_ids) != ['Olig2', 'Sox9']
-            or ref != 'GFP'):
+            sorted(soma_ids) != ['GFP', 'RFP'] or sorted(tf_ids) != ['Olig2', 'Sox9']):
         raise ValueError(
-            "sequential_joint requires GFP as reference, GFP/RFP soma and Sox9/Olig2 TF")
+            "sequential_joint requires GFP/RFP soma and Sox9/Olig2 TF; "
+            "reference_channel must be an active soma channel")
 
     if mode == 'sequential_joint':
         jp = {
