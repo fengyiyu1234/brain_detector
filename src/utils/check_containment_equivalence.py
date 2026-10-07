@@ -17,9 +17,9 @@ KD 树取一次**（半径放大到覆盖整个精搜索窗）。后者理论上
 
 用法
 ----
-  python scripts/check_containment_equivalence.py --sample /path/to/T4
-  python scripts/check_containment_equivalence.py --sample ... --tiles 326200_338600,337500_349900
-  python scripts/check_containment_equivalence.py --sample ... --n-tiles 4 --fine-xy 8
+  python src/utils/check_containment_equivalence.py --sample /path/to/T4
+  python src/utils/check_containment_equivalence.py --sample ... --tiles 326200_338600,337500_349900
+  python src/utils/check_containment_equivalence.py --sample ... --n-tiles 4 --fine-xy 8
 
 退出码 0 = 全部一致；1 = 有不一致（会逐条打印）。
 """
@@ -33,7 +33,7 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
     sys.stderr.reconfigure(encoding='utf-8')
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 

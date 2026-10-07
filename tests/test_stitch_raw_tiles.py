@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 
 try:
     from PIL import Image
-    from scripts.stitch_raw_tiles import (output_path_value, platform_path,
+    from src.core.stitch_raw_tiles import (output_path_value, platform_path,
                                           resolve_path, run)
 except ImportError:
     Image = None

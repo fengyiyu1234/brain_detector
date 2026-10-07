@@ -22,7 +22,7 @@ class TilePositionPipelineTests(unittest.TestCase):
         try:
             import numpy as np
             import pandas as pd
-            from scripts.solve_tile_positions import (
+            from src.core.solve_tile_positions import (
                 channel_xml_positions, write_channel_xml, publish_channel_xml,
             )
         except ModuleNotFoundError as exc:

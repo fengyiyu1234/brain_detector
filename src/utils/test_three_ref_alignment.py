@@ -5,7 +5,7 @@ root containing 3_2d_aligned/*.csv and *_offsets.json for all channels.
 The main pipeline and its outputs are never changed.
 
 Example:
-  python scripts/test_three_ref_alignment.py --tiles 373300_353000
+  python src/utils/test_three_ref_alignment.py --tiles 373300_353000
   python src/utils/visualize.py --config Y:/Fengyi/EGFR_brain/T70/detection_results_olig2_three_refs/gui_vis_config.json
 """
 
@@ -19,7 +19,7 @@ import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

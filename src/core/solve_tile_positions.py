@@ -79,10 +79,10 @@ model='free' 则是每个通道各解各的（不加平滑约束），留作对�
 用法
 ----
   # 只求解 + 看报告
-  python scripts/solve_tile_positions.py --sample Y:/Fengyi/EGFR_brain/T4 --workers 16
+  python src/core/solve_tile_positions.py --sample Y:/Fengyi/EGFR_brain/T4 --workers 16
 
   # 求解并写出可供 Stage 3 使用的偏移（常数由 --const 给出）
-  python scripts/solve_tile_positions.py --sample Y:/Fengyi/EGFR_brain/T4 --workers 16 \
+  python src/core/solve_tile_positions.py --sample Y:/Fengyi/EGFR_brain/T4 --workers 16 \
       --const Olig2=-3,0,-7 --const Sox9=1,6,-4 --const RFP=0,0,-4 \
       --write-aligned --write-xml
 """
@@ -99,7 +99,7 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
     sys.stderr.reconfigure(encoding='utf-8')
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
@@ -112,7 +112,7 @@ from scipy.sparse.linalg import lsqr
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
-import scripts.compare_stitching as cs
+import src.utils.compare_stitching as cs
 from src.config.loader import load_config
 from src.core.point_cloud_aligner import (apply_shift_to_csv, resolve_align_settings,
                                           containment_shift_from_arrays, _containment_score)

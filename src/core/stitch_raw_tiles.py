@@ -23,10 +23,10 @@ import xml.etree.ElementTree as ET
 import numpy as np
 from PIL import Image
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-from scripts.align_stitched_channels import MARKER_TO_WAVELENGTH
+from src.core.align_stitched_channels import MARKER_TO_WAVELENGTH
 from src.config.loader import load_config
 
 

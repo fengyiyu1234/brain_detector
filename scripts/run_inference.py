@@ -677,7 +677,7 @@ if __name__ == '__main__':
     # The stop point below leaves the generated XMLs ready for image merging.
     if solve_tile_positions:
         report_dir = derived['pATH_TILE_POSITIONS']
-        solver_script = os.path.join(project_root, 'scripts', 'solve_tile_positions.py')
+        solver_script = os.path.join(project_root, 'src', 'core', 'solve_tile_positions.py')
         xml_script = os.path.join(project_root, 'src', 'core', 'generate_merging_xml.py')
         frame_xml, recomputed = run_tile_position_stage(
             config, os.path.abspath(args.config), base_res_path,
@@ -760,7 +760,7 @@ if __name__ == '__main__':
     # Image stitching uses the per-channel XMLs produced above. It is separate
     # from Stage 3, which stitches cell coordinates rather than raw pixels.
     if config.get('direct_stitching', {}).get('enabled', False):
-        from scripts.stitch_raw_tiles import run as run_direct_stitching
+        from src.core.stitch_raw_tiles import run as run_direct_stitching
         logging.info("Direct image stitching enabled; stitching raw channels before Stage 3.")
         run_direct_stitching(Path(args.config), skip_completed=True)
 

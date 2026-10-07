@@ -35,10 +35,10 @@ TeraStitcher 约定：邻居位置 − 本 tile 位置 = displ（EAST/SOUTH 分�
 用法
 ----
   # 488 拼接还没出来时，先看 640 的自评和接缝残差
-  python scripts/compare_stitching.py --sample Y:/Fengyi/EGFR_brain/T4 --xml 640nm:GFP
+  python src/utils/compare_stitching.py --sample Y:/Fengyi/EGFR_brain/T4 --xml 640nm:GFP
 
   # 两份都齐了
-  python scripts/compare_stitching.py --sample Y:/Fengyi/EGFR_brain/T4 \
+  python src/utils/compare_stitching.py --sample Y:/Fengyi/EGFR_brain/T4 \
       --xml 640nm:GFP --xml 488nm:Olig2 --also GFP --workers 4
 
   --xml 的格式是 NAME[:CHANNEL][=PATH]：
@@ -66,7 +66,7 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
     sys.stderr.reconfigure(encoding='utf-8')
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 

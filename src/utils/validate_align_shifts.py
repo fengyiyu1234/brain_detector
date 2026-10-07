@@ -33,10 +33,10 @@ z 深度不足以留出窗口外区域时会退化成「窗口内取样」并在
 
 用法
 ----
-  python scripts/validate_align_shifts.py --sample Y:/Fengyi/TSC_brain/sample18
-  python scripts/validate_align_shifts.py --sample Y:/Fengyi/TSC_brain/sample18 \
+  python src/utils/validate_align_shifts.py --sample Y:/Fengyi/TSC_brain/sample18
+  python src/utils/validate_align_shifts.py --sample Y:/Fengyi/TSC_brain/sample18 \
       --n-tiles 8 --regions-per-tile 2 --xy-size 1024 --z-size 30 --workers 4
-  python scripts/validate_align_shifts.py --sample ... --tiles 291400_342500,302700_342500
+  python src/utils/validate_align_shifts.py --sample ... --tiles 291400_342500,302700_342500
 
 注意：conda 环境 brain_detector / gt_sam 里的 matplotlib 画图时会直接崩掉进程
 （Agg 后端加载 DLL 失败，Windows 异常 0xc06d007f），antsreg 环境正常。CSV 在画图
@@ -58,7 +58,7 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 

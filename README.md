@@ -1,6 +1,6 @@
 # brain_detector
 
-A tile-based light-sheet microscopy pipeline for cell detection, channel alignment, 3D Z linking, and multi-channel colocalization. The primary workflow detects cells on raw channel images (`pre_align`) and estimates alignment from detections. [`solve_tile_positions.py`](scripts/solve_tile_positions.py) can also estimate tile positions from cells shared by neighboring tiles, without running TeraStitcher.
+A tile-based light-sheet microscopy pipeline for cell detection, channel alignment, 3D Z linking, and multi-channel colocalization. The primary workflow detects cells on raw channel images (`pre_align`) and estimates alignment from detections. [`solve_tile_positions.py`](src/core/solve_tile_positions.py) can also estimate tile positions from cells shared by neighboring tiles, without running TeraStitcher.
 
 In `pre_align`, set `tile_position_params.enabled: true` to solve global tile positions from filtered detections inside the pipeline. The solver exports a frame XML for Stage 3 and one `xml_merging.xml` into each original channel image directory. A structural `xml_import.xml` or existing `xml_merging.xml` is required in each channel directory; the first publication preserves it as `xml_merging.original.xml`.
 
@@ -68,12 +68,12 @@ For a double-exposure channel, Stage 2 detects both exposures. Stage 2.5 gives t
 
 ## Solve tile positions from detections
 
-[`scripts/solve_tile_positions.py`](scripts/solve_tile_positions.py) is the global position solver used by optional pipeline Stage 2.9 and standalone runs. It reads filtered, unaligned `2_2d_filtered/` CSVs in pre_align mode, matches detections from the **same channel** across neighboring tile overlaps, and uses those measured seam displacements to solve tile positions. Tile names provide nominal stage-coordinate priors. The default `joint` model fits shared tile positions plus a smooth channel-dependent displacement field. Cross-channel data estimates constant offsets; local per-tile refinement is enabled by default. This geometry step does not use TeraStitcher displacement estimates.
+[`src/core/solve_tile_positions.py`](src/core/solve_tile_positions.py) is the global position solver used by optional pipeline Stage 2.9 and standalone runs. It reads filtered, unaligned `2_2d_filtered/` CSVs in pre_align mode, matches detections from the **same channel** across neighboring tile overlaps, and uses those measured seam displacements to solve tile positions. Tile names provide nominal stage-coordinate priors. The default `joint` model fits shared tile positions plus a smooth channel-dependent displacement field. Cross-channel data estimates constant offsets; local per-tile refinement is enabled by default. This geometry step does not use TeraStitcher displacement estimates.
 
 After Stage 2 raw detections exist, run, for example:
 
 ```bash
-python scripts/solve_tile_positions.py \
+python src/core/solve_tile_positions.py \
     --sample /path/to/brain_sample \
     --config config/config.json \
     --workers 8
@@ -160,7 +160,9 @@ without inferring a new pairing.
 
 - [`scripts/run_inference.py`](scripts/run_inference.py): pipeline orchestration, checkpoints, and global frame selection.
 - [`src/core/point_cloud_aligner.py`](src/core/point_cloud_aligner.py): per-tile pre-alignment and four-channel shift modes.
-- [`scripts/solve_tile_positions.py`](scripts/solve_tile_positions.py): detection-based seam measurement and global tile position solving.
+- [`src/core/solve_tile_positions.py`](src/core/solve_tile_positions.py): detection-based seam measurement and global tile position solving.
+- [`src/core/stitch_raw_tiles.py`](src/core/stitch_raw_tiles.py): optional raw-image mosaics on a shared channel canvas.
+- [`src/core/align_stitched_channels.py`](src/core/align_stitched_channels.py): align previously stitched channel images.
 - [`src/core/channel_stage3.py`](src/core/channel_stage3.py): per-channel global 2D construction and Z-link calls.
 - [`src/core/z_linker.py`](src/core/z_linker.py): across-Z tracking.
 - [`src/core/stitcher.py`](src/core/stitcher.py): overlap handling, soma matching, and TF annotation.

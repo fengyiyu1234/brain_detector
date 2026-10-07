@@ -35,7 +35,7 @@ class RefilterCliTests(unittest.TestCase):
                 ["s", 0, 0, 4, 4, "nucleus", .8, 2, 1],
             ], columns=["slice_name", "x1", "y1", "x2", "y2", "class", "score", "mean", "z"]
             ).to_csv(raw / "tile_Olig2_result.csv", index=False)
-            script = Path(__file__).parents[1] / "scripts" / "refilter_detections.py"
+            script = Path(__file__).parents[1] / "src" / "core" / "refilter_detections.py"
             dry = subprocess.run(
                 [sys.executable, str(script), "--config", str(config_path), "--dry-run"],
                 text=True, capture_output=True, check=True,

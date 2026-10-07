@@ -15,7 +15,7 @@
 
 ### 做了什么
 
-**1. 拼接质量比较脚本 `scripts/compare_stitching.py`（新增）**
+**1. 拼接质量比较脚本 `src/utils/compare_stitching.py`（新增）**
 - A. TeraStitcher 自评：各轴被替换成机械默认位移的比例、子块位移一致性、最终摆放与相邻对位移的残差。
 - B. 接缝残差：重叠区同一细胞在两个 tile 的检测做 z-link + 互为最近邻配对，中位数差即接缝误差；
   `--also CH` 先用 Stage 2.5 偏移把 CH 换到拼接通道坐标系再测（= 细胞最终落在该拼接图上的误差）。
@@ -102,7 +102,7 @@
 - 离群偏移处理（待实现）：得分为 0 / 过低、或与相邻 tile 明显不一致的偏移，改用相邻 tile 的中位数（位移随位置平滑变化，
   不能用全局中位数），并在 offsets JSON 里记录原值和替换原因。
 - 用 `validate_align_shifts.py` 在 held-out 数据上检验 T4 各通道偏移（RFP/Sox9 目前看起来稳定但未独立验证）。
-- 写 `scripts/solve_tile_positions.py`：接缝配对 → 加权稳健最小二乘求各通道 tile 位置 → 各通道 merging XML + 残差报告。
+- 写 `src/core/solve_tile_positions.py`：接缝配对 → 加权稳健最小二乘求各通道 tile 位置 → 各通道 merging XML + 残差报告。
 - T10 检测：计划在 gpu14 上用 4 块 L40（gpu02 的 RTX 2080 显存不够），提交前确认节点 CPU/内存余量。
 - git：1–4 以及 5 之前的改动已在 `abb1cb4 pipeline update` 提交；之后的改动（`containment_coarse` 粗搜索、
   溯源修复、`compare_stitching.py` C 部分结论修正、README、本日志）尚未提交。
@@ -147,7 +147,7 @@ T4 四个通道的检测都已完成，可以用来检验。
   随列号从 +24 px 走到 −21 px，对应两排 tile 之间约 0.4° 的相对旋转。TeraStitcher 同样表达不了。
   每通道各解各的时候，这个不自洽被各通道分摊得不一样，会冒充成 8–13 px 的"通道位移"。
 
-**3. 新脚本 `scripts/solve_tile_positions.py`**
+**3. 新脚本 `src/core/solve_tile_positions.py`**
 - 输入只有 `1_tile_2d_raw/` 和 tile 名字，不需要任何 XML。
 - 模型 `joint`（默认）：`P_c(t) = P(t) + delta_c(t)`，`delta_c(t) = a_c + b_c*行 + c_c*列`，参考通道 delta ≡ 0。
   所有通道的接缝一起约束共用的 `P(t)`（旋转那类不自洽被它统一吸收），每通道只留 2 个斜率/轴。
@@ -242,7 +242,7 @@ TeraStitcher 从此只做 merge，XML 从**输入**变成**输出**（`paths.pAT
   取候选对（每个 TF 细胞一个 Python list）原本占了绝大部分时间：单 tile 405 个候选位移
   **73 s → 12 s**；汇总点云（8 万核）上这一步是能不能跑的分界线。
 
-**2. `scripts/solve_tile_positions.py`**
+**2. `src/core/solve_tile_positions.py`**
 - `--const-from pooled`（默认）：并行把每个 tile 每个通道的中心 z 窗 z-link 成紧凑数组、
   加上该通道解出的 tile 位置，拼成全脑点云，然后
   soma↔TF 用包含度打分（与 Stage 3B 同一判据）、同类型通道用质心位移直方图 + 互为最近邻。
@@ -268,7 +268,7 @@ GFP 48165 soma / RFP 32081 / Olig2 494716 核 / Sox9 1144307 核。
 - 记住：结论对常数的估计质量极其敏感。抽样太小时常数本身是噪声，这个对照只反映那一点。
 
 **4. HPC 上跑的两个入口（本机太慢，正式计算搬过去）**
-- `scripts/check_containment_equivalence.py`（新增）：重构等价性检验，做两件事——
+- `src/utils/check_containment_equivalence.py`（新增）：重构等价性检验，做两件事——
   A 穷举精搜索（逐候选调用 `_containment_score`）vs 新的 `_fine_containment`；
   B 重构前的整个 `find_shift_containment` 函数体（原样抄在脚本里作参照）vs 现在的实现，
   `displacement_hist` / `fft` 两种粗搜索都测。有不一致就非零退出。
@@ -584,7 +584,7 @@ Olig2 逐 tile 包含数中位数 54 → 122。
 - Added src/core/detection_filter.py as the CPU-only source of truth for Stage 2.75: ordered bbox/aspect/area/mean/IoMin filtering, per-z stable-score containment NMS, parameter validation, per-channel override resolution, statistics, legal source routing, and atomic CSV writing.
 - Updated src/core/worker.py so 1_tile_2d_raw/ streams the full nine-column detector output and no longer applies configurable bbox, percentile, intensity, or containment filters. Detector-native YOLO patch stitching/model NMS and StarDist instance NMS remain.
 - Updated scripts/run_inference.py: Stage 2.75 is now mandatory, has no passthrough switch, validates every required raw/aligned/fused source CSV before checkpointing, logs per-tile/channel params and counts, and leaves Stage 3 reading only filtered CSVs.
-- Added CPU-only scripts/refilter_detections.py with --channels, --tiles, --output-dir, --dry-run, and explicit --overwrite. It uses existing CSV means, writes only after all filter calculations succeed, records refilter_manifest.json, and warns (without deleting) about stale downstream outputs.
+- Added CPU-only src/core/refilter_detections.py with --channels, --tiles, --output-dir, --dry-run, and explicit --overwrite. It uses existing CSV means, writes only after all filter calculations succeed, records refilter_manifest.json, and warns (without deleting) about stale downstream outputs.
 - Updated 2-D visualization preview to use the shared filter before z-range cropping, read raw/post-align, aligned/pre-align, or fused/double-exposure sources, use the recorded runtime_config.json parameters when available, and distinguish source -> preview-kept from preview-rejected layers. The dual-exposure preview utility now uses the shared module as well.
 - Added empty channel_filter_overrides.Olig2 placeholders to the three EGFR T4 local config files. No Olig2 QC threshold was guessed or written; Sox9 still inherits the StarDist defaults. config/ is locally ignored/skip-worktree, so these local config edits require explicit force-add or equivalent if they are intended for Git.
 - Extended README with raw/filtered semantics, override/null behavior, cache invalidation, and refilter commands.
@@ -625,13 +625,13 @@ Olig2 逐 tile 包含数中位数 54 → 122。
 
 - No EGFR T4 detection, filtered, Stage 3, Stage 4, or colocalization result files were changed. This update changes only visualization coordinate parsing/display and its regression tests.
 
-- Added scripts/review_filtered_gui.py: read-only raw-image plus saved-filtered-box QC. It prints the visualize.py spatial tile grid, accepts comma-separated multi-tile selection, then opens one Napari window per selected tile with a shared Z range and selected channels.
+- Added src/utils/review_filtered_gui.py: read-only raw-image plus saved-filtered-box QC. It prints the visualize.py spatial tile grid, accepts comma-separated multi-tile selection, then opens one Napari window per selected tile with a shared Z range and selected channels.
 
 ## 2026-09-24 — score_min 后处理过滤
 
 ### 已完成
 - 在共享 `src/core/detection_filter.py` 中加入 `score_min`：允许 `null` 或 `[0,1]` 有限数值，拒绝 bool/字符串/NaN/Infinity/越界值；过滤顺序在 `mean_min` 后、containment NMS 前，使用 `score >= score_min`。Filter schema 升至 `"2"`，每步统计始终包含 `removed.score_min`。
-- `scripts/refilter_detections.py` 继续使用共享 filter，终端显示 score_min 独立删除数；manifest 记录参数、分步统计和 schema。Stage 2.75 日志同样报告独立删除数。
+- `src/core/refilter_detections.py` 继续使用共享 filter，终端显示 score_min 独立删除数；manifest 记录参数、分步统计和 schema。Stage 2.75 日志同样报告独立删除数。
 - 可视化 preview 通过共享 filter 对 CSV score 过滤，不加载像素数据；更新 README 与预览说明，区分 StarDist 推理用 `prob_thresh` 和后处理用 `score_min`。
 - 所有生产模型配置加入显式 `score_min`。Olig2 redetect 的 HPC/local 配置均设为 `0.30`，其他配置为 `null`；两份 Olig2 config 阈值一致。
 - 新增阈值边界、参数校验、空表、channel override、NMS 顺序、refilter manifest/overwrite 覆盖。修复过滤后 index 非连续时 containment NMS 使用行位置越界的问题。

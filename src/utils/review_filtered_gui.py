@@ -12,7 +12,7 @@ import os
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -35,7 +35,7 @@ def _parse_args() -> argparse.Namespace:
         description="Read-only QC: raw images plus saved filtered CSV boxes."
     )
     parser.add_argument(
-        "--config", default=str(PROJECT_ROOT / "config" / "config_EGFR_t4_local_gpu.json"),
+        "--config", default=str(PROJECT_ROOT / "config" / "EGFR" / "2" / "config_EGFR_t4_local_gpu.json"),
         help="Pipeline JSON/JSONC config.",
     )
     parser.add_argument(

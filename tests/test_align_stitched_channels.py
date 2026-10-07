@@ -5,7 +5,7 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
-from scripts.align_stitched_channels import run
+from src.core.align_stitched_channels import run
 
 try:
     from PIL import Image
