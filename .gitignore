@@ -41,3 +41,4 @@ local_scripts/
 scripts/review_gui.py
 src/core/yolo_infer.py
 src/gui/
+!config_example/*.json

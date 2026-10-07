@@ -1,0 +1,11 @@
+{
+  "raw_sample_dir": "/path/to/EGFR_brain/T4",
+  "stitched_images": {
+    "GFP": "/path/to/stitched/GFP.tif",
+    "RFP": "/path/to/stitched/RFP.tif",
+    "Sox9": "/path/to/stitched/Sox9.tif",
+    "Olig2": "/path/to/stitched/Olig2.tif"
+  },
+  "xy_downsample": 4,
+  "output_dir": "/path/to/stitched_aligned"
+}

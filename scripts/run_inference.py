@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+from pathlib import Path
 import shutil
 import sys
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -756,6 +757,13 @@ if __name__ == '__main__':
     # ==========================================
     # 阶段 3: 线性 Checkpoint - 全局拼接与 Z-Linker共定位
     # ==========================================
+    # Image stitching uses the per-channel XMLs produced above. It is separate
+    # from Stage 3, which stitches cell coordinates rather than raw pixels.
+    if config.get('direct_stitching', {}).get('enabled', False):
+        from scripts.stitch_raw_tiles import run as run_direct_stitching
+        logging.info("Direct image stitching enabled; stitching raw channels before Stage 3.")
+        run_direct_stitching(Path(args.config), skip_completed=True)
+
     validate_global_checkpoints(
         derived, [os.path.basename(p) for p in pATHTILE_all], routing_config)
     bbox_path = os.path.join(derived['pATH_COLOCALIZATION'], "coloc_result.csv")

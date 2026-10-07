@@ -1,0 +1,10 @@
+{
+  "raw_sample_dir": "/path/to/EGFR_brain/T4",
+  "direct_stitching": {
+    "enabled": false,
+    "markers": ["GFP", "RFP", "Sox9", "Olig2"],
+    "downsample_factor": 4,
+    "blend_width_px": 256,
+    "output_dir": "/path/to/EGFR_brain/T4/stitched_direct_4x"
+  }
+}

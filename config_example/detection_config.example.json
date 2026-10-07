@@ -65,6 +65,18 @@
         "enabled": true,
         "workers": 4
     },
+    // With enabled=true, run_inference.py stitches raw images after XML generation.
+    // scripts/stitch_raw_tiles.py can also run separately with this config.
+    // stop_before_stitching=true exits before direct image stitching.
+    // Omit markers to stitch every active channel; list a subset if needed.
+    "direct_stitching": {
+        "enabled": false,
+        "downsample_factor": 4,
+        "blend_width_px": 256,
+        "output_dir": "/path/to/brain_sample/stitched_direct_4x"
+        // If output_dir is a local-only drive such as J:, add output_dir_hpc.
+        // "output_dir_hpc": "/rsstu/users/.../brain_sample/stitched_direct_4x"
+    },
     "pre_align_params": {
         // Reference used to measure channel shifts.
         "reference_channel": "GFP",
