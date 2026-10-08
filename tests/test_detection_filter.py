@@ -12,7 +12,7 @@ def frame(rows):
 
 
 class DetectionFilterTests(unittest.TestCase):
-    def test_ordered_percentiles_and_input_stability(self):
+    def test_area_percentiles_share_population_and_input_stability(self):
         source = frame([
             ["a", 0, 0, 1, 1, "n", .9, 1, 1],
             ["a", 0, 0, 2, 2, "n", .8, 8, 1],
@@ -30,8 +30,8 @@ class DetectionFilterTests(unittest.TestCase):
         pd.testing.assert_frame_equal(source, original)
         self.assertEqual(result.index.tolist(), [1])
         self.assertEqual(stats["thresholds"]["area_pct_min"], 3.25)
-        self.assertEqual(stats["thresholds"]["area_pct_max"], 9.0)
-        self.assertEqual(stats["thresholds"]["mean_pct_min"], 5.5)
+        self.assertEqual(stats["thresholds"]["area_pct_max"], 6.5)
+        self.assertEqual(stats["thresholds"]["mean_pct_min"], 8.0)
 
     def test_containment_only_same_z_and_high_score_wins(self):
         source = frame([
@@ -47,6 +47,17 @@ class DetectionFilterTests(unittest.TestCase):
         params["nms_containment_thresh"] = .9
         result = filter_detection_df(source, params)
         self.assertEqual(result.index.tolist(), [0, 2])
+
+    def test_containment_prefers_glia_across_classes_and_score_within_class(self):
+        source = frame([
+            ["a", 0, 0, 10, 10, "neuron", .95, 3, 1],
+            ["a", 1, 1, 3, 3, "glia", .20, 3, 1],
+            ["a", 1, 1, 3, 3, "glia", .80, 3, 1],
+        ])
+        result, stats = filter_detection_df(
+            source, {"nms_containment_thresh": .98}, return_stats=True)
+        self.assertEqual(result.index.tolist(), [2])
+        self.assertEqual(stats["removed"]["containment_nms"], 2)
 
     def test_channel_override_isolated_and_null_disables(self):
         config = {

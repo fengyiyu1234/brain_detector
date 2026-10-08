@@ -9,7 +9,7 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-FILTER_SCHEMA_VERSION = "2"
+FILTER_SCHEMA_VERSION = "4"
 FILTER_KEYS = frozenset({
     "bbox_min", "bbox_max", "bbox_max_aspect_ratio", "bbox_area_pct_min",
     "bbox_area_pct_max", "bbox_mean_pct_min", "bbox_mean_min",
@@ -95,7 +95,12 @@ def _iomin_keep(df: pd.DataFrame, threshold: float) -> np.ndarray:
         x1, y1 = group.x1.to_numpy(float), group.y1.to_numpy(float)
         x2, y2 = group.x2.to_numpy(float), group.y2.to_numpy(float)
         areas = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
-        order = np.argsort(-group.score.to_numpy(float), kind="mergesort")
+        scores = group.score.to_numpy(float)
+        if "class" in group:
+            glia = group["class"].astype(str).str.split("_").str[0].eq("glia").to_numpy()
+            order = np.lexsort((np.arange(len(group)), -scores, -glia.astype(int)))
+        else:
+            order = np.argsort(-scores, kind="mergesort")
         local_keep = np.ones(len(group), dtype=bool)
         for pos, winner in enumerate(order):
             if not local_keep[winner]:
@@ -142,10 +147,25 @@ def filter_detection_df(df: pd.DataFrame, params: Mapping[str, Any], return_stat
         threshold = float(np.percentile(values, percentile)); stats["thresholds"][name] = threshold
         apply(name, values >= threshold if keep_min else values <= threshold)
 
-    area = (out.x2.to_numpy(float) - out.x1.to_numpy(float)) * (out.y2.to_numpy(float) - out.y1.to_numpy(float)) if not out.empty else np.array([])
-    percentile_step("area_pct_min", area, params.get("bbox_area_pct_min"), True)
-    area = (out.x2.to_numpy(float) - out.x1.to_numpy(float)) * (out.y2.to_numpy(float) - out.y1.to_numpy(float)) if not out.empty else np.array([])
-    percentile_step("area_pct_max", area, params.get("bbox_area_pct_max"), False)
+    if not out.empty:
+        area = (out.x2.to_numpy(float) - out.x1.to_numpy(float)) * (out.y2.to_numpy(float) - out.y1.to_numpy(float))
+        min_pct = params.get("bbox_area_pct_min")
+        max_pct = params.get("bbox_area_pct_max")
+        min_mask = np.ones(len(out), dtype=bool)
+        max_mask = np.ones(len(out), dtype=bool)
+        if min_pct is not None:
+            lower = float(np.percentile(area, min_pct))
+            stats["thresholds"]["area_pct_min"] = lower
+            min_mask = area >= lower
+        if max_pct is not None:
+            upper = float(np.percentile(area, max_pct))
+            stats["thresholds"]["area_pct_max"] = upper
+            max_mask = area <= upper
+        apply("area_pct_min", min_mask)
+        apply("area_pct_max", max_mask[min_mask])
+    else:
+        stats["removed"]["area_pct_min"] = 0
+        stats["removed"]["area_pct_max"] = 0
     percentile_step("mean_pct_min", out["mean"].to_numpy(float) if not out.empty else np.array([]), params.get("bbox_mean_pct_min"), True)
     if not out.empty and params.get("bbox_mean_min") is not None: apply("mean_min", out["mean"].to_numpy(float) >= params["bbox_mean_min"])
     else: stats["removed"]["mean_min"] = 0
