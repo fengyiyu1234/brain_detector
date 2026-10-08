@@ -33,6 +33,7 @@ import pickle
 import sys
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if project_root not in sys.path:
@@ -43,6 +44,7 @@ from src.utils.coordinate_context import CoordinateContext, CoordinateContextErr
 import numpy as np
 import pandas as pd
 import napari
+from qtpy.QtCore import QTimer
 from qtpy.QtWidgets import QApplication, QMessageBox, QWidget, QGridLayout, QLabel, QSpinBox, QLineEdit
 
 from src.config.loader import load_config
@@ -167,37 +169,40 @@ def _auto_groups_from_classes(classes, outline_width=4, dash_size=8):
     return groups
 
 
-def _read_tiff(fpath):
+def _read_tiff(fpath, native_dtype=False):
     img = cv2.imread(fpath, cv2.IMREAD_ANYDEPTH)
     if img is None:
         return None
-    return img[:, :, 0].astype(np.float32) if img.ndim == 3 else img.astype(np.float32)
+    if img.ndim == 3:
+        img = img[:, :, 0]
+    return img if native_dtype else img.astype(np.float32)
 
 
-def load_volume(tile_dir, z_range=None, contrast_pct=(0.1, 99.9)):
-    """Load a tile volume preserving original 16-bit intensity values (no normalization).
+def load_volume(tile_dir, z_range=None, contrast_pct=(0.1, 99.9),
+                native_dtype=False, files=None):
+    """Load selected TIFF slices and estimate contrast from a spatial subsample.
 
-    Returns (vol, contrast_limits): vol is float32 with raw 16-bit values; contrast_limits
-    is an (lo, hi) tuple from contrast_pct percentiles on a subsample, meant to be passed
-    straight to napari's contrast_limits so the slider reads real 16-bit intensities instead
-    of a normalized 0-1 range.
+    The default float32 output preserves existing callers. The frame viewer can
+    request the original TIFF dtype to avoid doubling memory for 16-bit images.
     """
-    if not os.path.isdir(tile_dir):
-        return None, None
-    files = sorted(f for f in os.listdir(tile_dir)
-                   if f.lower().endswith(('.tif', '.tiff')))
+    if files is None:
+        files = _list_tiffs(tile_dir)
     if z_range:
         files = files[z_range[0]:z_range[1]]
     if not files:
         return None, None
+    paths = [os.path.join(tile_dir, name) for name in files]
     with ThreadPoolExecutor() as ex:
-        slices = list(ex.map(_read_tiff, [os.path.join(tile_dir, f) for f in files]))
-    slices = [s for s in slices if s is not None]
+        slices = list(ex.map(partial(_read_tiff, native_dtype=native_dtype), paths))
+    slices = [image for image in slices if image is not None]
     if not slices:
         return None, None
     vol = np.stack(slices)
     sample = vol[::2, ::4, ::4]
-    lo, hi = np.percentile(sample, contrast_pct[0]), np.percentile(sample, contrast_pct[1])
+    # Contrast is display-only. Bound percentile work for large Z stacks.
+    while sample.size > 1_000_000:
+        sample = sample[::2, ::2, ::2]
+    lo, hi = np.percentile(sample, contrast_pct)
     return vol, (float(lo), float(hi))
 
 
@@ -220,27 +225,34 @@ def load_raw_volume(tile_dir, z_range=None):
 
 
 def load_frame_volume(tile_dir, frame_z_range, shift=(0, 0, 0), contrast_pct=(0.1, 99.9)):
-    """Load TIFFs into final-frame Z coordinates, including edge slices."""
-    dx, dy, dz = (int(v) for v in shift)
+    """Load TIFFs into final-frame coordinates without extra full-volume copies."""
+    dx, dy, dz = (int(value) for value in shift)
     frame_z0, frame_z1 = frame_z_range
+    files = _list_tiffs(tile_dir)
     raw_z0 = max(0, frame_z0 - dz)
-    raw_z1 = max(0, min(len(_list_tiffs(tile_dir)), frame_z1 - dz))
+    raw_z1 = max(0, min(len(files), frame_z1 - dz))
     if raw_z1 <= raw_z0:
         return None, None
-    source, climits = load_volume(tile_dir, (raw_z0, raw_z1), contrast_pct)
+    source, climits = load_volume(
+        tile_dir, (raw_z0, raw_z1), contrast_pct,
+        native_dtype=True, files=files)
     if source is None:
         return None, None
-    out = np.zeros((frame_z1 - frame_z0, *source.shape[1:]), dtype=source.dtype)
+    depth, height, width = source.shape
+    canvas_depth = frame_z1 - frame_z0
     dst_z0 = raw_z0 + dz - frame_z0
-    dst_z1 = dst_z0 + source.shape[0]
-    src_z0 = max(0, -dst_z0)
-    src_z1 = source.shape[0] - max(0, dst_z1 - out.shape[0])
-    dst_z0 = max(0, dst_z0)
-    dst_z1 = min(out.shape[0], dst_z1)
-    if src_z1 > src_z0 and dst_z1 > dst_z0:
-        out[dst_z0:dst_z1] = source[src_z0:src_z1]
-    if dx or dy:
-        out = _shift_volume(out, dx, dy, 0)
+    if dx == 0 and dy == 0 and dst_z0 == 0 and depth == canvas_depth:
+        return source, climits
+
+    src_x0, src_x1 = max(0, -dx), min(width, width - dx)
+    src_y0, src_y1 = max(0, -dy), min(height, height - dy)
+    src_z0, src_z1 = max(0, -dst_z0), min(depth, canvas_depth - dst_z0)
+    out = np.zeros((canvas_depth, height, width), dtype=source.dtype)
+    if src_x1 > src_x0 and src_y1 > src_y0 and src_z1 > src_z0:
+        out[dst_z0 + src_z0:dst_z0 + src_z1,
+            src_y0 + dy:src_y1 + dy,
+            src_x0 + dx:src_x1 + dx] = source[
+                src_z0:src_z1, src_y0:src_y1, src_x0:src_x1]
     return out, climits
 
 
@@ -524,6 +536,14 @@ def _get_tile_overlap_margins(channel_dir, tile_name, canvas_w, canvas_h):
         return left_margin, top_margin
     except Exception:
         return 0, 0
+
+
+def _show_only_images_initially(viewer, vis_cfg):
+    """Start with TIFF layers visible and all result/overlay layers hidden."""
+    if not vis_cfg.get('images_only_initially', True):
+        return
+    for layer in viewer.layers:
+        layer.visible = layer.name.startswith('[img]')
 
 
 def _add_margin_overlay(viewer, canvas_shape, left_m, top_m):
@@ -1382,7 +1402,7 @@ def _make_fn_recorder(vis_cfg, paths, routing_config, anchor_dir, tile_path,
             crop_note = "  (no crop — select a single [img] layer first)"
         elif crop_dir:
             o = offsets.get(ch_tag, {})
-            # 视图里是平移后的图像（对齐坐标 = 原始坐标 + shift），裁图读的是原始 TIFF，所以减去 shift
+            # Displayed images use aligned coordinates (aligned = raw + shift), so subtract the shift to crop the original TIFF.
             z_f = z_abs - o.get('dz', 0)
             x_f = x - o.get('dx', 0)
             y_f = y - o.get('dy', 0)
@@ -1516,8 +1536,8 @@ def _run_zlink_for_csv(csv_path, z_range, iou_thresh, min_z_layers, max_cell_z_s
     if df.empty:
         return []
     if ch_id is not None:
-        # "GFP_3" 这类带曝光后缀的通道 id 先规范成单个 marker token，
-        # 否则 class 会变成 "neuron_GFP_3"，下游按 '_' 拆分时多出一个伪 marker "3"
+        # Normalize exposure-suffixed channel IDs such as "GFP_3" to one marker token;
+        # otherwise "neuron_GFP_3" would create a false marker "3" when split downstream.
         df['class'] = df['class'].astype(str) + '_' + channel_marker(ch_id)
     matrix = df[['x1', 'y1', 'x2', 'y2', 'score', 'mean', 'class', 'z']].values
     _, vol_list = run_z_linker(
@@ -1800,6 +1820,7 @@ def _run_2d(vis_cfg, paths, routing_config, tile_path, tile_name):
                       box_registry)
 
         viewer.mouse_drag_callbacks.append(_on_click)
+    _show_only_images_initially(viewer, vis_cfg)
     viewer.reset_view()
 
 
@@ -2123,12 +2144,57 @@ def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
 
     viewer.mouse_drag_callbacks.append(_on_click)
 
+    _show_only_images_initially(viewer, vis_cfg)
     viewer.reset_view()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _configure_text_output():
+    """Keep Windows console and GUI child-process logs UTF-8 compatible."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, 'reconfigure', None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding='utf-8', errors='backslashreplace')
+            except (OSError, ValueError):
+                pass
+
+
+
+def _open_tiles_progressively(selected_tiles, open_tile, progress):
+    """Show the first available tile before loading the remaining windows."""
+    tiles = iter(selected_tiles)
+    total = len(selected_tiles)
+    opened = 0
+
+    def open_next():
+        nonlocal opened
+        for tile_path, tile_name in tiles:
+            print(f"\n{'=' * 70}\nTile: {tile_name}\n{'=' * 70}")
+            try:
+                open_tile(tile_path, tile_name)
+            except InvalidImageContrastError as exc:
+                print(f"[error] {exc}\nSkipping tile {tile_name}.")
+                QApplication.instance() or QApplication(sys.argv)
+                QMessageBox.critical(
+                    None, "Cannot open tile",
+                    f"{exc}\n\nThis tile was skipped. Other selected tiles will continue."
+                )
+                continue
+            opened += 1
+            progress(opened, total, tile_name)
+            # Let Qt paint the completed window before opening another tile.
+            QTimer.singleShot(100, open_next)
+            return True
+        return False
+
+    if open_next():
+        print("VIS_READY", flush=True)
+        napari.run()
+
 def main():
+    _configure_text_output()
     parser = argparse.ArgumentParser(description='brain_detector unified visualizer.')
     parser.add_argument(
         '--config',
@@ -2139,7 +2205,14 @@ def main():
                         help='Override mode from vis_config.json')
     parser.add_argument('--2d-source', dest='source_2d', choices=('raw', 'filtered'),
                         help='Select aligned raw or filtered 2D detections')
+    parser.add_argument('--direct', action='store_true',
+                        help='Use the original command-line tile selection instead of the launcher')
     args = parser.parse_args()
+
+    if not (args.direct or args.mode or args.source_2d):
+        from src.utils.visualize_gui import launch_gui
+        launch_gui(args.config)
+        return
 
     vis_cfg_path = args.config
     vis_cfg = load_config(vis_cfg_path) if os.path.isfile(vis_cfg_path) else {}
@@ -2148,9 +2221,9 @@ def main():
     if samples:
         active_sample = vis_cfg.get('active_sample')
         if not active_sample:
-            sys.exit(f"'samples' 已定义，但 'active_sample' 未设置。可选: {', '.join(samples)}")
+            sys.exit(f"'samples' is defined, but 'active_sample' is not set. Options: {', '.join(samples)}")
         if active_sample not in samples:
-            sys.exit(f"未知 sample '{active_sample}'。可选: {', '.join(samples)}")
+            sys.exit(f"Unknown sample '{active_sample}'. Options: {', '.join(samples)}")
         vis_cfg = {**vis_cfg, **samples[active_sample]}
         print(f"Sample: {active_sample}")
 
@@ -2193,36 +2266,33 @@ def main():
     print(f"\n{len(selected_tiles)} tile(s) selected: "
           f"{', '.join(name for _, name in selected_tiles)}")
 
-    if mode == 'prealign':
+    def report_progress(current, total, tile_name):
+        print(f"VIS_PROGRESS {current} {total} {tile_name}", flush=True)
+
+    if mode == 'prealign' and vis_cfg.get('view_space', 'local') == 'global':
         from src.utils.saved_gui import run_saved_prealign
-        run_saved_prealign(vis_cfg, paths, routing_config, context, selected_tiles)
+        run_saved_prealign(
+            vis_cfg, paths, routing_config, context, selected_tiles,
+            progress=report_progress)
+        print("VIS_READY", flush=True)
         napari.run()
         return
 
-    # One napari.Viewer() (= one OS window) per tile, all built up-front; napari.run()
-    # is called once at the end so every window stays open and you can Alt-Tab / click
-    # between them, instead of blocking on a single tile at a time.
-    opened_tiles = 0
-    qt_app = None
-    for tile_path, tile_name in selected_tiles:
-        print(f"\n{'=' * 70}\nTile: {tile_name}\n{'=' * 70}")
-        try:
-            if mode == '2d':
-                _run_2d(vis_cfg, paths, routing_config, tile_path, tile_name)
-            else:
-                _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name)
-        except InvalidImageContrastError as exc:
-            print(f"[error] {exc}\nSkipping tile {tile_name}.")
-            qt_app = QApplication.instance() or QApplication(sys.argv)
-            QMessageBox.critical(
-                None, "Cannot open tile",
-                f"{exc}\n\nThis tile was skipped. Other selected tiles will continue."
-            )
-            continue
-        opened_tiles += 1
+    if mode == 'prealign':
+        from src.utils.saved_gui import run_saved_prealign
 
-    if opened_tiles:
-        napari.run()
+        def open_tile(tile_path, tile_name):
+            run_saved_prealign(
+                vis_cfg, paths, routing_config, context,
+                [(tile_path, tile_name)])
+    elif mode == '2d':
+        def open_tile(tile_path, tile_name):
+            _run_2d(vis_cfg, paths, routing_config, tile_path, tile_name)
+    else:
+        def open_tile(tile_path, tile_name):
+            _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name)
+
+    _open_tiles_progressively(selected_tiles, open_tile, report_progress)
 
 
 if __name__ == '__main__':

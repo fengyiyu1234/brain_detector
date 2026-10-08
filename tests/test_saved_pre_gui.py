@@ -1,5 +1,6 @@
 """Saved pre-align GUI contracts using small synthetic pipeline outputs."""
 
+import io
 import json
 import os
 import pickle
@@ -18,7 +19,11 @@ from src.utils.saved_view import (
     saved_run_context, track_for_summary,
 )
 from src.utils.saved_gui import _add_tile_2d, run_saved_prealign
-from src.utils.visualize import _active_image_channel, load_frame_volume
+from src.utils.visualize import (
+    _active_image_channel, _configure_text_output, _make_fn_recorder,
+    _open_tiles_progressively,
+    _show_only_images_initially, load_frame_volume, load_volume,
+)
 
 
 class FakeViewer:
@@ -141,6 +146,33 @@ class SavedPrealignTests(unittest.TestCase):
         self.run, self.context = saved_run_context(self.vis)
         self.tile_path = str(self.images / "GFP" / "row" / self.tile)
 
+    def test_images_only_initial_visibility_can_be_disabled(self):
+        viewer = FakeViewer("visibility")
+        image = viewer.add_image(None, name="[img] GFP", visible=False)
+        boxes = viewer.add_shapes(None, name="[s3] GFP", visible=True)
+        _show_only_images_initially(viewer, {})
+        self.assertTrue(image.visible)
+        self.assertFalse(boxes.visible)
+        boxes.visible = True
+        _show_only_images_initially(viewer, {"images_only_initially": False})
+        self.assertTrue(boxes.visible)
+
+    def test_windows_console_encoding_does_not_break_annotation_log(self):
+        output = io.BytesIO()
+        stdout = io.TextIOWrapper(output, encoding="cp1252", errors="strict")
+        stderr = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+        with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            _configure_text_output()
+            _make_fn_recorder(
+                {"fn_ann_path": "annotations.csv", "fn_crop_dir": "crops"},
+                {"gfp_dir": str(self.images / "GFP")},
+                [{"id": "GFP", "dir_key": "gfp_dir"}],
+                str(self.images / "GFP"), self.tile_path,
+                self.tile, (0, 5),
+            )
+            stdout.flush()
+        self.assertIn(chr(0x2192).encode("utf-8"), output.getvalue())
+
     def test_runtime_frame_routing_and_cross_os_xml(self):
         self.assertEqual([r["id"] for r in self.context.routing], ["GFP", "RFP"])
         self.assertEqual(tuple(self.context.position(self.tile)), (20, 30, 2))
@@ -200,12 +232,20 @@ class SavedPrealignTests(unittest.TestCase):
                 super().__init__(title)
                 self.layers = Layers()
         self.vis["view_space"] = "global"
+        self.vis["no_images"] = False
         with patch("src.utils.saved_gui.napari.Viewer", Viewer):
             run_saved_prealign(
                 self.vis, run["paths"], context.routing, context,
                 [(self.tile_path, self.tile),
                  (str(self.images / "GFP" / "row" / second), second)])
         viewer = FakeViewer.made[-1]
+        image_indices = [i for i, layer in enumerate(viewer.layers)
+                         if layer.name.startswith("[img]")]
+        self.assertTrue(image_indices)
+        self.assertEqual(image_indices,
+                         list(range(image_indices[0], image_indices[-1] + 1)))
+        self.assertTrue(all(layer.visible == layer.name.startswith("[img]")
+                            for layer in viewer.layers))
         coloc_layer = next(l for l in viewer.layers
                            if l.name == "[s4 saved rep-z exact] GFP+RFP")
         self.assertEqual(len(coloc_layer.data), 2)
@@ -231,6 +271,7 @@ class SavedPrealignTests(unittest.TestCase):
         viewer = FakeViewer.made[-1]
         viewer.layers.selection.active = next(
             layer for layer in viewer.layers if layer.name == "[s3 saved summary] RFP")
+        viewer.layers.selection.active.visible = True
         viewer.cursor.position = (3, 7, 5)
         viewer.mouse_drag_callbacks[0](
             viewer, SimpleNamespace(type="mouse_press", modifiers=["Shift"]))
@@ -351,6 +392,23 @@ class SavedPrealignTests(unittest.TestCase):
             str(image_dir), (-10, -5), (0, 0, 0))
         self.assertIsNone(missing)
 
+    def test_frame_volume_preserves_uint16_and_combines_xyz_shift(self):
+        image_dir = self.images / "RFP" / "row" / self.tile
+        source = np.zeros((16, 16), dtype=np.uint16)
+        source[3, 4] = 40000
+        cv2.imwrite(str(image_dir / "0002.tif"), source)
+        volume, _ = load_frame_volume(
+            str(image_dir), (3, 5), (2, -1, 1))
+        self.assertEqual(volume.dtype, np.dtype("uint16"))
+        self.assertEqual(volume.shape, (2, 16, 16))
+        self.assertEqual(int(volume[0, 2, 6]), 40000)
+        self.assertEqual(int(volume[0, 3, 4]), 0)
+        direct, _ = load_frame_volume(str(image_dir), (2, 3))
+        self.assertEqual(direct.dtype, np.dtype("uint16"))
+        self.assertEqual(int(direct[0, 3, 4]), 40000)
+        legacy_caller, _ = load_volume(str(image_dir), (2, 3))
+        self.assertEqual(legacy_caller.dtype, np.dtype("float32"))
+
     def test_local_and_global_views_use_saved_rows(self):
         class Viewer(FakeViewer):
             def __init__(self, title):
@@ -376,6 +434,37 @@ class SavedPrealignTests(unittest.TestCase):
             coloc = next(l for l in global_view.layers
                          if l.name == "[s4 saved rep-z exact] GFP+RFP")
             self.assertEqual(tuple(coloc.data[0][0]), (1, 35, 23))
+
+
+    def test_local_tiles_open_after_first_viewer_starts(self):
+        events, pending = [], []
+
+        def open_tile(path, name):
+            events.append(("open", name))
+
+        def progress(current, total, name):
+            events.append(("progress", name, current, total))
+
+        def run_viewer():
+            events.append(("viewer_running",))
+            self.assertEqual(events[:3], [
+                ("open", "first"),
+                ("progress", "first", 1, 2),
+                ("viewer_running",),
+            ])
+            while pending:
+                pending.pop(0)()
+
+        with patch("src.utils.visualize.QTimer.singleShot",
+                   side_effect=lambda delay, callback: pending.append(callback)), \
+             patch("src.utils.visualize.napari.run", side_effect=run_viewer):
+            _open_tiles_progressively(
+                [("a", "first"), ("b", "second")], open_tile, progress)
+
+        self.assertEqual(events[-2:], [
+            ("open", "second"),
+            ("progress", "second", 2, 2),
+        ])
 
 
 if __name__ == "__main__":

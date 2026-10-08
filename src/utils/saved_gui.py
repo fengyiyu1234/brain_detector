@@ -19,7 +19,7 @@ from src.utils.saved_view import (
 )
 from src.utils.visualize import (
     _canvas_shape_from_tile, _ch_vis, _list_tiffs, _make_fn_recorder,
-    _resolve_z_range, load_frame_volume,
+    _resolve_z_range, _show_only_images_initially, load_frame_volume,
 )
 
 
@@ -335,7 +335,7 @@ def _attach_clicks(viewer, registry, result_dir, context, tile_contexts,
     viewer.mouse_drag_callbacks.append(on_click)
 
 
-def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles):
+def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles, progress=None):
     """Render one tile in local coordinates, or selected tiles in one global view."""
     view_space = vis_cfg.get("view_space", "local")
     if view_space not in ("local", "global"):
@@ -347,7 +347,7 @@ def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles):
     width = int(vis_cfg.get("outline_width", 3))
     show_coloc = bool(vis_cfg.get("show_coloc", True))
     if view_space == "local":
-        for tile_path, tile_name in selected_tiles:
+        for tile_index, (tile_path, tile_name) in enumerate(selected_tiles, 1):
             z_range = _resolve_z_range(vis_cfg, tile_path)
             offsets = (context.offsets_for_tile(tile_name) if context else
                        _load_offsets_if_present(result_dir, tile_name))
@@ -374,7 +374,10 @@ def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles):
                 False, vis_cfg, paths, routing, anchor_dir)
             if vis_cfg.get("spheres", False):
                 viewer.dims.ndisplay = 3
+            _show_only_images_initially(viewer, vis_cfg)
             viewer.reset_view()
+            if progress:
+                progress(tile_index, len(selected_tiles), tile_name)
         return
 
     first_path, first_name = selected_tiles[0]
@@ -386,7 +389,7 @@ def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles):
     global_range = (global_z0, global_z0 + count)
     viewer = napari.Viewer(title=f"Saved pre-align global — {context.frame_channel}")
     registry, tile_contexts, bounds_list = [], {}, []
-    for tile_path, tile_name in selected_tiles:
+    for tile_index, (tile_path, tile_name) in enumerate(selected_tiles, 1):
         pos = context.position(tile_name)
         offsets = context.offsets_for_tile(tile_name)
         local_range = (global_range[0] + pos.z, global_range[1] + pos.z)
@@ -396,6 +399,10 @@ def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles):
         _add_images(viewer, vis_cfg, paths, routing, anchor_dir, tile_path,
                     tile_name, local_range, offsets,
                     (global_range[0], pos.y, pos.x), True)
+        if progress:
+            progress(tile_index, len(selected_tiles), tile_name)
+    # Keep every tile's image layers together in Napari's layer list.
+    for tile_name, (_, local_range, offsets, pos) in tile_contexts.items():
         _add_tile_2d(viewer, result_dir, tile_name, routing, offsets,
                      local_range, pos, True, registry, width, vis_cfg)
     union = (min(b[0] for b in bounds_list), min(b[1] for b in bounds_list),
@@ -410,6 +417,7 @@ def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles):
         vis_cfg, paths, routing, anchor_dir)
     if vis_cfg.get("spheres", False):
         viewer.dims.ndisplay = 3
+    _show_only_images_initially(viewer, vis_cfg)
     viewer.reset_view()
 
 
