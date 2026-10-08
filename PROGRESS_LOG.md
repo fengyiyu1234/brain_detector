@@ -699,3 +699,43 @@ Olig2 逐 tile 包含数中位数 54 → 122。
 
 - Earlier implementation verification: 32 unit tests passed, including different-reference conversion, XML output/backup, and changed-input checkpoint protection. The T70 dataset itself was not rerun during that verification.
 - In this checkout, config/config_EGFR_t70.json is absent while scripts/inference_t70.slurm defaults to that path. Confirm that the T70 config exists at the submission location before running sbatch.
+
+---
+
+## 2026-10-08 Interactive visualization GUI updates
+
+### Completed
+
+- Added a light purple and white Qt launcher for `src/utils/visualize.py`. It supports sample selection, numbered Tile selection and spatial layout, editing common settings or the full configuration, larger adjustable fonts, and resizable panels. The launcher and its controls use English text; `--direct` retains the command-line flow.
+- The launcher starts with no sample selected and does not scan image folders until the user selects a sample and clicks **Choose**. Changing samples clears stale Tile selections. **Refresh** becomes available after a sample is chosen.
+- Scanning displays a prominent indeterminate progress dialog. Opening Tiles displays a progress dialog with the count of loaded Tiles; the dialog closes when the Napari viewer is ready. Viewer failures remain visible in the launcher.
+- In prealign local mode, each selected Tile opens in its own local-coordinate viewer. In prealign global mode, selected Tiles share one viewer; all image layers are added together before result layers so they are contiguous in Napari's layer list. Images remain separate layers rather than being blended into one output file.
+- Added **Start with images only**, enabled by default. TIFF image layers initially appear while detection boxes, points, colocalization, and overlap overlays start hidden in all visualization modes. Users can enable result layers inside Napari or disable the option to restore configured initial visibility.
+- Reduced TIFF loading overhead for aligned image views: retain native 16-bit pixels, avoid redundant full-volume copies when applying channel shifts, and bound the image sample used to calculate display contrast. The other `load_volume` callers keep their float32 return type. These are display-only changes; saved detection CSVs and pipeline results are unchanged.
+- Configured the visualization process's stdout and stderr as UTF-8 before logging. This fixes the Windows cp1252 `UnicodeEncodeError` raised while local mode printed Ctrl+click annotation instructions.
+- The visualizer reads only the current result layout. Channel-relative offsets come from `3_2d_aligned`, while global Tile positions come from the configured final-frame XML, including per-channel `xml_merging.xml` files where applicable. The temporary legacy-layout read fallback was removed.
+- Updated `README.md` and the local visualization configuration comments for the launcher and image-only startup behavior.
+
+### Verification and limits
+
+- The saved-view regression suite passed 15 tests, including multiple-Tile global layer ordering, initial visibility, uint16 TIFF alignment, and a cp1252 annotation-log reproduction. Python compilation and `git diff --check` passed.
+- An offscreen launcher smoke check confirmed an empty initial sample selection, zero scan workers, and **Start with images only** enabled.
+- No full multi-Tile Napari interaction or network-drive loading benchmark was run. The TIFF and CSV inputs are on a mapped network drive, so initial load time may still be limited by network throughput.
+
+---
+
+## 2026-10-08 YOLO 2D containment NMS: glia priority
+
+- Confirmed that raw YOLO tile CSVs already pass the model's per-patch NMS (`yolo.nms_iou`) and a per-class, per-slice tile NMS with fixed IoU 0.4. The later `nms_containment_thresh` filter reads those raw CSVs and writes filtered tile CSVs.
+- Changed the containment filter to keep glia when overlapping boxes have different classes, even if the glia box has a lower score. Boxes of the same class still use score order. The rule applies within each z slice of a tile and channel when IoMin exceeds the configured threshold.
+- Corrected the active T70 config comment: `nms_containment_thresh: 0.98` means more than 98% overlap relative to the smaller box, not 60%. Earlier confidence, size, and area filters can still remove a glia box before containment NMS.
+- Bumped `FILTER_SCHEMA_VERSION` to 4 so cached filtered CSVs are recomputed under the new rule. The focused detection-filter suite passed all 10 tests in the local `brain_detector` Conda environment; Python compilation and whitespace checks passed.
+
+---
+
+## 2026-10-08 重叠区检测丢失 bug 修复
+
+- 原因：全局 2D 拼接时，旧逻辑无条件丢弃后处理 tile 中心落在重叠区的检测，即使相邻 tile 没有对应检测，导致检测无法进入 Stage 3。
+- 修复：`combine_predictions` 只在先前 tile 的同一全局 Z 层、同一细胞类型存在 IoU > 0.4 的框时丢弃重复检测；没有匹配框则保留，并同步保留 tile/slice 溯源。
+- 验证：新增重叠区独有检测、重复检测、不同类型和不同 Z 层的回归测试；在 `brain_detector` Conda 环境中，新增测试 3 项及相关流水线测试 2 项全部通过。
+- 已生成的全局 2D、Stage 3 及下游 checkpoint 不会自动更新，需要重新生成才能应用修复。

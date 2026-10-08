@@ -677,7 +677,7 @@ _TF_CHUNK = 100_000   # 3B 每块处理的 TF 数；候选对数组的内存随�
 
 
 def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_margin=0,
-                                       max_center_dist_ratio=0.5):
+                                       max_center_dist_ratio=0.5, source_channel=None):
     """
     Annotate soma cells with TF markers using strict 3D bbox containment.
     A TF is colocalized only if its 3D bounding box is fully enclosed within
@@ -748,6 +748,9 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
                 tf_base, tf_mk = split_class(cls)
                 marker_of[cls] = tf_mk[-1] if tf_mk else tf_base
             soma_markers[best_idx].add(marker_of[cls])
+            if source_channel is not None:
+                soma_vol_list[best_idx].setdefault('source_tracks', []).append(
+                    (source_channel, chunk[t]))
 
     for idx, soma in enumerate(soma_vol_list):
         if idx in soma_markers:
@@ -835,6 +838,7 @@ def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, d
     # 以前每个框都把整层数组复制一遍，稠密核通道（每层上万个框）耗时按平方增长。
     # 行的先后顺序与逐个追加时完全相同。
     new_rows = {}
+    prior_boxes = {}
     for row_data in csv_reader:
         slice_name, x1, y1, x2, y2, class_name, score, mean, z = row_data[:9]
         z    = int(float(z))
@@ -845,15 +849,33 @@ def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, d
             cx_local = min(max(int((x1 + x2) // 2), 0), tILESIZE - 1)
             x1 += ABS_X; x2 += ABS_X; y1 += ABS_Y; y2 += ABS_Y; z = z - z0
             cell_type_index = 0 if 'glia' in class_name.lower() else 1
+            key = (z - 1, cell_type_index)
 
-            if not mask[cy_local, cx_local]:
-                # 非重叠区：写入
-                new_rows.setdefault((z - 1, cell_type_index), []).append(
-                    [x1, y1, x2, y2, score, mean, class_name, z])
-                if row_meta is not None:
-                    row_meta.setdefault((z - 1, cell_type_index), []).append((tile_name, slice_name))
-                metadata_registry.append([(x1 + x2) / 2, (y1 + y2) / 2, z, tile_name, slice_name])
-            # 重叠区：丢弃（保留左/上方 tile 的结果，右/下方 tile 的重叠区检测一律舍弃）
+            if mask[cy_local, cx_local]:
+                # Keep an overlap detection unless an earlier tile found the
+                # same cell type and substantially the same box on this Z slice.
+                if key not in prior_boxes:
+                    prior = all_predictions[key[0]][key[1]]
+                    prior_boxes[key] = (prior[:, :4].astype(float) if len(prior)
+                                        else np.empty((0, 4), dtype=float))
+                boxes = prior_boxes[key]
+                if len(boxes):
+                    ix1 = np.maximum(x1, boxes[:, 0])
+                    iy1 = np.maximum(y1, boxes[:, 1])
+                    ix2 = np.minimum(x2, boxes[:, 2])
+                    iy2 = np.minimum(y2, boxes[:, 3])
+                    inter = np.maximum(0, ix2 - ix1) * np.maximum(0, iy2 - iy1)
+                    area = max(0, x2 - x1) * max(0, y2 - y1)
+                    prior_area = (np.maximum(0, boxes[:, 2] - boxes[:, 0]) *
+                                  np.maximum(0, boxes[:, 3] - boxes[:, 1]))
+                    if np.any(inter / (area + prior_area - inter + 1e-6) > 0.4):
+                        continue
+
+            new_rows.setdefault(key, []).append(
+                [x1, y1, x2, y2, score, mean, class_name, z])
+            if row_meta is not None:
+                row_meta.setdefault(key, []).append((tile_name, slice_name))
+            metadata_registry.append([(x1 + x2) / 2, (y1 + y2) / 2, z, tile_name, slice_name])
 
     for (zi, ti), rows in new_rows.items():
         all_predictions[zi][ti] = np.concatenate(

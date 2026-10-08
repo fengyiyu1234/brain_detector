@@ -30,10 +30,11 @@ from src.utils.markers import channel_marker, class_markers, split_class
 import multiprocessing.connection
 from src.core.worker import run_tile_process
 from src.core.detection_filter import (
-    atomic_write_csv, filter_detection_df, resolve_filter_params, source_dir_for_channel,
+    FILTER_SCHEMA_VERSION, atomic_write_csv, filter_detection_df, resolve_filter_params, source_dir_for_channel,
 )
 from src.core.stitcher import fuse_dual_intensity_2d
 from src.core.channel_stage3 import stitch_and_link_channel
+from src.core.coloc_sources import source_3d_json, write_source_3d, write_source_boxes
 from src.core.tile_position_pipeline import run_tile_position_stage, tile_position_frame
 from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_containment,
                                _merge_class, suppress_cross_class_overlap)
@@ -47,7 +48,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
 def align_worker_count(pre_align_cfg, n_tasks):
-    """Stage 2.5 并行进程数：pre_align_params.n_workers，缺省为 slurm 分到的 CPU 数（没有则本机核数）。"""
+    """Stage 2.5 worker count; defaults to the allocated CPUs or local CPU count."""
     allocated = int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))
     n = pre_align_cfg.get('n_workers') or allocated
     return max(1, min(int(n), n_tasks, allocated))
@@ -58,8 +59,8 @@ _THREAD_VARS = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'N
 
 class _single_threaded_children:
     """
-    进程池期间让子进程只用单线程 BLAS/OpenMP，避免 进程数 × 核数 的线程超订。
-    spawn 出来的子进程在引导阶段就会 import numpy，所以只能在父进程里设环境变量让它继承。
+    Keep each child process on one BLAS/OpenMP thread to avoid oversubscription.
+    Spawned children import numpy during startup, so set these variables in the parent.
     """
     def __enter__(self):
         self.saved = {k: os.environ.get(k) for k in _THREAD_VARS}
@@ -74,7 +75,7 @@ class _single_threaded_children:
 
 
 def stage3_worker_count(config, n_channels):
-    """Stage 3 同时处理的通道数：stage3_n_workers，缺省 = 通道数（受 slurm 分到的 CPU 数限制）。"""
+    """Stage 3 channel workers, capped by the allocated CPU count."""
     cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))
     n = config.get('stage3_n_workers') or n_channels
     return max(1, min(int(n), n_channels, cpus))
@@ -82,7 +83,7 @@ def stage3_worker_count(config, n_channels):
 
 def run_stage3_channel_pool(routing, n_workers, src_dir, global_2d_dir, channel_3d_dir,
                             geom, zl_params, log_dir):
-    """Stage 3 前半段：每个通道一个进程做全局 2D 拼接 + Z-Link。返回 {ch_id: 结果}。"""
+    """Run global 2D stitching and Z-Link for each channel; return results by channel ID."""
     def _args(ch):
         return (ch, src_dir, global_2d_dir, channel_3d_dir, geom,
                 zl_params['soma' if ch.get('type', 'soma') == 'soma' else 'tf'])
@@ -109,8 +110,8 @@ def run_stage3_channel_pool(routing, n_workers, src_dir, global_2d_dir, channel_
 
 def run_align_pool(tile_paths, n_workers, det_dir, align_dir, routing, settings):
     """
-    Stage 2.5：每个 tile 一个任务，在 CPU 进程池里并行跑 align_tile。返回缺失的检测 CSV 列表。
-    任一 tile 抛异常即终止作业；已写完 offsets JSON 的 tile 保留，重新提交会跳过它们。
+    Stage 2.5 aligns one tile per CPU task and returns missing detection CSV paths.
+    Abort on any tile error; completed offset JSON files allow a later run to resume.
     """
     if not tile_paths:
         return []
@@ -142,10 +143,11 @@ def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filter
         ch['id']: resolve_filter_params(config, logical_channels[ch['id']])
         for ch in detect_routing
     }
+    filter_signature = {"schema_version": FILTER_SCHEMA_VERSION, "params": params_by_channel}
     settings_file = os.path.join(filtered_dir, "_filter_settings.json")
     try:
         with open(settings_file, encoding="utf-8") as handle:
-            same_settings = json.load(handle) == params_by_channel
+            same_settings = json.load(handle) == filter_signature
     except (OSError, ValueError):
         same_settings = False
     missing = [os.path.join(raw_dir, f"{tile}_{ch['id']}_result.csv")
@@ -172,7 +174,7 @@ def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filter
 
     part = settings_file + ".part"
     with open(part, "w", encoding="utf-8") as handle:
-        json.dump(params_by_channel, handle, indent=2)
+        json.dump(filter_signature, handle, indent=2)
     os.replace(part, settings_file)
 
 
@@ -208,13 +210,13 @@ def validate_global_checkpoints(derived, tile_names, routing):
 
 
 def run_detection_pool(tasks, gpu_ids, config):
-    """并行执行 tile 检测：每块 GPU 一个槽位，每个 tile 在全新的子进程里跑完即退出。
+    """Run tile detection with one slot per GPU and a fresh process for each tile.
 
-    不用常驻 worker 池：TF/StarDist 在长寿命进程里持续泄漏内存，跑几小时后作业被 OOM 杀掉
-    （见 worker.run_tile_process）。Python 3.10 的 ProcessPoolExecutor 没有 max_tasks_per_child，
-    mp.Pool 的 maxtasksperchild 又会在进程崩溃后不断补新 worker 导致卡死，所以这里自己调度。
-    任何子进程非零退出（抛异常，或被杀如 OOM）时终止其余子进程并抛出异常，作业以非零状态退出。
-    已写完的 tile CSV 会保留（worker 先写 .part 再改名），修复问题后重新提交即可续跑。
+    Persistent TF/StarDist workers can leak memory during long runs and be killed by OOM.
+    Python 3.10 ProcessPoolExecutor lacks max_tasks_per_child; mp.Pool restarts failed
+    workers indefinitely, so this stage schedules fresh processes directly.
+    Stop remaining workers and fail the job if any child exits unsuccessfully.
+    Completed tile CSVs remain available for a resumed run after the issue is fixed.
     """
     ctx = mp.get_context('spawn')
     pending = list(tasks)
@@ -254,11 +256,11 @@ if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)
     start_time = time.time()
     # ==========================================
-    # 阶段 1: 准备工作 (配置读取、动态路径构建与校验)
+    # Stage 1: load configuration and build and validate output paths.
     # ==========================================
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # 1. 加载基础配置 (此时 load_config 仅作纯粹的 JSON 读取)
+    # Load the base configuration as JSON.
     parser = argparse.ArgumentParser(description='Brain detector inference pipeline.')
     parser.add_argument(
         '--config',
@@ -287,10 +289,10 @@ if __name__ == '__main__':
                              if ch.get('active', True) and ch['id'] == frame)
         paths['pATHXML'] = os.path.join(paths[frame_dir_key], 'xml_merging.xml')
     derived = result_paths(base_res_path)
-    # 将构建好的字典挂载回 config，供 worker.py 及后续流程使用
+    # Attach derived paths for worker.py and downstream stages.
     config['derived_paths'] = derived
 
-    # 自动生成所有物理文件夹
+    # Create all required directories.
     os.makedirs(base_res_path, exist_ok=True)
     for p_key, p_path in derived.items():
         if not p_path.lower().endswith(('.txt', '.csv')):
@@ -300,7 +302,7 @@ if __name__ == '__main__':
     logging.info("Starting Multi-Channel Inference...")
     logging.info(f"Device: {device.upper()}, Pipeline mode: {pipeline_mode.upper()}")
 
-    # 2. 动态解析路由，确定基准(Anchor)通道
+    # Resolve channel routing and the anchor channel.
     routing_config = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
     if not routing_config:
         raise ValueError("❌ 配置文件中没有任何激活的通道路由 (channels_routing)！")
@@ -308,8 +310,8 @@ if __name__ == '__main__':
     anchor_ch = routing_config[0]
     anchor_dir = paths.get(anchor_ch['dir_key'])
 
-    # 2a. pre_align 对齐设置：在检测之前解析并校验，免得配置写错、或与已有对齐结果不一致，
-    #     要等检测跑完才报错。
+    # Resolve and validate pre-align settings before detection to catch configuration
+    # errors or conflicts with existing alignment results early.
     align_settings = None
     if pipeline_mode == 'pre_align':
         align_settings = resolve_align_settings(config, routing_config)
@@ -324,9 +326,9 @@ if __name__ == '__main__':
         logging.info(f"Pre-align 参考通道: {align_settings['reference_channel']}，"
                      f"TF 对齐方式: {align_settings['tf_align_mode']}")
 
-    # 2b. 展开 double_exposure 通道，得到检测阶段(Stage 2)专用的路由列表（含合成的第二曝光通道）。
-    # Stage 2 之后的所有阶段（2.5 部分、2.75、3、4）继续使用未展开的 routing_config——
-    # 融合(Stage 2.6)之后两个曝光就是同一个逻辑通道了。
+    # Expand double-exposure channels for Stage 2 detection.
+    # Later stages use the original routing configuration because fusion
+    # represents both exposures as one logical channel.
     detect_routing_config = expand_double_exposure_channels(routing_config)
     config['channels_routing_detect'] = detect_routing_config
 
@@ -341,7 +343,7 @@ if __name__ == '__main__':
     else:
         logging.info(f"[start_from_stage={start_from_stage}] 跳过网络通道路径校验。")
 
-    # 3. 获取 Tile 列表 (基于锚点通道)
+    # List tiles from the anchor channel.
     anchor_ch_id = anchor_ch['id']
     if start_from_stage >= 2:
         logging.info(f"[start_from_stage={start_from_stage}] 跳过网络扫描，从本地 CSV 推导 Tile 列表...")
@@ -366,17 +368,17 @@ if __name__ == '__main__':
 
     save_run_metadata(config, start_time)
 
-    # 4. 范围筛选
+    # Select the requested tile range.
     sTARTID = dp.get('sTARTID') or 1
     eNDID = dp.get('eNDID') or len(pATHTILE_all)
     target_indices = list(range(sTARTID - 1, eNDID))
     pATHTILE = [pATHTILE_all[i] for i in target_indices]
 
-    # 5. TeraStitcher XML 只有 Stage 3 全局拼接才用到，加载放在 Stage 3 之前，
-    #    这样拼接尚未完成的样本也能先跑检测 + tile 级对齐/过滤。
+    # TeraStitcher XML is needed only for global stitching in Stage 3.
+    # Detection and tile-level alignment/filtering can run before stitching finishes.
 
     # ==========================================
-    # 阶段 2: 线性 Checkpoint - Tile 级别检测 
+    # Stage 2: tile-level detection with checkpoints.
     # ==========================================
     tasks_to_run = []
     for i, path in enumerate(pATHTILE):
@@ -397,7 +399,7 @@ if __name__ == '__main__':
         num_gpus = torch.cuda.device_count()
         num_processes = max(1, num_gpus)
         logging.info(f"阶段 2: 发现 {len(tasks_to_run)} 个缺失结果，启动 {num_processes} 个进程 ({num_gpus} GPU)...")
-        # 无 GPU 时 gpu_id=None，init_worker 回退到 config['device']
+        # Without a GPU, init_worker falls back to config['device'].
         gpu_ids = list(range(num_gpus)) if num_gpus > 0 else [None]
         run_detection_pool(tasks_to_run, gpu_ids, config)
     else:
@@ -408,7 +410,7 @@ if __name__ == '__main__':
         sys.exit(0)
 
     # ==========================================
-    # 阶段 2.5: 点云通道对齐 (仅 pre_align 模式)
+    # Stage 2.5: align channel point clouds in pre-align mode.
     # ==========================================
     if pipeline_mode == 'pre_align':
         prepare_alignment_inputs(
@@ -432,7 +434,7 @@ if __name__ == '__main__':
 
             routing_cfg_align = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
 
-            # 已完成的 tile 直接跳过（offsets JSON 是最后写的完成标记，另核对 CSV 行数）
+            # Skip completed tiles; the offsets JSON is written last as a completion marker.
             todo = [p for p in pATHTILE
                     if not tile_alignment_done(os.path.basename(p), derived['pATH_DET_PREALIGN_FILTERED'],
                                                derived['pATH_ALIGN_OFFSETS'], routing_cfg_align)]
@@ -447,12 +449,12 @@ if __name__ == '__main__':
                     f"❌ [2.5] {len(missing_csvs)} 个检测 CSV 缺失，对齐结果不完整，未写完成标记。"
                     f"请先补齐 Stage 2 检测后重跑。示例: {missing_csvs[:3]}"
                 )
-            # 写完成标记
+            # Write the completion marker.
             open(align_done_flag, 'w').close()
             logging.info("✔️ [2.5] 所有 Tile 点云对齐完成。")
 
     # ==========================================
-    # 阶段 2.6: 双曝光强度融合 (Dual-Intensity Fusion)
+    # Stage 2.6: dual-exposure intensity fusion.
     # Input: aligned filtered CSVs (pre_align) or raw CSVs (post_align).
     # Fusion feeds the final filtered tile directory used by Stage 3.
     # ==========================================
@@ -549,6 +551,7 @@ if __name__ == '__main__':
         ch['id']: resolve_filter_params(config, ch) for ch in routing_config
     }
     _filter_signature = {
+        'schema_version': FILTER_SCHEMA_VERSION,
         'pipeline_mode': pipeline_mode,
         'input_stage': 'aligned_filtered_v1' if pipeline_mode == 'pre_align' else 'raw_v1',
         'params': _filter_params_by_channel,
@@ -624,11 +627,11 @@ if __name__ == '__main__':
     pATH_SRC_CSV = _filter_dst
 
     # ==========================================
-    # 阶段 2.8: 生成过滤前 Raw 2D 直方图（强度 & 面积）
-    # 输入: _filter_src (raw CSV)
-    # 输出: 1_2d_raw/histograms/{tile}_{ch}_hist.png
-    # 删除输出目录可强制重建；不影响过滤及后续流程
-    # 开关: detection_params.generate_histograms (默认 true)
+    # Stage 2.8: generate raw 2D histograms of intensity and area.
+    # Input: _filter_src (raw CSV).
+    # Output: 1_2d_raw/histograms/{tile}_{ch}_hist.png.
+    # Delete the output directory to rebuild histograms without affecting later stages.
+    # Controlled by detection_params.generate_histograms (default: true).
     # ==========================================
     _hist_dir = derived['pATH_HISTOGRAMS']
     if not dp.get('generate_histograms', True):
@@ -670,9 +673,9 @@ if __name__ == '__main__':
         logging.info(f"✔️ [2.8] 直方图输出至: {_hist_dir}")
 
     # ==========================================
-    # 可选停止点：tile 级阶段（检测 / 2.5 对齐 / 2.6 融合 / 2.75 过滤 / 2.8 直方图）都不需要
-    # TeraStitcher XML。拼接还没做完的样本设 stop_before_stitching=true 先跑到这里；
-    # 拼接完成后改回 false 重跑，前面各阶段按 checkpoint 自动跳过，从 Stage 3 继续。
+    # Tile-level stages do not need TeraStitcher XML.
+    # Set stop_before_stitching=true to stop here while stitching is unfinished.
+    # After stitching, set it to false; checkpoints resume at Stage 3.
     # Stage 2.9: optionally solve tile geometry and publish XMLs before Stage 3.
     # The stop point below leaves the generated XMLs ready for image merging.
     if solve_tile_positions:
@@ -693,12 +696,12 @@ if __name__ == '__main__':
                      "position solving are complete; exiting before Stage 3.")
         sys.exit(0)
 
-    # 加载 TeraStitcher XML
-    #    tile 位置求解开启时只用本次生成的 frame XML；其他模式沿用显式/原始目录候选。
+    # Load TeraStitcher XML.
+    # Use generated frame XML for tile-position solving; otherwise use configured paths.
     #
-    #    为什么要能显式指定：拼接位移是在参考通道（如 730nm 自发荧光）上算出来的，检测通道目录里
-    #    未必有这份 XML、或者放着一份 ABS_D 全为 0 的旧版本。细胞坐标必须和「真正 merge 出注册用
-    #    全脑图像」的那份 XML 共用同一套 ABS_H/ABS_V/ABS_D，否则 z 会按 tile 错位。
+    # Explicit paths matter because stitching offsets may come from a reference channel
+    # whose XML is absent from detection folders or replaced by an old zero-offset XML.
+    # Cell coordinates must use the XML that merged the registered whole-brain image.
     tile_size = dp.get('tILESIZE', 2048)
     xml_candidates = []
     if paths.get('pATHXML'):
@@ -727,9 +730,9 @@ if __name__ == '__main__':
                 f"请确认这份 XML 就是 merge 出那张图的同一份。"
             )
     elif dp.get('allow_grid_fallback', False):
-        # 回退：从 tile 目录名解析行列号，用均匀 Grid 推算全局偏移。
-        # 这是均匀网格，拿不到 TeraStitcher 逐 tile 的真实位移——行/列间距会有十几像素的系统
-        # 偏差，跨整个网格累积可达上百像素。只适合没有拼接结果时的探索性跑批。
+        # Fall back to grid offsets inferred from tile directory names.
+        # Uniform spacing lacks tile-specific TeraStitcher offsets and may introduce
+        # errors of tens of pixels per step, accumulating to hundreds across the grid.
         overlap_pct = pre_align_cfg.get('tile_overlap_pct', 15)
         logging.warning("⚠️ 未找到任何 TeraStitcher XML，allow_grid_fallback=true，"
                         "回退到文件名解析的【均匀网格】全局偏移。")
@@ -755,7 +758,7 @@ if __name__ == '__main__':
         )
 
     # ==========================================
-    # 阶段 3: 线性 Checkpoint - 全局拼接与 Z-Linker共定位
+    # Stage 3: global stitching, Z-Link, and colocalization with checkpoints.
     # ==========================================
     # Image stitching uses the per-channel XMLs produced above. It is separate
     # from Stage 3, which stitches cell coordinates rather than raw pixels.
@@ -767,9 +770,23 @@ if __name__ == '__main__':
     validate_global_checkpoints(
         derived, [os.path.basename(p) for p in pATHTILE_all], routing_config)
     bbox_path = os.path.join(derived['pATH_COLOCALIZATION'], "coloc_result.csv")
+    source_3d_path = os.path.join(
+        derived['pATH_COLOCALIZATION'], 'coloc_source_3d.csv')
+    source_boxes_path = os.path.join(
+        derived['pATH_COLOCALIZATION'], 'coloc_source_boxes.csv')
     final_results = None
+    source_checkpoint_ready = False
+    if all(os.path.isfile(p) for p in
+           (bbox_path, source_3d_path, source_boxes_path)):
+        try:
+            columns = set(pd.read_csv(bbox_path, nrows=0).columns)
+            source_checkpoint_ready = {'coloc_id', 'source_3d'} <= columns
+        except (OSError, ValueError, pd.errors.EmptyDataError):
+            pass
+    if os.path.isfile(bbox_path) and not source_checkpoint_ready:
+        logging.info("Stage 4 source coordinates missing; rebuilding from saved channel tracks.")
 
-    if os.path.exists(bbox_path):
+    if source_checkpoint_ready:
         logging.info(f"✔️ Checkpoint 2 达成: 加载已有的全局检测结果 {bbox_path}")
         df_boxes = pd.read_csv(bbox_path)
         final_results = df_boxes[["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]].values
@@ -782,8 +799,8 @@ if __name__ == '__main__':
         num_tiles = len(pATHTILE_all)
         BOX_COLS  = ["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]
 
-        # ====== 1+2. 各通道独立：全局 2D 拼接 → Z-Link，每个通道一个进程 ======
-        # checkpoint 与以前相同：5_2d_global/<ch>_2d_global.csv、6_3d_global/<ch>_3d_tracked.pkl
+        # Run global 2D stitching and Z-Link independently for each channel.
+        # Existing checkpoints: 5_2d_global/<ch>_2d_global.csv and 6_3d_global/<ch>_3d_tracked.pkl.
         zl      = config.get('z_linker', {})
         zl_soma = zl.get('soma', {})
         zl_tf   = zl.get('tf', {})
@@ -804,7 +821,7 @@ if __name__ == '__main__':
             pATH_SRC_CSV, derived['pATH_GLOBAL_2D'], derived['pATH_CHANNEL_3D'], geom, zl_params,
             base_res_path)
 
-        # tile 元数据（给最终细胞找回 tile/slice 名）按通道顺序拼起来，与以前逐通道追加的顺序一致
+        # Concatenate tile metadata in channel order to recover tile and slice names.
         meta_chunks = [ch_results[ch['id']]['metadata'] for ch in routing_config
                        if ch_results[ch['id']]['metadata'] is not None]
 
@@ -817,12 +834,17 @@ if __name__ == '__main__':
         tf_vol_by_ch   = {}
         for cid in soma_ch_ids + tf_ch_ids:
             pkl_path = os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.pkl")
-            if os.path.exists(pkl_path):   # 没有检测结果的通道不会生成 pkl，与以前一样跳过
+            if os.path.exists(pkl_path):   # Skip channels without detections and a pickle.
                 with open(pkl_path, 'rb') as pf:
                     (soma_vol_by_ch if cid in soma_ch_ids else tf_vol_by_ch)[cid] = pickle.load(pf)
 
+        # Keep a snapshot of each channel track before class labels are merged.
+        for cid, volumes in soma_vol_by_ch.items():
+            for cell in volumes:
+                cell['source_tracks'] = [(cid, cell.copy())]
+
         # ====== 3. 3D Colocalization ======
-        # Phase A: soma × soma 3D IoU（逐对匹配，依次合并到主列表）
+        # Phase A: match soma volumes by 3D IoU and merge them into the main list.
         iou_thresh_3d   = zl_soma.get('iou_thresh_3d', 0.15)
         iomin_thresh_3d = zl_soma.get('iomin_thresh_3d', 0.5)
         z_pad_3d        = zl_soma.get('z_pad_3d', 2)
@@ -835,6 +857,7 @@ if __name__ == '__main__':
                 iou_thresh=iou_thresh_3d, iomin_thresh=iomin_thresh_3d, z_pad=z_pad_3d
             )
             for a_cell, b_cell in matched_pairs:
+                a_cell['source_tracks'].extend(b_cell['source_tracks'])
                 a_cell['class'] = _merge_class(a_cell['class'], b_cell['class'])
             merged_soma_vols = merged_soma_vols + unmatched_b
         cross_iou = zl_soma.get('cross_class_iou_thresh', 0.5)
@@ -846,7 +869,7 @@ if __name__ == '__main__':
         logging.info(f"✔️ [3A] Soma 3D IoU 匹配: {len(merged_soma_vols)} 个 "
                      f"(多阳性 {n_multi}, 单阳性 {n_single})")
 
-        # Phase B: soma × TF 严格包含标注（TF框必须完全在soma框内）
+        # Phase B: annotate soma with TF boxes fully contained by soma boxes.
         xy_margin          = zl_tf.get('containment_xy_margin', 0)
         z_pad_tf           = zl_tf.get('containment_z_pad', 2)
         max_center_dist    = zl_tf.get('max_center_dist_ratio', 0.5)
@@ -866,7 +889,7 @@ if __name__ == '__main__':
             if tf_vols and merged_soma_vols:
                 merged_soma_vols = annotate_soma_with_tf_containment(
                     merged_soma_vols, tf_vols, z_pad=z_pad_tf, xy_margin=xy_margin,
-                    max_center_dist_ratio=max_center_dist
+                    max_center_dist_ratio=max_center_dist, source_channel=cid
                 )
                 logging.info(f"✔️ [3B] [{cid}] TF containment 标注完成")
         tf_markers_set = {channel_marker(cid) for cid in tf_ch_ids}
@@ -876,13 +899,13 @@ if __name__ == '__main__':
         )
         logging.info(f"✔️ [3B] 全部TF标注完成: {n_tf_annotated} 个 soma 有 TF marker")
 
-        # 统一规范 class 字符串：丢掉旧结果（如 "GFP_3" 通道名）带进来的伪 marker。
-        # 只参与合并的细胞会经过 _merge_class，单通道细胞不会，所以这里补一次。
+        # Normalize class labels to remove pseudo markers from old channel names.
+        # Merged cells already pass through _merge_class; normalize single-channel cells here.
         for soma in merged_soma_vols:
             _base, _mk = split_class(soma['class'])
             soma['class'] = f"{_base}_" + "_".join(sorted(_mk)) if _mk else _base
 
-        # Phase C: 输出为 2D 形式（center_z处的bbox），排除TF单阳性
+        # Phase C: output center-z 2D boxes and exclude TF-only detections.
         output_rows = []
         for soma in merged_soma_vols:
             center_z = int(round(soma['cz']))
@@ -899,14 +922,17 @@ if __name__ == '__main__':
                    if output_rows else np.empty((0, 8), dtype=object))
 
         out_coloc = os.path.join(derived['pATH_COLOCALIZATION'], 'coloc_result.csv')
-        pd.DataFrame(soma_3d, columns=BOX_COLS).to_csv(out_coloc, index=False)
+        write_source_boxes(source_boxes_path, merged_soma_vols)
+        write_source_3d(source_3d_path, merged_soma_vols)
         logging.info(f"✔️ [3C] 共定位结果: {len(soma_3d)} 个细胞 → {out_coloc}")
 
         final_results = soma_3d
 
-        # ====== 4. 保存全局 3D 报告 (目标 4) ======
+        # Save the global 3D report.
         if final_results is not None and len(final_results) > 0:
             df = pd.DataFrame(final_results, columns=BOX_COLS)
+            df['coloc_id'] = np.arange(len(df), dtype=np.int64)
+            df['source_3d'] = [source_3d_json(soma) for soma in merged_soma_vols]
 
             if meta_chunks:
                 meta_coords = np.concatenate([m['coords'] for m in meta_chunks])
@@ -918,7 +944,7 @@ if __name__ == '__main__':
                     final_results[:, 7].astype(float) * 10.0
                 ))
                 _, indices = tree.query(final_coords)
-                # 各通道的 tile/slice 名是编码后传回的，这里只解码被查到的那些
+                # Decode tile and slice names only for selected cells.
                 bounds = np.cumsum([0] + [len(m['coords']) for m in meta_chunks])
                 chunk_of = np.searchsorted(bounds, indices, side='right') - 1
                 tiles, slices = np.empty(len(indices), dtype=object), np.empty(len(indices), dtype=object)
@@ -933,20 +959,22 @@ if __name__ == '__main__':
                 df['tile_name']  = 'Unknown'
                 df['slice_name'] = 'Unknown'
 
-            # Checkpoint CSV (全量，供 Stage 4/5 读取)
+            # Save the full checkpoint CSV for later stages.
             df.to_csv(bbox_path, index=False)
             logging.info(f"✔️ 已输出 目标4 checkpoint: {bbox_path}")
 
-            # 按细胞类型分别保存 CSV (neuron_GFP.csv, glia_RFP_Sox9.csv, ...)
+            # Save one CSV per cell type.
             for cls, cls_df in df.groupby('class'):
                 safe_cls = str(cls).replace('/', '_').replace('\\', '_')
                 cls_df.to_csv(os.path.join(derived['pATH_COLOCALIZATION'], f"{safe_cls}.csv"), index=False)
             logging.info(f"✔️ 已输出 目标4 ({df['class'].nunique()} 种细胞类型) → {derived['pATH_COLOCALIZATION']}")
         else:
+            pd.DataFrame(columns=[*BOX_COLS, 'coloc_id', 'source_3d', 'tile_name', 'slice_name']).to_csv(
+                out_coloc, index=False)
             logging.warning("⚠️ 全局未检测到任何 3D 目标。")
 
     # ==========================================
-    # 阶段 4: 生成分析级的统计报告与质心
+    # Stage 4: generate analysis statistics and centroids.
     # ==========================================
     report_path = os.path.join(derived['pATH_COLOCALIZATION'], "global_summary_statistics.csv")
 
@@ -954,8 +982,8 @@ if __name__ == '__main__':
         df_final = pd.read_csv(bbox_path)
         total_cells = len(df_final)
 
-        # 1. 拆解分析动态标签 (例如把 "neuron_RFP_Sox9" 拆成类别和具体 Marker)
-        #    split_class 同时丢掉旧结果里由 "GFP_3" 这类通道名产生的伪 marker "3"
+        # Split class labels into base types and marker names.
+        # split_class also drops pseudo markers from old names such as GFP_3.
         parsed_cls = df_final['class'].apply(split_class)
         df_final['base_type']   = parsed_cls.apply(lambda pc: pc[0])
         df_final['marker_set']  = parsed_cls.apply(lambda pc: frozenset(pc[1]))
@@ -963,23 +991,23 @@ if __name__ == '__main__':
             lambda pc: f"{pc[0]}_" + "_".join(sorted(pc[1])) if pc[1] else pc[0]
         )
 
-        # 统计组合情况 (e.g. neuron_RFP_Sox9: 150个)
+        # Count marker combinations.
         combo_counts = df_final['class_clean'].value_counts()
 
-        # 统计基类情况 (e.g. neuron: 800个, glia: 1200个)
+        # Count base cell types.
         base_counts = df_final['base_type'].value_counts()
 
-        # 提取所有的 Markers 并独立统计阳性率
+        # Collect markers and calculate positivity independently.
         all_markers_found = set()
         for ms in df_final['marker_set']:
             all_markers_found.update(ms)
 
         marker_counts = {}
         for m in sorted(all_markers_found):
-            # 按 marker token 精确匹配，避免 str.contains 的子串误判
+            # Match exact marker tokens to avoid substring matches.
             marker_counts[m] = int(df_final['marker_set'].apply(lambda s: m in s).sum())
 
-        # 2. 写入极其详细的层级分析报告
+        # Write the detailed analysis report.
         if config.get('generate_analysis_report', False):
             with open(report_path, 'w', encoding='utf-8') as f:
                 f.write("=== Base Cell Type (基础细胞类型) ===\n")
@@ -997,7 +1025,7 @@ if __name__ == '__main__':
                 for m, count in marker_counts.items():
                     f.write(f"{m},{count},{count / total_cells * 100:.2f}%\n")
 
-        # 3. 按最终组合输出质心 (用下划线替代特殊字符保证文件名合法)
+        # Calculate centroids for each final class.
         df_final['cx'] = (df_final['x1'] + df_final['x2']) / 2
         df_final['cy'] = (df_final['y1'] + df_final['y2']) / 2
         
@@ -1005,7 +1033,7 @@ if __name__ == '__main__':
             group_sorted = group.sort_values('z')
             out_df = group_sorted[['cx', 'cy', 'z', 'score', 'slice_name', 'tile_name']]
             
-            # 净化文件名 (如 neuron_RFP_Sox9 -> ob_neuron_RFP_Sox9.csv)
+            # Sanitize labels for output filenames.
             safe_label = str(label).replace('/', '_').replace('\\', '_')
             save_path = os.path.join(derived['pATH_CENTROIDS'], f"ob_{safe_label}.csv")
             out_df.to_csv(save_path, index=False)

@@ -124,7 +124,32 @@ Changing alignment references, frame geometry, or `paths.pATHXML` after global c
 
 ## Visualize results
 
-src/utils/visualize.py reads config/vis_config.json by default.
+Run `python src/utils/visualize.py` to open the interactive launcher. Select a
+sample and click **Choose** to scan its tiles; no sample is scanned on startup.
+Select one or more tiles, adjust Z range, annotation/crop paths, and display
+options, then click **Open selected tiles**. Tiles retain their zero-based
+list numbers in a spatial row/column grid; click grid numbers or list entries to
+select multiple tiles. Drag the divider between the sample/tile column and the
+settings panel to adjust their widths; the sample and tile panels share one width.
+**Start with images only** is enabled by default: Napari opens TIFF layers
+visible and all detection, point, and overlap overlays hidden. Turn result
+layers on in Napari as needed. In a global view, image layers from every
+selected tile appear together in the layer list. Disable this option to
+restore the configured initial visibility of overlays.
+The **Full config** tab has an editable parameter tree for every setting, including sample paths,
+channel routing, colors, and filters. Its JSON page also allows adding or
+removing fields; click **Apply JSON** before selecting tiles after changing a
+sample path. **Save config as** writes a new JSON file; opening a viewer uses
+a temporary config and leaves the source config untouched.
+
+`src/utils/visualize.py` reads `config/vis_config.json` by default. In
+`2d` mode, **2D source** chooses one raw or filtered detection set. In
+`prealign` mode, the raw and filtered 2D checkboxes independently control
+additional overlays and can both be enabled. The launcher shows these controls
+only in their applicable modes. To use the original command-line flow, add
+`--direct`. Passing `--mode` or `--2d-source` also keeps the command-line
+flow.
+
 
 | Mode | Displays | Geometry |
 | --- | --- | --- |
@@ -153,6 +178,25 @@ time for dense channels. Stage 4 CSV stores only one representative-Z box
 per cell. Stage 4 layers show exact marker combinations; each cell appears
 in one combination layer. Clicking a Stage 4 box reports its saved row
 without inferring a new pairing.
+
+### Per-channel coordinates in colocalization output
+
+New Stage 4 runs write three linked files under `7_colocalization/`:
+
+- `coloc_result.csv`: one row per colocalized soma, with a zero-based `coloc_id`
+  and a `source_3d` JSON object keyed by every matched channel ID. Each channel
+  contains a list so multiple matched TF tracks are retained.
+- `coloc_source_3d.csv`: one row per matched source track with its original
+  Stage 3 center (`cx,cy,cz`) and 3D bounds
+  (`x1_3d,y1_3d,x2_3d,y2_3d,z_min,z_max`).
+- `coloc_source_boxes.csv`: each source track's exact per-Z 2D boxes.
+
+Join the flat files to the main result on `coloc_id`; join the two source
+files on `coloc_id,source_track`. All coordinates use the saved, aligned
+global frame. Z values are one-based, as in the pipeline CSV files. These
+coordinates are the individual Stage 3 tracks before colocalization; they
+are not raw TIFF tile coordinates. On the next pipeline run, a Stage 4 checkpoint lacking these fields is
+rebuilt from the saved channel tracks.
 
     python src/utils/visualize.py --config config/vis_config.json --mode prealign
 
