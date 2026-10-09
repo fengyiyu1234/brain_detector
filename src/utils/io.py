@@ -5,6 +5,10 @@ import csv
 import datetime
 import json
 import platform
+from pathlib import Path
+
+from src.core.provenance import (PROVENANCE_SCHEMA_VERSION, atomic_json,
+                                 file_sha256, model_fingerprints)
 
 def loadTeraxml(fxml, tile_size=2048):
     tILESIZE = tile_size
@@ -165,20 +169,53 @@ def load_cached_detections(csv_path):
         
     return detection_map
 
-def save_run_metadata(cfg, start_time_stamp):
+def save_run_metadata(cfg, start_time_stamp, model_hashes=None):
+    """Record the current run while retaining the first checkpoint's origin."""
     save_path = os.path.join(cfg['paths']['pATHRESULT'], 'runtime_config.json')
     metadata = cfg.copy()
-    
-    # 动态记录所有使用的模型名称（适配新 config.json）
-    models_info = {}
-    if 'models' in cfg:
-        for model_name, model_path in cfg['models'].items():
-            models_info[model_name] = os.path.basename(model_path)
-            
-    metadata['run_info'] = {
-        "start_time": datetime.datetime.fromtimestamp(start_time_stamp).strftime('%Y-%m-%d %H:%M:%S'),
+    previous = None
+    if os.path.isfile(save_path):
+        try:
+            with open(save_path, encoding='utf-8') as handle:
+                previous = json.load(handle)
+        except (OSError, ValueError):
+            previous = None
+
+    models_info = {name: os.path.basename(path)
+                   for name, path in cfg.get('models', {}).items()}
+    run_info = {
+        "start_time": datetime.datetime.fromtimestamp(
+            start_time_stamp).isoformat(),
         "platform": platform.platform(),
-        "models_used": models_info # 替换原有的单一 model 字段
+        "models_used": models_info,
     }
-    with open(save_path, 'w', encoding='utf-8') as f:
-        json.dump(metadata, f, indent=4, ensure_ascii=False)
+    project_root = Path(__file__).resolve().parents[2]
+    if model_hashes is None:
+        model_hashes = model_fingerprints(cfg.get('models'), project_root)
+    code_files = [
+        project_root / 'scripts' / 'run_inference.py',
+        *(project_root / 'src' / 'core').glob('*.py'),
+        *(project_root / 'src' / 'utils').glob('*.py'),
+    ]
+    metadata['provenance'] = {
+        "schema_version": PROVENANCE_SCHEMA_VERSION,
+        "model_sha256": model_hashes,
+        "code_sha256": {
+            str(path.relative_to(project_root)): file_sha256(path)
+            for path in sorted(code_files) if path.is_file()
+        },
+    }
+    history = list(previous.get('run_history', [])) if previous else []
+    if previous and not history and previous.get('run_info'):
+        history.append(previous['run_info'])
+    history.append(run_info)
+    metadata['run_history'] = history
+    metadata['origin_config'] = (
+        previous.get('origin_config', {k: v for k, v in previous.items()
+                                       if k not in ('run_history', 'run_info', 'origin_run_info', 'provenance')})
+        if previous else cfg.copy())
+    metadata['origin_run_info'] = (
+        previous.get('origin_run_info', previous.get('run_info'))
+        if previous else run_info)
+    metadata['run_info'] = run_info
+    atomic_json(save_path, metadata)

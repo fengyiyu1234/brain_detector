@@ -35,6 +35,14 @@ class PipelineFilterInputTests(unittest.TestCase):
             target = filtered / source.name
             self.assertEqual(pd.read_csv(target).score.tolist(), [.9])
             self.assertEqual(len(pd.read_csv(source)), 2)
+            rejected = filtered / 'tile_a_GFP_rejected.csv'
+            manifest = filtered / 'tile_a_GFP_filter_manifest.json'
+            self.assertTrue(manifest.is_file())
+            self.assertEqual(len(pd.read_csv(rejected)), 1)
+            rejected.write_text('broken\n', encoding='utf-8')
+            prepare_alignment_inputs(config, ['tile_a'], [channel],
+                                     str(raw), str(filtered))
+            self.assertEqual(len(pd.read_csv(rejected)), 1)
 
             rows[0][6] = .8
             pd.DataFrame(rows, columns=COLUMNS).to_csv(source, index=False)
@@ -63,9 +71,9 @@ class PipelineFilterInputTests(unittest.TestCase):
             global_csv.touch()
             older = os.path.getmtime(global_csv) + 10
             os.utime(source, (older, older))
-            with self.assertRaisesRegex(RuntimeError, "Stale Stage 3 checkpoint"):
-                validate_global_checkpoints(
-                    derived, ["tile_a"], [{"id": "GFP"}])
+            stale = validate_global_checkpoints(
+                derived, ["tile_a"], [{"id": "GFP"}])
+            self.assertEqual(stale, {"GFP"})
 
     def test_alignment_checkpoint_is_stale_when_filtered_input_changes(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -17,6 +17,8 @@ if str(PROJECT_ROOT) not in sys.path:
 import pandas as pd
 
 from src.config.loader import load_config
+from src.core.provenance import file_stamp, provenance_columns
+from src.core.provenance import file_stamp, provenance_columns
 from src.core.detection_filter import (
     FILTER_SCHEMA_VERSION, filter_detection_df, resolve_filter_params,
     source_dir_for_channel,
@@ -103,11 +105,12 @@ def main() -> int:
     prepared = []
     for tile, ch, source, target in jobs:
         params = resolve_filter_params(config, ch)
-        filtered, stats = filter_detection_df(
-            pd.read_csv(source), params, return_stats=True,
+        source_df = provenance_columns(pd.read_csv(source), tile, ch['id'])
+        filtered, stats, rejected = filter_detection_df(
+            source_df, params, return_stats=True, return_rejected=True,
             context=f"{source} ({ch['id']})",
         )
-        prepared.append((tile, ch, source, target, params, filtered, stats))
+        prepared.append((tile, ch, source, target, params, filtered, stats, rejected))
         print(f"[{tile}][{ch['id']}] {stats['before']} -> {stats['after']} "
               f"(removed={stats['removed_total']}; score_min={stats['removed']['score_min']})")
 
@@ -118,11 +121,14 @@ def main() -> int:
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     parts: list[tuple[Path, Path]] = []
     try:
-        for _, _, _, target, _, filtered, _ in prepared:
-            destination = Path(target)
-            part = destination.with_name(destination.name + ".part")
-            filtered.to_csv(part, index=False)
-            parts.append((part, destination))
+        for _, _, _, target, _, filtered, _, rejected in prepared:
+            for destination, data in (
+                (Path(target), filtered),
+                (Path(target.replace('_result.csv', '_rejected.csv')), rejected),
+            ):
+                part = destination.with_name(destination.name + ".part")
+                data.to_csv(part, index=False)
+                parts.append((part, destination))
         for part, destination in parts:
             os.replace(part, destination)
     except Exception:
@@ -139,10 +145,15 @@ def main() -> int:
 
     records = [{
         "tile": tile, "channel": ch["id"], "source": source, "target": target,
+        "rejected": target.replace('_result.csv', '_rejected.csv'),
+        "source_stamp": file_stamp(source, with_hash=True),
+        "target_stamp": file_stamp(target, with_hash=True),
+        "rejected_stamp": file_stamp(target.replace('_result.csv', '_rejected.csv'),
+                                      with_hash=True),
         "params": params, "before": stats["before"], "after": stats["after"],
         "removed_total": stats["removed_total"], "removed_by_step": stats["removed"],
         "thresholds": stats["thresholds"],
-    } for tile, ch, source, target, params, _, stats in prepared]
+    } for tile, ch, source, target, params, _, stats, _ in prepared]
     manifest = {
         "filter_schema_version": FILTER_SCHEMA_VERSION,
         "config": os.path.abspath(args.config),

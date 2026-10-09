@@ -5,16 +5,18 @@ import os
 cv2.setNumThreads(0)
 os.environ["OMP_NUM_THREADS"] = "1"
 import csv
+import json
 import numpy as np
 from ultralytics import YOLO
 import logging
 from tqdm import tqdm
 from .stitcher import stitchDetection
 from src.utils.image import normalize_for_detection
+from src.core.provenance import stable_id, file_stamp, file_sha256, atomic_json
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import torch
-from src.utils.logger import setup_logging  
+from src.utils.logger import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +125,7 @@ def process_single_tile(i, pATHTEST, config):
     output_dir = derived.get('pATH_DET_RES')
     if output_dir:
         setup_logging(log_path=output_dir)
-        
+
     current_logger = logging.getLogger(__name__)
     current_logger.info(f"🚀 Worker (PID:{os.getpid()}) 开始接管 Tile: {dir_name}，日志已绑定至输出目录！")
 
@@ -162,9 +164,9 @@ def process_single_tile(i, pATHTEST, config):
     # --- 4. 建立多通道文件索引 (完美镜像结构版) ---
     anchor_ch = routing_config[0]
     anchor_root = os.path.abspath(paths[anchor_ch['dir_key']])
-    
+
     print(f"\n[{dir_name}] ====== 文件检索 Checkpoint ======")
-    
+
     # 获取锚点通道的所有图片
     testnames = []
     if os.path.exists(pATHTEST):
@@ -172,7 +174,7 @@ def process_single_tile(i, pATHTEST, config):
             if f.lower().endswith(('.tif', '.tiff')) and not f.startswith('.'):
                 testnames.append(f)
         testnames.sort()
-        
+
     print(f" -> 锚点通道 [{anchor_ch['id']}] (路径: {pATHTEST})")
     print(f"    共找到切片: {len(testnames)} 张")
 
@@ -184,13 +186,13 @@ def process_single_tile(i, pATHTEST, config):
     testnames_no_ext = [os.path.splitext(f)[0] for f in testnames]
 
     is_downsample = dp.get('DOWNSAMPLE', False)
-    
+
     if is_downsample:
         z_step = dp.get('DOWNSAMPLE_Z_STEP', 2)
         if z_step <= 1:
             current_logger.warning("⚠️ 开启了 DOWNSAMPLE 但 DOWNSAMPLE_Z_STEP <= 1，已自动修正为步长 2")
             z_step = 2
-            
+
         current_logger.info(f"🚀 跳层检测开启：每隔 {z_step-1} 张处理一张 (抽样步长={z_step})")
         testnames = testnames[::z_step]
         testnames_no_ext = testnames_no_ext[::z_step]
@@ -206,11 +208,11 @@ def process_single_tile(i, pATHTEST, config):
         ch_id = ch['id']
         ch_root = os.path.abspath(paths[ch['dir_key']])
         target_dir = os.path.join(ch_root, rel_tile_path)
-        
+
         if os.path.exists(target_dir):
             files_dict = {
-                os.path.splitext(f)[0]: os.path.join(target_dir, f) 
-                for f in os.listdir(target_dir) 
+                os.path.splitext(f)[0]: os.path.join(target_dir, f)
+                for f in os.listdir(target_dir)
                 if f.lower().endswith(('.tif', '.tiff')) and not f.startswith('.')
             }
             channel_files_indices[ch_id] = files_dict
@@ -218,7 +220,7 @@ def process_single_tile(i, pATHTEST, config):
         else:
             channel_files_indices[ch_id] = {}
             current_logger.warning(f"⚠️ 警告: 找不到对应的镜像文件夹: {target_dir}")
-            
+
     print("======================================\n")
 
     # --- 5. 核心循环准备 ---
@@ -226,6 +228,14 @@ def process_single_tile(i, pATHTEST, config):
 
     file_handles = {}
     csv_writers = {}
+    row_counts = {}
+    candidate_handles = {}
+    candidate_writers = {}
+    candidate_paths = {}
+    instance_handles = {}
+    instance_writers = {}
+    instance_paths = {}
+    image_status = {ch['id']: {} for ch in channels_to_run}
     part_paths = {}   # ch_id -> (临时 .part 路径, 正式 CSV 路径)
     tile_ok = False
 
@@ -239,10 +249,51 @@ def process_single_tile(i, pATHTEST, config):
         f_ch = open(ch_csv_path + '.part', 'w', newline='', encoding='utf-8')
         file_handles[ch_id] = f_ch
         csv_writers[ch_id] = csv.writer(f_ch)
-        
+        row_counts[ch_id] = 0
+
         # 写入规范的表头，方便后期跑全脑 3D Z-linker 时精准读取
-        csv_writers[ch_id].writerow(['slice_name', 'x1', 'y1', 'x2', 'y2', 'class', 'score', 'mean', 'z'])
-        
+        csv_writers[ch_id].writerow(['slice_name', 'x1', 'y1', 'x2', 'y2', 'class', 'score', 'mean', 'z',
+                                     'detection_id', 'source_image', 'raw_slice_name', 'raw_z',
+                                     'score_type', 'intensity_region', 'parent_detection_ids'])
+        if ch['model'] == 'yolo':
+            candidates_path = os.path.join(
+                derived['pATH_DET_RES'], f"{dir_name}_{ch_id}_candidates.csv")
+            candidate_paths[ch_id] = (candidates_path + '.part', candidates_path)
+            candidate_handles[ch_id] = open(
+                candidates_path + '.part', 'w', newline='', encoding='utf-8')
+            candidate_writers[ch_id] = csv.writer(candidate_handles[ch_id])
+            candidate_writers[ch_id].writerow([
+                'candidate_id', 'detection_id', 'suppressed_by_detection_id',
+                'slice_name', 'z', 'source_image', 'patch_x', 'patch_y',
+                'x1', 'y1', 'x2', 'y2', 'class', 'score',
+                'decision', 'suppression_iou',
+            ])
+        elif ch['model'] == 'stardist':
+            instances_path = os.path.join(
+                derived['pATH_DET_RES'], f"{dir_name}_{ch_id}_instances.csv")
+            instance_paths[ch_id] = (instances_path + '.part', instances_path)
+            instance_handles[ch_id] = open(
+                instances_path + '.part', 'w', newline='', encoding='utf-8')
+            instance_writers[ch_id] = csv.writer(instance_handles[ch_id])
+            instance_writers[ch_id].writerow([
+                'detection_id', 'slice_name', 'z', 'source_image',
+                'label', 'area_px', 'centroid_x', 'centroid_y',
+                'polygon_xy_json',
+            ])
+
+    def write_detection(ch_id, row, source_image, score_type, intensity_region):
+        import json
+        ordinal = row_counts[ch_id]
+        row_counts[ch_id] += 1
+        det_id = stable_id("raw2d", source_image, ch_id, row[8],
+                           ordinal, row[1:7])
+        csv_writers[ch_id].writerow([
+            *row, det_id, source_image, row[0], row[8],
+            score_type, intensity_region,
+            json.dumps([det_id], separators=(",", ":")),
+        ])
+        return det_id
+
     try:
         PREFETCH_DEPTH = 8  # 预取深度：降低以减少内存峰值压力
         prefetch_futures = {}
@@ -287,9 +338,14 @@ def process_single_tile(i, pATHTEST, config):
                             prefetch_futures[(future_z_idx, ch_id)] = None
 
                     future = prefetch_futures.pop((z_idx, ch_id), None)
-                    if future is None: continue
+                    if future is None:
+                        image_status[ch_id][name_no_ext] = 'missing'
+                        continue
                     img_raw = future.result()
-                    if img_raw is None: continue
+                    if img_raw is None:
+                        image_status[ch_id][name_no_ext] = 'unreadable'
+                        continue
+                    image_status[ch_id][name_no_ext] = 'processed'
 
                     # --- GPU 推理图像预处理 ---
                     if len(img_raw.shape) == 3: img_raw = img_raw[:, :, 0]
@@ -326,7 +382,10 @@ def process_single_tile(i, pATHTEST, config):
                                     boxes = res.boxes.xyxy.cpu().numpy() + np.array([bx, by, bx, by])
                                     scores = res.boxes.conf.cpu().numpy()
                                     labels = res.boxes.cls.cpu().numpy()
-                                    raw_det_chunks.append(np.hstack((boxes, scores[:, np.newaxis], labels[:, np.newaxis])))
+                                    patch_coords = np.tile(np.array([[bx, by]]), (len(boxes), 1))
+                                    raw_det_chunks.append(np.hstack((
+                                        boxes, scores[:, np.newaxis], labels[:, np.newaxis],
+                                        patch_coords)))
 
                         for x in range(0, W_pad, step_win):
                             for y in range(0, H_pad, step_win):
@@ -344,19 +403,42 @@ def process_single_tile(i, pATHTEST, config):
                         if batch_patches:
                             _flush_yolo_batch(batch_patches, batch_coords)
 
-                        raw_detections = np.concatenate(raw_det_chunks, axis=0) if raw_det_chunks else np.empty((0, 6))
-
+                        raw_detections = (np.concatenate(raw_det_chunks, axis=0)
+                                          if raw_det_chunks else np.empty((0, 8)))
                         unique_labels = np.unique(raw_detections[:, 5]) if raw_detections.size > 0 else []
                         for lbl in unique_labels:
-                            layer_label_data = raw_detections[raw_detections[:, 5] == lbl, :-1]
-                            if layer_label_data.size > 0:
-                                cleaned_boxes = stitchDetection(layer_label_data)
-                                class_str = yolo_classes.get(str(int(lbl)), "unknown")
-                                for box in cleaned_boxes:
-                                    x1r = max(0, int(round(box[0]))); x2r = min(W0, int(round(box[2])))
-                                    y1r = max(0, int(round(box[1]))); y2r = min(H0, int(round(box[3])))
-                                    mean_val = float(img_raw[y1r:y2r, x1r:x2r].mean()) if y2r > y1r and x2r > x1r else 0.0
-                                    csv_writers[ch_id].writerow([name_no_ext, box[0], box[1], box[2], box[3], class_str, box[4], mean_val, current_z_real])
+                            label_positions = np.flatnonzero(raw_detections[:, 5] == lbl)
+                            label_data = raw_detections[label_positions]
+                            cleaned_boxes, picked, suppressed = stitchDetection(
+                                label_data[:, :5], return_trace=True)
+                            class_str = yolo_classes.get(str(int(lbl)), "unknown")
+                            accepted_ids = {}
+                            for local_index, box in zip(picked, cleaned_boxes):
+                                x1r = max(0, int(round(box[0]))); x2r = min(W0, int(round(box[2])))
+                                y1r = max(0, int(round(box[1]))); y2r = min(H0, int(round(box[3])))
+                                mean_val = (float(img_raw[y1r:y2r, x1r:x2r].mean())
+                                            if y2r > y1r and x2r > x1r else 0.0)
+                                accepted_ids[local_index] = write_detection(
+                                    ch_id, [name_no_ext, box[0], box[1], box[2], box[3],
+                                            class_str, box[4], mean_val, current_z_real],
+                                    channel_files_indices[ch_id][name_no_ext],
+                                    "yolo_confidence", "raw_rectangle")
+                            for local_index, candidate in enumerate(label_data):
+                                raw_index = int(label_positions[local_index])
+                                winner_index, suppression_iou = suppressed.get(
+                                    local_index, (None, ''))
+                                candidate_writers[ch_id].writerow([
+                                    stable_id('yolo_candidate', dir_name, ch_id,
+                                              current_z_real, raw_index),
+                                    accepted_ids.get(local_index, ''),
+                                    accepted_ids.get(winner_index, ''),
+                                    name_no_ext, current_z_real,
+                                    channel_files_indices[ch_id][name_no_ext],
+                                    candidate[6], candidate[7],
+                                    *candidate[:4], class_str, candidate[4],
+                                    'kept' if local_index in accepted_ids else 'suppressed_nms',
+                                    suppression_iou,
+                                ])
 
                     # --------- StarDist: 逐切片推断，直接写出 BBox ---------
                     elif ch_model == 'stardist':
@@ -378,9 +460,22 @@ def process_single_tile(i, pATHTEST, config):
                         )
                         for prop, score in stardist_regions_with_scores(labels, details, img_raw):
                             min_r, min_c, max_r, max_c = prop.bbox
-                            csv_writers[ch_id].writerow([
+                            det_id = write_detection(ch_id, [
                                 name_no_ext, int(min_c), int(min_r), int(max_c), int(max_r),
                                 "nucleus", score, float(prop.mean_intensity), current_z_real,
+                            ], channel_files_indices[ch_id][name_no_ext],
+                                "stardist_instance_probability", "raw_instance_mask")
+                            coordinates = details.get('coord')
+                            polygon = ''
+                            if coordinates is not None and prop.label - 1 < len(coordinates):
+                                polygon = json.dumps(np.asarray(
+                                    coordinates[prop.label - 1]).T[:, ::-1].tolist(),
+                                    separators=(',', ':'))
+                            instance_writers[ch_id].writerow([
+                                det_id, name_no_ext, current_z_real,
+                                channel_files_indices[ch_id][name_no_ext],
+                                prop.label, prop.area, prop.centroid[1],
+                                prop.centroid[0], polygon,
                             ])
 
                 pbar.update(1)
@@ -389,15 +484,50 @@ def process_single_tile(i, pATHTEST, config):
     finally:
         for f in file_handles.values():
             f.close()
+        for f in candidate_handles.values():
+            f.close()
+        for f in instance_handles.values():
+            f.close()
         pbar.close()
         if not tile_ok:
-            for part_path, _ in part_paths.values():
+            for part_path, _ in list(part_paths.values()) + list(candidate_paths.values()) + list(instance_paths.values()):
                 if os.path.exists(part_path):
                     os.remove(part_path)
 
+    for ch in channels_to_run:
+        ch_id = ch['id']
+        images = []
+        for slice_name in testnames_no_ext:
+            source_path = channel_files_indices[ch_id].get(slice_name)
+            row = {'slice_name': slice_name,
+                   'status': image_status[ch_id].get(slice_name, 'not_processed')}
+            if source_path and os.path.isfile(source_path):
+                row.update(file_stamp(source_path))
+            else:
+                row['path'] = source_path or ''
+            images.append(row)
+        atomic_json(
+            os.path.join(derived['pATH_DET_RES'],
+                         f'{dir_name}_{ch_id}_inputs.json'),
+            {'tile_name': dir_name, 'channel': ch_id,
+             'route': ch, 'detection_params': dp,
+             'image_fingerprint': 'size_and_mtime_ns',
+             'images': images, 'rows_written': row_counts[ch_id],
+             'output_size': os.path.getsize(part_paths[ch_id][0]),
+             'output_sha256': file_sha256(part_paths[ch_id][0]),
+             'candidate_output_size': (os.path.getsize(candidate_paths[ch_id][0])
+                                       if ch_id in candidate_paths else None),
+             'candidate_output_sha256': (file_sha256(candidate_paths[ch_id][0])
+                                         if ch_id in candidate_paths else None),
+             'instance_output_size': (os.path.getsize(instance_paths[ch_id][0])
+                                      if ch_id in instance_paths else None),
+             'instance_output_sha256': (file_sha256(instance_paths[ch_id][0])
+                                        if ch_id in instance_paths else None)})
+
+    for part_path, final_path in list(candidate_paths.values()) + list(instance_paths.values()):
+        os.replace(part_path, final_path)
     for part_path, final_path in part_paths.values():
         os.replace(part_path, final_path)
-    
     # =========================================================
     # 步骤 6: 彻底移除局部统计，仅做内存清理与退出
     # =========================================================
@@ -405,7 +535,7 @@ def process_single_tile(i, pATHTEST, config):
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        
+
     # 返回空列表，因为我们不再向主进程回传冗余的内存数据
     return [], dir_name
 

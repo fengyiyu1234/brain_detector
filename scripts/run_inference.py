@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 #python scripts/run_inference.py --config config/config.json
 import argparse
+import csv
 import json
 import os
 from pathlib import Path
@@ -34,9 +35,17 @@ from src.core.detection_filter import (
 )
 from src.core.stitcher import fuse_dual_intensity_2d
 from src.core.channel_stage3 import stitch_and_link_channel
-from src.core.coloc_sources import source_3d_json, write_source_3d, write_source_boxes
+from src.core.coloc_sources import (cell_id, coloc_display_box, colocalization_status,
+                                    primary_source_trace, source_3d_json,
+                                    write_match_evidence, write_source_3d,
+                                    write_source_boxes)
+from src.core.provenance import (provenance_columns, file_sha256, file_stamp,
+                                 model_fingerprints, atomic_json,
+                                 output_manifest_valid, write_output_manifest,
+                                 validate_raw_input_manifest)
 from src.core.tile_position_pipeline import run_tile_position_stage, tile_position_frame
-from src.core.stitcher import (match_soma_3d_iou, annotate_soma_with_tf_containment,
+from src.core.stitcher import (match_soma_3d_iou, merge_soma_volumes_union, soma_match_metrics,
+                               annotate_soma_with_tf_containment,
                                _merge_class, suppress_cross_class_overlap)
 from src.core.point_cloud_aligner import (
     align_tile, tile_alignment_done,
@@ -131,6 +140,35 @@ def run_align_pool(tile_paths, n_workers, det_dir, align_dir, routing, settings)
     return missing
 
 
+def write_fusion_summary(tile_names, channels, fusion_dir):
+    """Aggregate all tile manifests, including tiles skipped during resume."""
+    rows = []
+    totals = {ch['id']: {'n_low': 0, 'n_high': 0,
+                         'n_fused': 0, 'n_matched': 0}
+              for ch in channels}
+    for tile in tile_names:
+        for channel in channels:
+            cid = channel['id']
+            manifest = os.path.join(
+                fusion_dir, f"{tile}_{cid}_fusion_manifest.json")
+            with open(manifest, encoding='utf-8') as handle:
+                counts = json.load(handle)['metadata']
+            row = {'channel': cid, 'tile': tile, **counts}
+            row['n_matched'] = counts['n_low'] + counts['n_high'] - counts['n_fused']
+            rows.append(row)
+            for key in totals[cid]:
+                totals[cid][key] += row[key]
+    rows.extend({'channel': cid, 'tile': 'TOTAL', **counts}
+                for cid, counts in totals.items())
+    summary_path = os.path.join(fusion_dir, 'fusion_summary.csv')
+    atomic_write_csv(pd.DataFrame(rows), summary_path)
+    return summary_path
+
+
+def filter_input_signature(source, settings):
+    return {'source': file_stamp(source, with_hash=True), 'settings': settings}
+
+
 def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filtered_dir):
     """Filter raw tile detections before estimating pre-align channel shifts."""
     os.makedirs(filtered_dir, exist_ok=True)
@@ -143,7 +181,11 @@ def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filter
         ch['id']: resolve_filter_params(config, logical_channels[ch['id']])
         for ch in detect_routing
     }
-    filter_signature = {"schema_version": FILTER_SCHEMA_VERSION, "params": params_by_channel}
+    filter_signature = {
+        "schema_version": FILTER_SCHEMA_VERSION, "params": params_by_channel,
+        "filter_code_sha256": file_sha256(os.path.join(
+            project_root, 'src', 'core', 'detection_filter.py')),
+    }
     settings_file = os.path.join(filtered_dir, "_filter_settings.json")
     try:
         with open(settings_file, encoding="utf-8") as handle:
@@ -160,15 +202,24 @@ def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filter
     for tile, ch in tqdm(jobs, desc="Filter raw tiles for alignment"):
         name = f"{tile}_{ch['id']}_result.csv"
         target = os.path.join(filtered_dir, name)
-        if (same_settings and os.path.isfile(target) and
-                os.path.getmtime(target) >= os.path.getmtime(
-                    os.path.join(raw_dir, name))):
-            continue
+        rejected_path = os.path.join(
+            filtered_dir, f"{tile}_{ch['id']}_rejected.csv")
         source = os.path.join(raw_dir, name)
+        manifest_path = os.path.join(
+            filtered_dir, f"{tile}_{ch['id']}_filter_manifest.json")
+        signature = filter_input_signature(
+            source, {'stage': 'pre_align_filter',
+                     'params': params_by_channel[ch['id']],
+                     'filter_settings': filter_signature})
+        if (same_settings and output_manifest_valid(manifest_path, signature)):
+            continue
         params = params_by_channel[ch['id']]
-        filtered, stats = filter_detection_df(
-            pd.read_csv(source), params, return_stats=True, context=source)
+        raw = provenance_columns(pd.read_csv(source), tile, ch['id'])
+        filtered, stats, rejected = filter_detection_df(
+            raw, params, return_stats=True, return_rejected=True, context=source)
         atomic_write_csv(filtered, target)
+        atomic_write_csv(rejected, rejected_path)
+        write_output_manifest(manifest_path, [target, rejected_path], signature)
         logging.info("[2.25][%s][%s] %s -> %s", tile, ch['id'],
                      stats['before'], stats['after'])
 
@@ -178,9 +229,51 @@ def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filter
     os.replace(part, settings_file)
 
 
+
+def validate_reused_provenance(previous, current, derived, model_hashes):
+    """Prevent old checkpoints from being relabeled with changed input settings."""
+    raw_dir = derived['pATH_DET_RES']
+    tracked_dir = derived['pATH_CHANNEL_3D']
+    has_raw = os.path.isdir(raw_dir) and any(
+        name.endswith('_result.csv') for name in os.listdir(raw_dir))
+    has_tracks = os.path.isdir(tracked_dir) and any(
+        name.endswith('_3d_tracked.pkl') for name in os.listdir(tracked_dir))
+    if not (has_raw or has_tracks):
+        return
+    if previous is None:
+        raise ValueError("Existing checkpoints lack runtime_config.json provenance")
+    if has_raw:
+        keys = ('models', 'model_classes', 'channels_routing', 'pipeline_mode')
+        changed = [key for key in keys if previous.get(key) != current.get(key)]
+        old_detection = dict(previous.get('detection_params') or {})
+        new_detection = dict(current.get('detection_params') or {})
+        for transient in ('generate_histograms', 'sTARTID', 'eNDID'):
+            old_detection.pop(transient, None)
+            new_detection.pop(transient, None)
+        if old_detection != new_detection:
+            changed.append('detection_params')
+        old_hashes = (previous.get('provenance') or {}).get('model_sha256')
+        def content_only(fingerprints):
+            return {name: {key: value for key, value in record.items()
+                           if key in ('sha256', 'files', 'configured_value')}
+                    for name, record in fingerprints.items()}
+        if (old_hashes is not None and
+                content_only(old_hashes) != content_only(model_hashes)):
+            changed.append('model_content')
+        if changed:
+            raise ValueError(
+                "Raw detections were produced with different settings/model "
+                f"content ({', '.join(changed)}). Use a new result directory or "
+                "regenerate the affected checkpoints.")
+        if old_hashes is None:
+            logging.warning("Legacy raw checkpoints have no model-content fingerprint.")
+    if has_tracks and previous.get('z_linker') != current.get('z_linker'):
+        logging.info("Z-link settings changed; Stage 3 manifest will rebuild tracks.")
+
+
 def validate_global_checkpoints(derived, tile_names, routing):
-    """Refuse cached global outputs older than the filtered tile CSVs."""
-    newest_input = 0
+    """Report stale channel outputs; Stage 3 will verify and rebuild them."""
+    stale = set()
     for ch in routing:
         cid = ch['id']
         source_times = [
@@ -189,24 +282,78 @@ def validate_global_checkpoints(derived, tile_names, routing):
             for tile in tile_names
         ]
         newest = max(source_times, default=0)
-        newest_input = max(newest_input, newest)
         global_csv = os.path.join(derived['pATH_GLOBAL_2D'], f"{cid}_2d_global.csv")
         tracked = os.path.join(derived['pATH_CHANNEL_3D'], f"{cid}_3d_tracked.pkl")
         if os.path.isfile(global_csv) and os.path.getmtime(global_csv) < newest:
-            raise RuntimeError(
-                f"Stale Stage 3 checkpoint: {global_csv}. Archive/regenerate this "
-                "channel's global 2D, 3D, and downstream results.")
+            stale.add(cid)
         if os.path.isfile(tracked) and (
                 not os.path.isfile(global_csv)
                 or os.path.getmtime(tracked) < os.path.getmtime(global_csv)):
-            raise RuntimeError(
-                f"Stale Stage 3 checkpoint: {tracked}. Archive/regenerate this "
-                "channel's 3D and downstream results.")
-    coloc = os.path.join(derived['pATH_COLOCALIZATION'], "coloc_result.csv")
-    if os.path.isfile(coloc) and os.path.getmtime(coloc) < newest_input:
-        raise RuntimeError(
-            f"Stale colocalization checkpoint: {coloc}. Archive/regenerate "
-            "Stage 3/4 results after changing filtered tile inputs.")
+            stale.add(cid)
+    if stale:
+        logging.warning("Stage 3 checkpoint(s) stale and scheduled for rebuild: %s",
+                        ', '.join(sorted(stale)))
+    return stale
+
+
+
+def stage4_input_signature(derived, routing, config, geometry_source=None):
+    return {
+        "channels": [ch["id"] for ch in routing if ch.get("active", True)],
+        "geometry_source": (file_stamp(geometry_source, with_hash=True)
+                            if geometry_source else None),
+        "z_linker": config.get("z_linker", {}),
+        "calibration_um": {
+            "xy": config.get("detection_params", {}).get("xy_resolution_um", 0.65),
+            "z": config.get("detection_params", {}).get("z_resolution_um", 8.0),
+        },
+        "coloc_code_sha256": {
+            name: file_sha256(os.path.join(project_root, name))
+            for name in ('scripts/run_inference.py', 'src/core/stitcher.py',
+                         'src/core/coloc_sources.py')
+        },
+        "filtered_inputs": {
+            ch["id"]: {
+                name: file_stamp(os.path.join(derived["pATH_DET_FILTERED"], name),
+                                 with_hash=True)
+                for name in sorted(os.listdir(derived["pATH_DET_FILTERED"]))
+                if name.endswith(f"_{ch['id']}_result.csv")
+            }
+            for ch in routing if ch.get("active", True)
+        },
+        "stage3_manifests": {
+            ch["id"]: file_stamp(path, with_hash=True)
+            if os.path.isfile(path) else None
+            for ch in routing if ch.get("active", True)
+            for path in [os.path.join(
+                derived["pATH_CHANNEL_3D"], f"{ch['id']}_stage3_manifest.json")]
+        },
+        "stage3_outputs": {
+            ch["id"]: {
+                name: file_stamp(path, with_hash=True)
+                if os.path.isfile(path) else None
+                for name, path in (
+                    ('global_2d', os.path.join(derived['pATH_GLOBAL_2D'],
+                                               f"{ch['id']}_2d_global.csv")),
+                    ('stitch_decisions', os.path.join(derived['pATH_GLOBAL_2D'],
+                                                       f"{ch['id']}_stitch_decisions.csv")),
+                    ('track_summary', os.path.join(derived['pATH_CHANNEL_3D'],
+                                                    f"{ch['id']}_3d_tracked.csv")),
+                    ('track_members', os.path.join(derived['pATH_CHANNEL_3D'],
+                                                    f"{ch['id']}_track_members.csv")),
+                    ('track_rejections', os.path.join(derived['pATH_CHANNEL_3D'],
+                                                       f"{ch['id']}_track_rejections.csv")),
+                )
+            }
+            for ch in routing if ch.get("active", True)
+        },
+        "tracks": {
+            ch["id"]: file_stamp(path) if os.path.isfile(path) else None
+            for ch in routing if ch.get("active", True)
+            for path in [os.path.join(
+                derived["pATH_CHANNEL_3D"], f"{ch['id']}_3d_tracked.pkl")]
+        },
+    }
 
 
 def run_detection_pool(tasks, gpu_ids, config):
@@ -361,12 +508,14 @@ if __name__ == '__main__':
         if not pATHTILE_all:
             raise ValueError(f"❌ 在锚点目录 {anchor_dir} 中没有找到合法的 Tile！")
 
+    previous_path = os.path.join(base_res_path, 'runtime_config.json')
+    previous = load_config(previous_path) if os.path.isfile(previous_path) else None
+    model_hashes = model_fingerprints(config.get('models'), project_root)
+    validate_reused_provenance(previous, config, derived, model_hashes)
     if align_settings is not None:
-        previous_path = os.path.join(base_res_path, 'runtime_config.json')
-        previous = load_config(previous_path) if os.path.isfile(previous_path) else None
         validate_cached_geometry(previous, config, base_res_path, align_settings)
 
-    save_run_metadata(config, start_time)
+    save_run_metadata(config, start_time, model_hashes=model_hashes)
 
     # Select the requested tile range.
     sTARTID = dp.get('sTARTID') or 1
@@ -404,6 +553,19 @@ if __name__ == '__main__':
         run_detection_pool(tasks_to_run, gpu_ids, config)
     else:
         logging.info("✔️ Checkpoint 1 达成: 所有 Tile 检测完成。")
+
+    # Verify newly generated raw checkpoints before downstream reuse. Legacy
+    # CSVs without manifests remain usable, but their TIFF content is unknown.
+    for _tile_path in pATHTILE:
+        _tile = os.path.basename(_tile_path)
+        for _ch in detect_routing_config:
+            _prefix = f"{_tile}_{_ch['id']}"
+            _raw_csv = os.path.join(derived['pATH_DET_RES'], _prefix + '_result.csv')
+            _raw_manifest = os.path.join(derived['pATH_DET_RES'], _prefix + '_inputs.json')
+            if os.path.isfile(_raw_manifest):
+                validate_raw_input_manifest(_raw_manifest, _raw_csv)
+            else:
+                logging.warning("Legacy raw CSV has no TIFF/input manifest: %s", _raw_csv)
 
     if config.get('stop_after_detection', False):
         logging.info("🛑 stop_after_detection=true：Stage 1 完成，正常退出。Stage 2~5 可在 CPU 或单 GPU 上单独运行。")
@@ -477,29 +639,48 @@ if __name__ == '__main__':
                        else derived['pATH_DET_RES'])
         _fusion_dst = derived['pATH_DET_FUSED']
 
+        def _fusion_signature(tile, channel):
+            ids = (channel['id'], channel['second_intensity_id'])
+            paths = [os.path.join(_fusion_src, f"{tile}_{cid}_result.csv")
+                     for cid in ids]
+            missing = [path for path in paths if not os.path.isfile(path)]
+            if missing:
+                raise FileNotFoundError(
+                    f"Dual-exposure fusion requires both inputs; missing {missing}")
+            return {
+                'channel': channel['id'],
+                'iou_threshold': channel.get('fusion_iou_thresh', 0.3),
+                'inputs': {path: file_stamp(path, with_hash=True)
+                           for path in paths},
+                'fusion_code_sha256': file_sha256(os.path.join(
+                    project_root, 'src', 'core', 'stitcher.py')),
+            }
+
+        def _fusion_manifest(tile, channel):
+            return os.path.join(
+                _fusion_dst, f"{tile}_{channel['id']}_fusion_manifest.json")
+
+        def _fusion_ready(tile, channel):
+            output = os.path.join(
+                _fusion_dst, f"{tile}_{channel['id']}_result.csv")
+            return output_manifest_valid(
+                _fusion_manifest(tile, channel),
+                _fusion_signature(tile, channel))
+
         _fusion_done = all(
-            os.path.exists(os.path.join(_fusion_dst, f"{tn}_{ch['id']}_result.csv"))
-            and os.path.getmtime(os.path.join(_fusion_dst, f"{tn}_{ch['id']}_result.csv"))
-                >= max(os.path.getmtime(os.path.join(_fusion_src, f"{tn}_{cid}_result.csv"))
-                       for cid in (ch['id'], ch['second_intensity_id']))
-            for tn in _tile_names_all
-            for ch in _de_channels
+            _fusion_ready(tn, ch)
+            for tn in _tile_names_all for ch in _de_channels
         )
         if _fusion_done:
             logging.info("✔️ Checkpoint 2.6 达成: 融合后 tile CSV 已全部存在。")
         else:
             logging.info(f"阶段 2.6: 融合 {len(_de_channels)} 个双曝光通道 ...")
-            _fusion_rows = []
-            _agg = {ch['id']: {'low': 0, 'high': 0, 'fused': 0} for ch in _de_channels}
             for _tn in tqdm(_tile_names_all, desc="Fuse dual-intensity tiles"):
                 for ch in _de_channels:
                     ch_id = ch['id']
                     second_id = ch['second_intensity_id']
                     out_csv = os.path.join(_fusion_dst, f"{_tn}_{ch_id}_result.csv")
-                    if (os.path.exists(out_csv) and
-                            os.path.getmtime(out_csv) >= max(
-                                os.path.getmtime(os.path.join(_fusion_src, f"{_tn}_{cid}_result.csv"))
-                                for cid in (ch_id, second_id))):
+                    if _fusion_ready(_tn, ch):
                         continue
                     low_csv  = os.path.join(_fusion_src, f"{_tn}_{ch_id}_result.csv")
                     high_csv = os.path.join(_fusion_src, f"{_tn}_{second_id}_result.csv")
@@ -507,40 +688,24 @@ if __name__ == '__main__':
                         "slice_name", "x1", "y1", "x2", "y2", "class", "score", "mean", "z"])
                     high_df = pd.read_csv(high_csv) if os.path.isfile(high_csv) else pd.DataFrame(columns=[
                         "slice_name", "x1", "y1", "x2", "y2", "class", "score", "mean", "z"])
-                    if low_df.empty and high_df.empty:
-                        continue
+                    low_df = provenance_columns(low_df, _tn, ch_id)
+                    high_df = provenance_columns(high_df, _tn, second_id)
 
                     fused_df, n_low, n_high, n_fused = fuse_dual_intensity_2d(
                         low_df, high_df, iou_thresh=ch.get('fusion_iou_thresh', 0.3)
                     )
                     atomic_write_csv(fused_df, out_csv)
+                    write_output_manifest(
+                        _fusion_manifest(_tn, ch), [out_csv],
+                        _fusion_signature(_tn, ch),
+                        metadata={'n_low': n_low, 'n_high': n_high,
+                                  'n_fused': n_fused})
 
                     n_matched = n_low + n_high - n_fused
-                    _agg[ch_id]['low']   += n_low
-                    _agg[ch_id]['high']  += n_high
-                    _agg[ch_id]['fused'] += n_fused
-                    _fusion_rows.append({
-                        "channel": ch_id, "tile": _tn, "n_low": n_low, "n_high": n_high,
-                        "n_fused": n_fused, "n_matched": n_matched,
-                    })
                     logging.info(f"  [2.6][{ch_id}] tile={_tn}: low={n_low} high={n_high} "
                                  f"-> fused={n_fused} (matched={n_matched})")
 
-            for ch_id, c in _agg.items():
-                n_matched_total = c['low'] + c['high'] - c['fused']
-                logging.info(f"✔️ [2.6] [{ch_id}] 汇总: low={c['low']:,} high={c['high']:,} "
-                             f"fused={c['fused']:,} (matched={n_matched_total:,})")
-
-            if _fusion_rows:
-                _df_fusion_summary = pd.DataFrame(_fusion_rows)
-                for ch_id, c in _agg.items():
-                    _df_fusion_summary = pd.concat([_df_fusion_summary, pd.DataFrame([{
-                        "channel": ch_id, "tile": "TOTAL", "n_low": c['low'], "n_high": c['high'],
-                        "n_fused": c['fused'], "n_matched": c['low'] + c['high'] - c['fused'],
-                    }])], ignore_index=True)
-                _df_fusion_summary.to_csv(
-                    os.path.join(_fusion_dst, "fusion_summary.csv"), index=False
-                )
+        write_fusion_summary(_tile_names_all, _de_channels, _fusion_dst)
 
 
     # ==========================================
@@ -555,6 +720,8 @@ if __name__ == '__main__':
         'pipeline_mode': pipeline_mode,
         'input_stage': 'aligned_filtered_v1' if pipeline_mode == 'pre_align' else 'raw_v1',
         'params': _filter_params_by_channel,
+        'filter_code_sha256': file_sha256(os.path.join(
+            project_root, 'src', 'core', 'detection_filter.py')),
     }
     _filter_dst = derived['pATH_DET_FILTERED']
     os.makedirs(_filter_dst, exist_ok=True)
@@ -581,10 +748,21 @@ if __name__ == '__main__':
             f"missing {len(_missing_sources)} file(s):\n  {preview}"
         )
 
+    def _filtered_checkpoint_ready(tile, channel, source_dir):
+        ch_id = channel['id']
+        target = os.path.join(_filter_dst, f"{tile}_{ch_id}_result.csv")
+        rejected = os.path.join(_filter_dst, f"{tile}_{ch_id}_rejected.csv")
+        source = os.path.join(source_dir, f"{tile}_{ch_id}_result.csv")
+        manifest = os.path.join(_filter_dst, f"{tile}_{ch_id}_filter_manifest.json")
+        signature = filter_input_signature(
+            source, {'stage': 'final_filter', 'channel': ch_id,
+                     'params': _filter_params_by_channel[ch_id],
+                     'filter_settings': _filter_signature})
+        return (os.path.isfile(target) and os.path.isfile(rejected)
+                and output_manifest_valid(manifest, signature))
+
     _filter_done = _same_filter_settings and bool(_expected_filter_inputs) and all(
-        os.path.isfile(os.path.join(_filter_dst, f"{_tn}_{_ch['id']}_result.csv"))
-        and os.path.getmtime(os.path.join(_filter_dst, f"{_tn}_{_ch['id']}_result.csv"))
-            >= os.path.getmtime(os.path.join(_src, f"{_tn}_{_ch['id']}_result.csv"))
+        _filtered_checkpoint_ready(_tn, _ch, _src)
         for _tn, _ch, _src in _expected_filter_inputs
     )
     if _filter_done:
@@ -596,22 +774,39 @@ if __name__ == '__main__':
             _ch_id = _ch['id']
             _in_csv = os.path.join(_src, f"{_tn}_{_ch_id}_result.csv")
             _out_csv = os.path.join(_filter_dst, f"{_tn}_{_ch_id}_result.csv")
-            if (_same_filter_settings and os.path.isfile(_out_csv) and
-                    os.path.getmtime(_out_csv) >= os.path.getmtime(_in_csv)):
+            _rejected_path = os.path.join(
+                _filter_dst, f"{_tn}_{_ch_id}_rejected.csv")
+            _manifest_path = os.path.join(
+                _filter_dst, f"{_tn}_{_ch_id}_filter_manifest.json")
+            _signature = filter_input_signature(
+                _in_csv, {'stage': 'final_filter', 'channel': _ch_id,
+                          'params': _filter_params_by_channel[_ch_id],
+                          'filter_settings': _filter_signature})
+            if (_same_filter_settings and
+                    _filtered_checkpoint_ready(_tn, _ch, _src)):
                 continue
             if pipeline_mode == 'pre_align' and not _ch.get('double_exposure'):
-                if os.path.abspath(_in_csv) == os.path.abspath(_out_csv):
-                    continue
-                part = _out_csv + '.part'
-                shutil.copyfile(_in_csv, part)
-                os.replace(part, _out_csv)
+                if os.path.abspath(_in_csv) != os.path.abspath(_out_csv):
+                    part = _out_csv + '.part'
+                    shutil.copyfile(_in_csv, part)
+                    os.replace(part, _out_csv)
+                empty_rejected = pd.read_csv(_in_csv, nrows=0)
+                empty_rejected['rejection_reason'] = pd.Series(dtype=str)
+                atomic_write_csv(empty_rejected, _rejected_path)
+                write_output_manifest(
+                    _manifest_path, [_out_csv, _rejected_path], _signature)
                 continue
             _params = _filter_params_by_channel[_ch_id]
-            _filtered_df, _stats = filter_detection_df(
-                pd.read_csv(_in_csv), _params, return_stats=True,
+            _input_df = provenance_columns(
+                pd.read_csv(_in_csv), _tn, _ch_id)
+            _filtered_df, _stats, _rejected_df = filter_detection_df(
+                _input_df, _params, return_stats=True, return_rejected=True,
                 context=f"{_in_csv} ({_ch_id})",
             )
             atomic_write_csv(_filtered_df, _out_csv)
+            atomic_write_csv(_rejected_df, _rejected_path)
+            write_output_manifest(
+                _manifest_path, [_out_csv, _rejected_path], _signature)
             _n_filtered_total += _stats["removed_total"]
             logging.info(
                 "[2.75][%s][%s] %s -> %s (removed=%s; score_min_removed=%s; params=%s)",
@@ -767,24 +962,27 @@ if __name__ == '__main__':
         logging.info("Direct image stitching enabled; stitching raw channels before Stage 3.")
         run_direct_stitching(Path(args.config), skip_completed=True)
 
-    validate_global_checkpoints(
+    stale_stage3_channels = validate_global_checkpoints(
         derived, [os.path.basename(p) for p in pATHTILE_all], routing_config)
     bbox_path = os.path.join(derived['pATH_COLOCALIZATION'], "coloc_result.csv")
     source_3d_path = os.path.join(
         derived['pATH_COLOCALIZATION'], 'coloc_source_3d.csv')
     source_boxes_path = os.path.join(
         derived['pATH_COLOCALIZATION'], 'coloc_source_boxes.csv')
+    manifest_path = os.path.join(
+        derived['pATH_COLOCALIZATION'], '_provenance_manifest.json')
     final_results = None
-    source_checkpoint_ready = False
-    if all(os.path.isfile(p) for p in
-           (bbox_path, source_3d_path, source_boxes_path)):
-        try:
-            columns = set(pd.read_csv(bbox_path, nrows=0).columns)
-            source_checkpoint_ready = {'coloc_id', 'source_3d'} <= columns
-        except (OSError, ValueError, pd.errors.EmptyDataError):
-            pass
+    source_checkpoint_ready = (not stale_stage3_channels and output_manifest_valid(
+        manifest_path, stage4_input_signature(derived, routing_config, config, pATHxml)))
+    if source_checkpoint_ready:
+        columns = set(pd.read_csv(bbox_path, nrows=0).columns)
+        source_checkpoint_ready = {
+            'coloc_id', 'source_3d', 'source_trace_status',
+            'cx', 'cy', 'cz', 'x1_3d', 'y1_3d', 'x2_3d', 'y2_3d',
+            'z_min', 'z_max', 'bounds_method', 'soma_status', 'tf_status'
+        } <= columns
     if os.path.isfile(bbox_path) and not source_checkpoint_ready:
-        logging.info("Stage 4 source coordinates missing; rebuilding from saved channel tracks.")
+        logging.info("Stage 4 provenance checkpoint incomplete or stale; rebuilding.")
 
     if source_checkpoint_ready:
         logging.info(f"✔️ Checkpoint 2 达成: 加载已有的全局检测结果 {bbox_path}")
@@ -815,15 +1013,12 @@ if __name__ == '__main__':
                          max_z_gap=zl_tf.get('max_z_gap', 0)),
         }
         geom = {'dir_dict': dir_dict, 'disp_mat_fin': disp_mat_fin, 'z_start': z_start, 'Z': Z,
-                'H': H, 'W': W, 'tile_size': tile_size, 'num_tiles': num_tiles}
+                'H': H, 'W': W, 'tile_size': tile_size, 'num_tiles': num_tiles,
+                'xml_source': pATHxml}
         ch_results = run_stage3_channel_pool(
             routing_config, stage3_worker_count(config, len(routing_config)),
             pATH_SRC_CSV, derived['pATH_GLOBAL_2D'], derived['pATH_CHANNEL_3D'], geom, zl_params,
             base_res_path)
-
-        # Concatenate tile metadata in channel order to recover tile and slice names.
-        meta_chunks = [ch_results[ch['id']]['metadata'] for ch in routing_config
-                       if ch_results[ch['id']]['metadata'] is not None]
 
         soma_ch_ids = [ch['id'] for ch in routing_config
                        if ch.get('type', 'soma') == 'soma' and ch.get('active', True)]
@@ -857,12 +1052,26 @@ if __name__ == '__main__':
                 iou_thresh=iou_thresh_3d, iomin_thresh=iomin_thresh_3d, z_pad=z_pad_3d
             )
             for a_cell, b_cell in matched_pairs:
+                iou, iomin = soma_match_metrics(a_cell, b_cell, z_pad_3d)
+                a_cell.setdefault('match_evidence', []).append({
+                    'match_type': 'soma_iou',
+                    'channel': cid_b,
+                    'track_id': b_cell.get('track_id', ''),
+                    'iou': iou, 'iomin': iomin,
+                    'iou_threshold': iou_thresh_3d,
+                    'iomin_threshold': iomin_thresh_3d,
+                    'z_pad': z_pad_3d,
+                })
+                merge_soma_volumes_union(a_cell, b_cell)
                 a_cell['source_tracks'].extend(b_cell['source_tracks'])
                 a_cell['class'] = _merge_class(a_cell['class'], b_cell['class'])
             merged_soma_vols = merged_soma_vols + unmatched_b
         cross_iou = zl_soma.get('cross_class_iou_thresh', 0.5)
+        decision_rows = []
+        filtered_tf_objects = set()
         merged_soma_vols = suppress_cross_class_overlap(
-            merged_soma_vols, iou_thresh=cross_iou, z_pad=z_pad_3d
+            merged_soma_vols, iou_thresh=cross_iou, z_pad=z_pad_3d,
+            decision_rows=decision_rows
         )
         n_multi  = sum(1 for c in merged_soma_vols if len(class_markers(c['class'])) > 1)
         n_single = len(merged_soma_vols) - n_multi
@@ -879,11 +1088,23 @@ if __name__ == '__main__':
             tf_vols = tf_vol_by_ch.get(cid, [])
             if (tf_bbox_max_w is not None or tf_bbox_max_h is not None) and tf_vols:
                 n_before = len(tf_vols)
+                old_tf_vols = tf_vols
                 tf_vols = [
                     v for v in tf_vols
                     if (tf_bbox_max_w is None or v['x2_3d'] - v['x1_3d'] <= tf_bbox_max_w)
                     and (tf_bbox_max_h is None or v['y2_3d'] - v['y1_3d'] <= tf_bbox_max_h)
                 ]
+                accepted_objects = {id(v) for v in tf_vols}
+                for rejected_tf in old_tf_vols:
+                    if id(rejected_tf) not in accepted_objects:
+                        filtered_tf_objects.add(id(rejected_tf))
+                        decision_rows.append({
+                            'stage': 'tf_size_filter', 'channel': cid,
+                            'track_id': rejected_tf.get('track_id', ''),
+                            'other_track_id': '', 'decision': 'rejected_tf',
+                            'reason': 'bbox_max_size', 'metric': '',
+                            'threshold': f"{tf_bbox_max_w},{tf_bbox_max_h}",
+                        })
                 logging.info(f"  [{cid}] TF size filter: {n_before} → {len(tf_vols)} "
                              f"(bbox_max_w={tf_bbox_max_w}, bbox_max_h={tf_bbox_max_h})")
             if tf_vols and merged_soma_vols:
@@ -892,6 +1113,11 @@ if __name__ == '__main__':
                     max_center_dist_ratio=max_center_dist, source_channel=cid
                 )
                 logging.info(f"✔️ [3B] [{cid}] TF containment 标注完成")
+        matched_tf_objects = {
+            id(source) for soma in merged_soma_vols
+            for channel, source in soma.get('source_tracks', ())
+            if channel in tf_ch_ids
+        }
         tf_markers_set = {channel_marker(cid) for cid in tf_ch_ids}
         n_tf_annotated = sum(
             1 for c in merged_soma_vols
@@ -908,11 +1134,7 @@ if __name__ == '__main__':
         # Phase C: output center-z 2D boxes and exclude TF-only detections.
         output_rows = []
         for soma in merged_soma_vols:
-            center_z = int(round(soma['cz']))
-            bbox = soma['per_z_boxes'].get(
-                center_z,
-                [soma['x1_3d'], soma['y1_3d'], soma['x2_3d'], soma['y2_3d']]
-            )
+            bbox, center_z = coloc_display_box(soma)
             output_rows.append([
                 bbox[0], bbox[1], bbox[2], bbox[3],
                 soma['score'], soma['mean'], soma['class'], center_z
@@ -921,9 +1143,34 @@ if __name__ == '__main__':
         soma_3d = (np.array(output_rows, dtype=object)
                    if output_rows else np.empty((0, 8), dtype=object))
 
+        xy_um = float(dp.get('xy_resolution_um', 0.65))
+        z_um = float(dp.get('z_resolution_um', 8.0))
         out_coloc = os.path.join(derived['pATH_COLOCALIZATION'], 'coloc_result.csv')
         write_source_boxes(source_boxes_path, merged_soma_vols)
-        write_source_3d(source_3d_path, merged_soma_vols)
+        write_source_3d(source_3d_path, merged_soma_vols, xy_um, z_um)
+        write_match_evidence(
+            os.path.join(derived['pATH_COLOCALIZATION'], 'coloc_match_evidence.csv'),
+            merged_soma_vols)
+        decisions_path = os.path.join(
+            derived['pATH_COLOCALIZATION'], 'coloc_decisions.csv')
+        with open(decisions_path + '.part', 'w', newline='', encoding='utf-8') as handle:
+            columns = ['stage', 'channel', 'track_id', 'other_track_id',
+                       'decision', 'reason', 'metric', 'threshold']
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(decision_rows)
+            for cid in tf_ch_ids:
+                for tf_track in tf_vol_by_ch.get(cid, []):
+                    if (id(tf_track) not in matched_tf_objects
+                            and id(tf_track) not in filtered_tf_objects):
+                        writer.writerow({
+                            'stage': 'tf_containment', 'channel': cid,
+                            'track_id': tf_track.get('track_id', ''),
+                            'other_track_id': '', 'decision': 'unmatched_tf',
+                            'reason': 'no_accepted_soma', 'metric': '',
+                            'threshold': max_center_dist,
+                        })
+        os.replace(decisions_path + '.part', decisions_path)
         logging.info(f"✔️ [3C] 共定位结果: {len(soma_3d)} 个细胞 → {out_coloc}")
 
         final_results = soma_3d
@@ -931,47 +1178,70 @@ if __name__ == '__main__':
         # Save the global 3D report.
         if final_results is not None and len(final_results) > 0:
             df = pd.DataFrame(final_results, columns=BOX_COLS)
-            df['coloc_id'] = np.arange(len(df), dtype=np.int64)
-            df['source_3d'] = [source_3d_json(soma) for soma in merged_soma_vols]
+            df['coloc_id'] = [cell_id(soma, index)
+                              for index, soma in enumerate(merged_soma_vols)]
+            df['source_3d'] = [source_3d_json(soma, xy_um, z_um)
+                               for soma in merged_soma_vols]
+            for field in ('cx', 'cy', 'cz', 'x1_3d', 'y1_3d',
+                          'x2_3d', 'y2_3d', 'z_min', 'z_max',
+                          'bounds_method'):
+                df[field] = [soma.get(field) for soma in merged_soma_vols]
+            status_rows = [colocalization_status(soma, soma_ch_ids, tf_ch_ids)
+                           for soma in merged_soma_vols]
+            for field in ('soma_positive_channels', 'soma_positive_count',
+                          'soma_status', 'tf_positive_channels',
+                          'tf_positive_count', 'tf_status'):
+                df[field] = [row[field] for row in status_rows]
+            df['cx_um'] = [float(soma['cx']) * xy_um for soma in merged_soma_vols]
+            df['cy_um'] = [float(soma['cy']) * xy_um for soma in merged_soma_vols]
+            df['cz_um'] = [(float(soma['cz']) - 1) * z_um
+                           for soma in merged_soma_vols]
+            df['xy_um_per_px'] = xy_um
+            df['z_um_per_slice'] = z_um
 
-            if meta_chunks:
-                meta_coords = np.concatenate([m['coords'] for m in meta_chunks])
-                meta_coords[:, 2] *= 10.0
-                tree = cKDTree(meta_coords)
-                final_coords = np.column_stack((
-                    (final_results[:, 0] + final_results[:, 2]) / 2,
-                    (final_results[:, 1] + final_results[:, 3]) / 2,
-                    final_results[:, 7].astype(float) * 10.0
-                ))
-                _, indices = tree.query(final_coords)
-                # Decode tile and slice names only for selected cells.
-                bounds = np.cumsum([0] + [len(m['coords']) for m in meta_chunks])
-                chunk_of = np.searchsorted(bounds, indices, side='right') - 1
-                tiles, slices = np.empty(len(indices), dtype=object), np.empty(len(indices), dtype=object)
-                for k, m in enumerate(meta_chunks):
-                    sel = chunk_of == k
-                    local = indices[sel] - bounds[k]
-                    tiles[sel] = m['tile_u'][m['tile_c'][local]]
-                    slices[sel] = m['slice_u'][m['slice_c'][local]]
-                df['tile_name']  = tiles
-                df['slice_name'] = slices
-            else:
-                df['tile_name']  = 'Unknown'
-                df['slice_name'] = 'Unknown'
+            traces = [primary_source_trace(soma) for soma in merged_soma_vols]
+            df['tile_name'] = [trace[0] for trace in traces]
+            df['slice_name'] = [trace[1] for trace in traces]
+            df['source_trace_status'] = [trace[2] for trace in traces]
 
             # Save the full checkpoint CSV for later stages.
-            df.to_csv(bbox_path, index=False)
+            df.to_csv(bbox_path + '.part', index=False)
+            os.replace(bbox_path + '.part', bbox_path)
             logging.info(f"✔️ 已输出 目标4 checkpoint: {bbox_path}")
 
             # Save one CSV per cell type.
+            class_paths = []
             for cls, cls_df in df.groupby('class'):
                 safe_cls = str(cls).replace('/', '_').replace('\\', '_')
-                cls_df.to_csv(os.path.join(derived['pATH_COLOCALIZATION'], f"{safe_cls}.csv"), index=False)
+                class_path = os.path.join(
+                    derived['pATH_COLOCALIZATION'], f"{safe_cls}.csv")
+                cls_df.to_csv(class_path + '.part', index=False)
+                os.replace(class_path + '.part', class_path)
+                class_paths.append(class_path)
             logging.info(f"✔️ 已输出 目标4 ({df['class'].nunique()} 种细胞类型) → {derived['pATH_COLOCALIZATION']}")
         else:
-            pd.DataFrame(columns=[*BOX_COLS, 'coloc_id', 'source_3d', 'tile_name', 'slice_name']).to_csv(
-                out_coloc, index=False)
+            class_paths = []
+            pd.DataFrame(columns=[*BOX_COLS, 'coloc_id', 'source_3d',
+                                  'cx', 'cy', 'cz', 'x1_3d', 'y1_3d',
+                                  'x2_3d', 'y2_3d', 'z_min', 'z_max',
+                                  'bounds_method',
+                                  'soma_positive_channels', 'soma_positive_count',
+                                  'soma_status', 'tf_positive_channels',
+                                  'tf_positive_count', 'tf_status',
+                                  'tile_name', 'slice_name',
+                                  'source_trace_status', 'cx_um', 'cy_um', 'cz_um',
+                                  'xy_um_per_px', 'z_um_per_slice']).to_csv(
+                out_coloc + '.part', index=False)
+            os.replace(out_coloc + '.part', out_coloc)
             logging.warning("⚠️ 全局未检测到任何 3D 目标。")
+
+        write_output_manifest(
+            manifest_path,
+            [bbox_path, source_3d_path, source_boxes_path,
+             os.path.join(derived['pATH_COLOCALIZATION'],
+                          'coloc_match_evidence.csv'),
+             decisions_path, *class_paths],
+            stage4_input_signature(derived, routing_config, config, pATHxml))
 
     # ==========================================
     # Stage 4: generate analysis statistics and centroids.
@@ -1028,10 +1298,15 @@ if __name__ == '__main__':
         # Calculate centroids for each final class.
         df_final['cx'] = (df_final['x1'] + df_final['x2']) / 2
         df_final['cy'] = (df_final['y1'] + df_final['y2']) / 2
+        df_final['cx_um'] = df_final['cx'] * df_final['xy_um_per_px']
+        df_final['cy_um'] = df_final['cy'] * df_final['xy_um_per_px']
+        df_final['cz_um'] = (df_final['z'] - 1) * df_final['z_um_per_slice']
         
         for label, group in df_final.groupby('class_clean'):
             group_sorted = group.sort_values('z')
-            out_df = group_sorted[['cx', 'cy', 'z', 'score', 'slice_name', 'tile_name']]
+            out_df = group_sorted[['cx', 'cy', 'z', 'cx_um', 'cy_um', 'cz_um',
+                                   'score', 'slice_name', 'tile_name',
+                                   'coloc_id', 'source_trace_status']]
             
             # Sanitize labels for output filenames.
             safe_label = str(label).replace('/', '_').replace('\\', '_')

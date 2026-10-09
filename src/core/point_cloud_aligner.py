@@ -1110,7 +1110,8 @@ def compute_tile_channel_shifts(per_ch_vol_lists, soma_ch_ids, tf_ch_ids,
 # 8.  Apply shift to a per-tile detection CSV
 # ──────────────────────────────────────────────────────────────────────────────
 
-def apply_shift_to_csv(in_csv_path, dx, dy, dz, out_csv_path, slice_names=None):
+def apply_shift_to_csv(in_csv_path, dx, dy, dz, out_csv_path, slice_names=None,
+                       tile_name=None, channel_id=None):
     """
     Add (dx, dy) to bbox columns and dz to z column of a detection CSV.
 
@@ -1126,7 +1127,10 @@ def apply_shift_to_csv(in_csv_path, dx, dy, dz, out_csv_path, slice_names=None):
     if not os.path.exists(in_csv_path):
         return
 
-    df = pd.read_csv(in_csv_path)
+    from src.core.provenance import provenance_columns
+    df = provenance_columns(pd.read_csv(in_csv_path),
+                            tile_name or os.path.basename(in_csv_path),
+                            channel_id or "")
     os.makedirs(os.path.dirname(out_csv_path), exist_ok=True)
     if df.empty:
         _atomic_to_csv(df, out_csv_path)
@@ -1194,6 +1198,18 @@ def _count_lines(path):
         return sum(buf.count(b'\n') for buf in iter(lambda: f.read(1 << 20), b''))
 
 
+def _alignment_input_signature(tile_name, det_dir, routing):
+    from src.core.provenance import file_stamp, file_sha256
+    return {
+        'inputs': {
+            cid: file_stamp(path, with_hash=True) if os.path.isfile(path) else None
+            for cid in _aligned_channel_ids(routing)
+            for path in [os.path.join(det_dir, f"{tile_name}_{cid}_result.csv")]
+        },
+        'aligner_sha256': file_sha256(__file__),
+    }
+
+
 def tile_alignment_done(tile_name, det_dir, align_dir, routing):
     """
     offsets JSON 最后写，是完成标记；另外核对每个通道的对齐 CSV 与原始 CSV 行数一致
@@ -1201,6 +1217,11 @@ def tile_alignment_done(tile_name, det_dir, align_dir, routing):
     """
     offsets_file = os.path.join(align_dir, f"{tile_name}_offsets.json")
     if not os.path.isfile(offsets_file):
+        return False
+    from src.core.provenance import output_manifest_valid
+    manifest_path = os.path.join(align_dir, f"{tile_name}_alignment_manifest.json")
+    if os.path.isfile(manifest_path) and not output_manifest_valid(
+            manifest_path, _alignment_input_signature(tile_name, det_dir, routing)):
         return False
     primary = {ch['id'] for ch in routing}
     for cid in _aligned_channel_ids(routing):
@@ -1351,10 +1372,22 @@ def align_tile(tile_path, det_dir, align_dir, routing, settings):
         dx, dy, dz = shifts.get(cid, (0, 0, 0))
         apply_shift_to_csv(os.path.join(det_dir, f"{tile_name}_{cid}_result.csv"), dx, dy, dz,
                            os.path.join(align_dir, f"{tile_name}_{cid}_result.csv"),
-                           slice_names=slice_names)
+                           slice_names=slice_names,
+                           tile_name=tile_name, channel_id=cid)
 
     # 5. 最后写 offsets JSON，作为该 tile 的完成标记
-    save_tile_offsets(tile_name, shifts, scores, align_dir)
+    offsets_path = save_tile_offsets(tile_name, shifts, scores, align_dir)
+    from src.core.provenance import write_output_manifest
+    outputs = [offsets_path, measurement_file]
+    outputs.extend(
+        os.path.join(align_dir, f"{tile_name}_{cid}_result.csv")
+        for cid in _aligned_channel_ids(routing)
+        if os.path.isfile(os.path.join(det_dir, f"{tile_name}_{cid}_result.csv")))
+    if diagnostics:
+        outputs.append(diagnostic_path)
+    write_output_manifest(
+        os.path.join(align_dir, f"{tile_name}_alignment_manifest.json"),
+        outputs, _alignment_input_signature(tile_name, det_dir, routing))
     return missing
 
 

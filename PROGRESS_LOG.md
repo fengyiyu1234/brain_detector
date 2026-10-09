@@ -739,3 +739,30 @@ Olig2 逐 tile 包含数中位数 54 → 122。
 - 修复：`combine_predictions` 只在先前 tile 的同一全局 Z 层、同一细胞类型存在 IoU > 0.4 的框时丢弃重复检测；没有匹配框则保留，并同步保留 tile/slice 溯源。
 - 验证：新增重叠区独有检测、重复检测、不同类型和不同 Z 层的回归测试；在 `brain_detector` Conda 环境中，新增测试 3 项及相关流水线测试 2 项全部通过。
 - 已生成的全局 2D、Stage 3 及下游 checkpoint 不会自动更新，需要重新生成才能应用修复。
+
+---
+
+## 2026-10-09 Pipeline-wide detection and colocalization provenance (implemented 2026-10-08)
+
+### Completed
+
+- Raw tile detections now carry stable `detection_id`, original TIFF path, raw slice/Z, score meaning, intensity-region meaning, and parent IDs. Each tile/channel has an input manifest recording processed, missing, or unreadable slices and validating the raw CSV. YOLO exports post-model window candidates with patch origins and tile-NMS keep/suppress decisions, winner IDs, and IoU. StarDist exports instance labels, mask areas, centroids, and available polygons.
+- Both filtering passes and the standalone refilter tool retain IDs in accepted and rejected CSVs. Rejected rows record the first failing filter; containment NMS also records the winning detection ID, IoMin, and threshold. Per-tile filter manifests bind source, accepted, and rejected files by SHA256. Alignment preserves raw slice/Z and source image; its per-tile manifest validates inputs, offsets, and outputs.
+- Dual-exposure fusion writes a new ID linked to both original exposure IDs, the winning box/source image, and fusion IoU. Per-tile fusion manifests record input/output hashes and counts. `fusion_summary.csv` is rebuilt from every tile manifest, including cached tiles during a partial resume.
+- Global 2D stitching keeps detection ID and exact tile/slice. Cross-tile overlap rejections record the competing ID and IoU. Z-linked cells keep stable track IDs, exact member detections, representative detection/Z, observed XY envelope, and tracks rejected by the minimum-Z rule; CSV sidecars and Stage 3 manifests validate these outputs.
+- Stage 4 colocalization exports stable `coloc_id`, each participating channel's original 3D track and per-Z boxes, accepted soma/TF match measurements, and exclusion decisions. `coloc_result.csv` includes a `source_3d` JSON map, exact source-trace status, and calibrated center coordinates in micrometers. The representative-centered 3D matching box and observed per-Z envelope are labeled separately. Centroid CSVs retain the cell ID and physical coordinates.
+- Runtime metadata records model/code hashes, original config/run info, and run history. Tile-position solver, filtering, alignment, fusion, Stage 3, and Stage 4 checkpoints now use content signatures or completion manifests; stale downstream outputs are rebuilt where safe. The stitching XML is hashed for the global stages. README documents file joins, coordinate frames, and legacy limitations.
+
+### Verification and limits
+
+- `brain_detector` Conda environment: `python -B -m unittest discover -s tests -p 'test_*.py' -q` passed 76 tests. `git diff --check` found no whitespace errors.
+- No T70 dataset or existing detection results were rerun for this change. New provenance fields appear when the affected stages regenerate. Historical raw detections or track summaries cannot recover original details that were never saved; raw TIFF manifests use path, size, and modification time rather than a full TIFF content hash.
+
+---
+
+## 2026-10-09 Stage 4 soma 3D union and nuclear-marker status
+
+- GFP/RFP soma tracks still match by the configured 3D IoU or IoMin gate. A matched cell now uses the axis-aligned union of both source 3D boxes: min lower and max upper X/Y/Z coordinates. The merged center and per-Z display boxes are recomputed; each original channel track remains available unchanged in `source_3d`, `coloc_source_3d.csv`, and `coloc_source_boxes.csv`.
+- Stage 4 applies Sox9 and Olig2 containment independently to the same merged soma geometry. The marker order does not change final cell labels. `coloc_result.csv` now exposes merged 3D center/bounds, `bounds_method`, soma/TF positive channel lists and counts, and negative/single/double/multi positivity status. Its legacy XY box is the union projection for multi-soma matches.
+- The Stage 4 code hash invalidates an earlier Stage 4 manifest and rebuilds these outputs from saved Stage 3 tracks; saved raw detections or alignment shifts do not need to be recomputed for this code change. Status is defined at the soma level; two TF assignments do not by themselves prove both markers occupy one nucleus.
+- Verification: the full test suite passed 78 tests after the core change; after the viewer label and source-trace test, the focused colocalization suite passed 6 tests and saved-viewer suite passed 16 tests. `git diff --check` reported no whitespace errors. T70 data were not rerun.

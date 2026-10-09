@@ -9,7 +9,7 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-FILTER_SCHEMA_VERSION = "4"
+FILTER_SCHEMA_VERSION = "6"
 FILTER_KEYS = frozenset({
     "bbox_min", "bbox_max", "bbox_max_aspect_ratio", "bbox_area_pct_min",
     "bbox_area_pct_max", "bbox_mean_pct_min", "bbox_mean_min",
@@ -88,8 +88,10 @@ def _check_columns(df: pd.DataFrame, context: str | None) -> None:
         raise ValueError(f"Detection CSV is missing required column(s) {missing}{where}")
 
 
-def _iomin_keep(df: pd.DataFrame, threshold: float) -> np.ndarray:
+def _iomin_keep(df: pd.DataFrame, threshold: float, return_details=False):
     keep = np.ones(len(df), dtype=bool)
+    winner_ids = np.full(len(df), '', dtype=object)
+    loser_iomin = np.full(len(df), np.nan, dtype=float)
     for positions in df.groupby("z", sort=False).indices.values():
         group = df.iloc[positions]
         x1, y1 = group.x1.to_numpy(float), group.y1.to_numpy(float)
@@ -111,22 +113,39 @@ def _iomin_keep(df: pd.DataFrame, threshold: float) -> np.ndarray:
                 inter = max(0., min(x2[winner], x2[loser]) - max(x1[winner], x1[loser]))
                 inter *= max(0., min(y2[winner], y2[loser]) - max(y1[winner], y1[loser]))
                 denom = min(areas[winner], areas[loser])
-                if denom > 0 and inter / denom > threshold:
+                iomin = inter / denom if denom > 0 else 0.0
+                if iomin > threshold:
                     local_keep[loser] = False
+                    absolute_pos = int(np.asarray(positions)[loser])
+                    if 'detection_id' in group:
+                        winner_ids[absolute_pos] = str(group.iloc[winner]['detection_id'])
+                    loser_iomin[absolute_pos] = iomin
         keep[np.asarray(positions)[~local_keep]] = False
-    return keep
+    return (keep, winner_ids, loser_iomin) if return_details else keep
 
 
 def filter_detection_df(df: pd.DataFrame, params: Mapping[str, Any], return_stats: bool = False,
-                        *, context: str | None = None) -> pd.DataFrame | tuple[pd.DataFrame, dict[str, Any]]:
+                        *, context: str | None = None, return_rejected: bool = False):
+
     """Filter a complete tile×channel dataframe without changing its input."""
     validate_filter_params(params); _check_columns(df, context)
     out = df.copy()
     stats: dict[str, Any] = {"before": len(out), "removed": {}, "thresholds": {}}
+    rejected_parts = []
 
-    def apply(name: str, mask: np.ndarray) -> None:
+    def apply(name: str, mask: np.ndarray, evidence=None) -> None:
         nonlocal out
-        before = len(out); out = out.loc[np.asarray(mask, dtype=bool)].copy()
+        mask = np.asarray(mask, dtype=bool)
+        if return_rejected and np.any(~mask):
+            rejected = out.loc[~mask].copy()
+            rejected["rejection_reason"] = name
+            if evidence is not None:
+                winner_ids, iomin_values, threshold = evidence
+                rejected['suppressed_by_detection_id'] = winner_ids[~mask]
+                rejected['suppression_iomin'] = iomin_values[~mask]
+                rejected['suppression_threshold'] = threshold
+            rejected_parts.append(rejected)
+        before = len(out); out = out.loc[mask].copy()
         stats["removed"][name] = before - len(out)
 
     if not out.empty:
@@ -171,9 +190,19 @@ def filter_detection_df(df: pd.DataFrame, params: Mapping[str, Any], return_stat
     else: stats["removed"]["mean_min"] = 0
     if not out.empty and params.get("score_min") is not None: apply("score_min", out["score"].to_numpy(float) >= params["score_min"])
     else: stats["removed"]["score_min"] = 0
-    if not out.empty and params.get("nms_containment_thresh") is not None: apply("containment_nms", _iomin_keep(out, float(params["nms_containment_thresh"])))
+    if not out.empty and params.get("nms_containment_thresh") is not None:
+        threshold = float(params["nms_containment_thresh"])
+        if return_rejected:
+            mask, winners, metrics = _iomin_keep(out, threshold, return_details=True)
+            apply("containment_nms", mask, (winners, metrics, threshold))
+        else:
+            apply("containment_nms", _iomin_keep(out, threshold))
     else: stats["removed"]["containment_nms"] = 0
     stats["after"] = len(out); stats["removed_total"] = stats["before"] - stats["after"]
+    if return_rejected:
+        rejected = (pd.concat(rejected_parts, ignore_index=True)
+                    if rejected_parts else pd.DataFrame(columns=[*df.columns, "rejection_reason"]))
+        return (out, stats, rejected) if return_stats else (out, rejected)
     return (out, stats) if return_stats else out
 
 

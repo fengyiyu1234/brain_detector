@@ -1,3 +1,4 @@
+import json
 from functools import lru_cache
 
 import numpy as np
@@ -153,7 +154,8 @@ def parse_class_string(cls_str):
 
 
 def run_z_linker(full_stack_matrix, iou_thresh=0.45, min_z_layers=2,
-                 max_cell_z_span=5, max_z_gap=0, solver='sparse'):
+                 max_cell_z_span=5, max_z_gap=0, solver='sparse',
+                 channel_id=None, rejected_tracks=None):
     """
     Returns (summary_array, volumetric_list).
       summary_array:    np.ndarray (N, 8) — one row per cell, center_z, for visualization CSV
@@ -234,6 +236,24 @@ def run_z_linker(full_stack_matrix, iou_thresh=0.45, min_z_layers=2,
     final_rows = []
     volumetric_list = []
     for track in finished_tracks:
+        if len(track['all_boxes']) < min_z_layers:
+            if rejected_tracks is not None:
+                from src.core.provenance import stable_id
+                ids = [
+                    str(det[8]) if len(det) > 8 and det[8] else
+                    stable_id('legacy_z_member', channel_id, i, *det[:8])
+                    for i, det in enumerate(track['all_boxes'])
+                ]
+                rejected_tracks.append({
+                    'track_id': stable_id('rejected_track3d', channel_id, sorted(ids)),
+                    'channel': channel_id or '',
+                    'decision': 'rejected',
+                    'reason': 'min_z_layers',
+                    'member_count': len(ids),
+                    'threshold': min_z_layers,
+                    'member_detection_ids': json.dumps(ids),
+                })
+            continue
         if len(track['all_boxes']) >= min_z_layers:
             boxes    = track['all_boxes']
             best_det = max(boxes, key=lambda x: (len(_parse_cached(x[6])[1]), float(x[4])))
@@ -258,7 +278,40 @@ def run_z_linker(full_stack_matrix, iou_thresh=0.45, min_z_layers=2,
             half_w = max(all_w) / 2
             half_h = max(all_h) / 2
             z_sorted = sorted(pzb.keys())
+            from src.core.provenance import stable_id
+            members = []
+            for member_index, det in enumerate(boxes):
+                det_id = (str(det[8]) if len(det) > 8 and det[8] else
+                          stable_id('legacy_z_member', channel_id, member_index,
+                                    *det[:8]))
+                members.append({
+                    'detection_id': det_id,
+                    'tile_name': str(det[9]) if len(det) > 9 else 'Unknown',
+                    'slice_name': str(det[10]) if len(det) > 10 else 'Unknown',
+                    'z': int(det[7]),
+                    'x1': float(det[0]), 'y1': float(det[1]),
+                    'x2': float(det[2]), 'y2': float(det[3]),
+                    'score': float(det[4]), 'mean': float(det[5]),
+                    'class': str(det[6]),
+                })
+            best_id = next(member['detection_id'] for member in members
+                           if member['z'] == int(best_det[7]) and
+                           member['x1'] == float(best_det[0]) and
+                           member['y1'] == float(best_det[1]) and
+                           member['score'] == float(best_det[4]))
+            track_id = stable_id('track3d', channel_id,
+                                 sorted(member['detection_id'] for member in members))
             volumetric_list.append({
+                'track_id': track_id,
+                'best_detection_id': best_id,
+                'best_box_z': int(best_det[7]),
+                'member_count': len(members),
+                'member_detections': members,
+                'bounds_method': 'representative_centered_max_size',
+                'observed_x1': min(v[0] for v in pzb.values()),
+                'observed_y1': min(v[1] for v in pzb.values()),
+                'observed_x2': max(v[2] for v in pzb.values()),
+                'observed_y2': max(v[3] for v in pzb.values()),
                 'cx': cx,
                 'cy': cy,
                 'cz': float(center_z),

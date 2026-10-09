@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import pandas as pd
+from src.core.detection_filter import FILTER_SCHEMA_VERSION
 
 
 class RefilterCliTests(unittest.TestCase):
@@ -53,7 +54,10 @@ class RefilterCliTests(unittest.TestCase):
             result = pd.read_csv(output / "tile_Olig2_result.csv")
             self.assertEqual(result.score.tolist(), [.5, .8])
             manifest = json.loads((output / "refilter_manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["filter_schema_version"], "2")
+            self.assertEqual(manifest["filter_schema_version"], FILTER_SCHEMA_VERSION)
+            self.assertTrue((output / "tile_Olig2_rejected.csv").is_file())
+            rejected = pd.read_csv(output / "tile_Olig2_rejected.csv")
+            self.assertEqual(rejected["rejection_reason"].tolist(), ["score_min"])
             record = manifest["records"][0]
             self.assertEqual(record["params"]["score_min"], .5)
             self.assertEqual(record["removed_by_step"]["score_min"], 1)

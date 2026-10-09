@@ -354,6 +354,12 @@ def merge_soma_detections_2d(ch_a_matrix, ch_b_matrix, iou_thresh=0.1):
             winner = a if float(a[4]) >= float(b[4]) else b
             merged = list(winner)
             merged[6] = _merge_class(str(a[6]), str(b[6]))
+            if len(merged) > 8:
+                import json
+                merged[8] = json.dumps(
+                    sorted(json.loads(a[8]) + json.loads(b[8])),
+                    separators=(",", ":"))
+                merged[10] = float(iou_mat[ri, ci])
             result.append(merged)
             matched_a.add(ri)
             matched_b.add(ci)
@@ -376,6 +382,13 @@ def _raw_df_to_tagged_box_matrix(df, tag):
     z_to_slice = dict(zip(df["z"].astype(int), df["slice_name"]))
     mat = df[_BOX_COLS].values.copy()
     mat[:, 6] = np.array([f"{v}_{tag}" for v in mat[:, 6]], dtype=object)
+    if "detection_id" in df:
+        import json
+        provenance = np.array([
+            [json.dumps([det_id], separators=(",", ":")), det_id, None]
+            for det_id in df["detection_id"].astype(str)
+        ], dtype=object)
+        mat = np.column_stack((mat, provenance))
     return mat, z_to_slice
 
 
@@ -395,26 +408,52 @@ def fuse_dual_intensity_2d(low_df, high_df, iou_thresh=0.3):
 
     Returns (fused_df, n_low, n_high, n_fused) — fused_df in the same raw 9-col format.
     """
+    import json
+    from src.core.provenance import provenance_columns, stable_id
+
+    low_df = provenance_columns(low_df, "fusion_input", "low")
+    high_df = provenance_columns(high_df, "fusion_input", "high")
     n_low, n_high = len(low_df), len(high_df)
 
-    low_mat, low_z2s = _raw_df_to_tagged_box_matrix(low_df, _DUAL_LO_TAG)
-    high_mat, high_z2s = _raw_df_to_tagged_box_matrix(high_df, _DUAL_HI_TAG)
-
+    low_mat, _ = _raw_df_to_tagged_box_matrix(low_df, _DUAL_LO_TAG)
+    high_mat, _ = _raw_df_to_tagged_box_matrix(high_df, _DUAL_HI_TAG)
     fused_mat = merge_soma_detections_2d(low_mat, high_mat, iou_thresh=iou_thresh)
     n_fused = len(fused_mat)
-
-    z_to_slice = dict(low_z2s)
-    z_to_slice.update(high_z2s)
+    sources = {
+        str(row["detection_id"]): row
+        for df in (low_df, high_df)
+        for _, row in df.iterrows()
+    }
 
     rows = []
     for row in fused_mat:
-        x1, y1, x2, y2, score, mean, cls, z = row
-        base_cls = str(cls).split('_')[0]
-        z_int = int(float(z))
-        slice_name = z_to_slice.get(z_int, str(z_int))
-        rows.append([slice_name, x1, y1, x2, y2, base_cls, score, mean, z_int])
-
-    fused_df = pd.DataFrame(rows, columns=_RAW_COLS)
+        x1, y1, x2, y2, score, mean, cls, z = row[:8]
+        parents = json.loads(row[8])
+        winner_id = str(row[9])
+        winner = sources[winner_id]
+        source_images = [str(sources[parent].get("source_image", ""))
+                         for parent in parents]
+        rows.append({
+            "slice_name": winner["slice_name"],
+            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+            "class": str(cls).split("_")[0],
+            "score": score, "mean": mean, "z": int(float(z)),
+            "detection_id": stable_id("fused2d", *parents),
+            "parent_detection_ids": json.dumps(parents, separators=(",", ":")),
+            "winner_detection_id": winner_id,
+            "fusion_iou": row[10],
+            "source_image": winner.get("source_image", ""),
+            "source_images": json.dumps(source_images, separators=(",", ":")),
+            "raw_slice_name": winner.get("raw_slice_name", ""),
+            "raw_z": winner.get("raw_z", ""),
+            "score_type": winner.get("score_type", ""),
+            "intensity_region": winner.get("intensity_region", ""),
+        })
+    fused_df = pd.DataFrame(rows, columns=[
+        *_RAW_COLS, "detection_id", "parent_detection_ids",
+        "winner_detection_id", "fusion_iou", "source_image", "source_images",
+        "raw_slice_name", "raw_z", "score_type", "intensity_region",
+    ])
     return fused_df, n_low, n_high, n_fused
 
 
@@ -511,6 +550,57 @@ def _iou_3d_batch(x1a, y1a, x2a, y2a, z1a, z2a,
     return iou, iomin
 
 
+
+def soma_match_metrics(cell_a, cell_b, z_pad=0):
+    """The exact 3D IoU and IoMin values used for a selected soma pair."""
+    arrays_a = _cells_to_arrays([cell_a], z_pad)
+    arrays_b = _cells_to_arrays([cell_b], z_pad)
+    iou, iomin = _iou_3d_batch(
+        *arrays_a[:6], *arrays_b[:6],
+        np.array([0], dtype=np.int64), np.array([0], dtype=np.int64), z_pad)
+    return float(iou[0]), float(iomin[0])
+
+
+def merge_soma_volumes_union(cell_a, cell_b):
+    """Expand a matched soma to the 3D bounding-box union of both tracks.
+
+    Mutate only the merged soma. Its saved source_tracks continue to hold the
+    original, unmerged channel tracks for tracing each channel independently.
+    """
+    for lower, upper in (('x1_3d', 'x2_3d'), ('y1_3d', 'y2_3d'),
+                         ('z_min', 'z_max')):
+        cell_a[lower] = min(cell_a[lower], cell_b[lower])
+        cell_a[upper] = max(cell_a[upper], cell_b[upper])
+
+    cell_a['cx'] = (cell_a['x1_3d'] + cell_a['x2_3d']) / 2
+    cell_a['cy'] = (cell_a['y1_3d'] + cell_a['y2_3d']) / 2
+    cell_a['cz'] = (cell_a['z_min'] + cell_a['z_max']) / 2
+    cell_a['bounds_method'] = 'cross_channel_bbox_union'
+
+    per_z = {int(z): list(box) for z, box in cell_a['per_z_boxes'].items()}
+    for z, box in cell_b['per_z_boxes'].items():
+        z = int(z)
+        if z in per_z:
+            old = per_z[z]
+            per_z[z] = [min(old[0], box[0]), min(old[1], box[1]),
+                        max(old[2], box[2]), max(old[3], box[3])]
+        else:
+            per_z[z] = list(box)
+    cell_a['per_z_boxes'] = per_z
+
+    for lower, upper, index in (('observed_x1', 'observed_x2', 0),
+                                ('observed_y1', 'observed_y2', 1)):
+        if lower in cell_a and lower in cell_b:
+            cell_a[lower] = min(cell_a[lower], cell_b[lower])
+        else:
+            cell_a[lower] = min(box[index] for box in per_z.values())
+        if upper in cell_a and upper in cell_b:
+            cell_a[upper] = max(cell_a[upper], cell_b[upper])
+        else:
+            cell_a[upper] = max(box[index + 2] for box in per_z.values())
+    return cell_a
+
+
 def match_soma_3d_iou(cells_a, cells_b, iou_thresh=0.15, iomin_thresh=0.5, z_pad=0):
     """
     Match two lists of volumetric soma cells using 3D IoU (greedy matching).
@@ -574,7 +664,7 @@ def match_soma_3d_iou(cells_a, cells_b, iou_thresh=0.15, iomin_thresh=0.5, z_pad
     return matched_pairs, unmatched_a, unmatched_b
 
 
-def suppress_cross_class_overlap(cells, iou_thresh=0.5, z_pad=2):
+def suppress_cross_class_overlap(cells, iou_thresh=0.5, z_pad=2, decision_rows=None):
     """
     For any (neuron, glia) pair with 3D IoU > iou_thresh, drop the neuron.
     Glia takes priority.  Runs after Phase-A soma merging, before TF annotation.
@@ -607,6 +697,19 @@ def suppress_cross_class_overlap(cells, iou_thresh=0.5, z_pad=2):
                                          x1g, y1g, x2g, y2g, z1g, z2g,
                                          i_arr, j_arr, z_pad)
             suppressed = set(i_arr[iou_vals > iou_thresh].tolist())
+            if decision_rows is not None:
+                for i, j, iou in zip(i_arr, j_arr, iou_vals):
+                    if iou > iou_thresh:
+                        decision_rows.append({
+                            'stage': 'cross_class_suppression',
+                            'channel': '',
+                            'track_id': neurons[int(i)].get('track_id', ''),
+                            'other_track_id': glias[int(j)].get('track_id', ''),
+                            'decision': 'rejected_neuron',
+                            'reason': 'overlaps_glia',
+                            'metric': float(iou),
+                            'threshold': iou_thresh,
+                        })
 
     surviving = [nn for i, nn in enumerate(neurons) if i not in suppressed]
     logging.info(f"Cross-class dedup: suppressed {len(suppressed)} neuron(s) "
@@ -742,7 +845,7 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
             if dist < best.get(t, (float('inf'), None))[0]:
                 best[t] = (dist, idx)
 
-        for t, (_, best_idx) in best.items():
+        for t, (best_dist, best_idx) in best.items():
             cls = chunk[t]['class']
             if cls not in marker_of:
                 tf_base, tf_mk = split_class(cls)
@@ -751,6 +854,16 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
             if source_channel is not None:
                 soma_vol_list[best_idx].setdefault('source_tracks', []).append(
                     (source_channel, chunk[t]))
+                soma_vol_list[best_idx].setdefault('match_evidence', []).append({
+                    'match_type': 'tf_containment',
+                    'channel': source_channel,
+                    'track_id': chunk[t].get('track_id', ''),
+                    'center_distance': best_dist,
+                    'center_distance_ratio': best_dist / soma_radii[best_idx],
+                    'center_distance_ratio_max': max_center_dist_ratio,
+                    'xy_margin': xy_margin,
+                    'z_pad': z_pad,
+                })
 
     for idx, soma in enumerate(soma_vol_list):
         if idx in soma_markers:
@@ -765,18 +878,20 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
 # Tile-level detection stitching (unchanged)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def stitchDetection(detections, H=None, W=None, xsize=None, ysize=None, step=None):
+def stitchDetection(detections, H=None, W=None, xsize=None, ysize=None, step=None, return_trace=False):
     if len(detections) == 0:
-        return detections
+        return (detections, [], {}) if return_trace else detections
     boxes = np.array(list(detections))
-    return non_max_suppression_iou(boxes, overlapThresh=0.4, sort_idx=4)
+    return non_max_suppression_iou(boxes, overlapThresh=0.4, sort_idx=4,
+                                   return_trace=return_trace)
 
 
-def non_max_suppression_iou(boxes, overlapThresh=0.45, sort_idx=4, containment_thresh=None):
+def non_max_suppression_iou(boxes, overlapThresh=0.45, sort_idx=4, containment_thresh=None, return_trace=False):
     if len(boxes) == 0:
-        return []
+        return (boxes, [], {}) if return_trace else []
 
     pick = []
+    suppressed_by = {}
     x1 = boxes[:, 0].astype(float)
     y1 = boxes[:, 1].astype(float)
     x2 = boxes[:, 2].astype(float)
@@ -808,12 +923,15 @@ def non_max_suppression_iou(boxes, overlapThresh=0.45, sort_idx=4, containment_t
             iomin    = inter_area / (np.minimum(area[i], area[idxs[:last]]) + 1e-6)
             suppress = suppress | (iomin > containment_thresh)
 
+        if return_trace:
+            for position in np.where(suppress)[0]:
+                suppressed_by[int(idxs[position])] = (int(i), float(iou[position]))
         idxs = np.delete(idxs, np.concatenate(([last], np.where(suppress)[0])))
 
-    return boxes[pick]
+    return (boxes[pick], pick, suppressed_by) if return_trace else boxes[pick]
 
 
-def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, disp_mat, size, metadata_registry, tile_name, tILESIZE=2048, file_z0=None, row_meta=None):
+def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, disp_mat, size, metadata_registry, tile_name, tILESIZE=2048, file_z0=None, row_meta=None, provenance_meta=None, decision_meta=None):
     """
     row_meta: 可选 dict，(层, 类别) → [(tile_name, slice_name), ...]，与写进
               all_predictions[层][类别] 的行一一对应、顺序相同（用于把溯源信息存进全局 2D CSV）。
@@ -839,8 +957,19 @@ def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, d
     # 行的先后顺序与逐个追加时完全相同。
     new_rows = {}
     prior_boxes = {}
-    for row_data in csv_reader:
-        slice_name, x1, y1, x2, y2, class_name, score, mean, z = row_data[:9]
+    for row_number, row_data in enumerate(csv_reader):
+        if isinstance(row_data, dict):
+            slice_name = row_data["slice_name"]
+            x1, y1, x2, y2 = (row_data[key] for key in ("x1", "y1", "x2", "y2"))
+            class_name, score, mean, z = (row_data[key] for key in
+                                          ("class", "score", "mean", "z"))
+            detection_id = row_data.get("detection_id")
+        else:
+            slice_name, x1, y1, x2, y2, class_name, score, mean, z = row_data[:9]
+            detection_id = row_data[9] if len(row_data) > 9 else None
+        if not detection_id and provenance_meta is not None:
+            from src.core.provenance import stable_id
+            detection_id = stable_id("legacy2d", tile_name, row_number)
         z    = int(float(z))
         x1   = float(x1); x2 = float(x2); y1 = float(y1); y2 = float(y2)
         score = float(score); mean = float(mean)
@@ -868,13 +997,28 @@ def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, d
                     area = max(0, x2 - x1) * max(0, y2 - y1)
                     prior_area = (np.maximum(0, boxes[:, 2] - boxes[:, 0]) *
                                   np.maximum(0, boxes[:, 3] - boxes[:, 1]))
-                    if np.any(inter / (area + prior_area - inter + 1e-6) > 0.4):
+                    overlap_iou = inter / (area + prior_area - inter + 1e-6)
+                    if np.any(overlap_iou > 0.4):
+                        if decision_meta is not None:
+                            winner_index = int(np.argmax(overlap_iou))
+                            prior_ids = provenance_meta.get(key, ()) if provenance_meta else ()
+                            decision_meta.append({
+                                'detection_id': detection_id,
+                                'tile_name': tile_name, 'slice_name': slice_name,
+                                'z': z, 'decision': 'rejected',
+                                'reason': 'cross_tile_overlap',
+                                'other_detection_id': (prior_ids[winner_index]
+                                                       if winner_index < len(prior_ids) else ''),
+                                'iou': float(overlap_iou[winner_index]),
+                            })
                         continue
 
             new_rows.setdefault(key, []).append(
                 [x1, y1, x2, y2, score, mean, class_name, z])
             if row_meta is not None:
                 row_meta.setdefault(key, []).append((tile_name, slice_name))
+            if provenance_meta is not None:
+                provenance_meta.setdefault(key, []).append(str(detection_id))
             metadata_registry.append([(x1 + x2) / 2, (y1 + y2) / 2, z, tile_name, slice_name])
 
     for (zi, ti), rows in new_rows.items():

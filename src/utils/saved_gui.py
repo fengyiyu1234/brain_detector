@@ -97,8 +97,12 @@ def _add_s4_layers(viewer, rows, registry, width=4):
         def row_color(record):
             scale = .65 if str(record["class"]).startswith("glia") else 1.0
             return [*(rgb * scale), 1.0]
+        box_label = ("[s4 saved 3d union]" if
+                     "bounds_method" in selected and
+                     selected["bounds_method"].eq("cross_channel_bbox_union").all()
+                     else "[s4 saved rep-z exact]")
         _add_box_layer(
-            viewer, selected, f"[s4 saved rep-z exact] {label}",
+            viewer, selected, f"{box_label} {label}",
             visible=len(markers) >= 2, color=row_color,
             width=width, registry=registry, source="s4")
 

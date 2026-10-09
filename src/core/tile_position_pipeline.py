@@ -4,6 +4,12 @@ import os
 import subprocess
 import sys
 
+from src.core.provenance import file_sha256
+
+
+def _file_hashes(paths):
+    return {path: file_sha256(path) for path in paths if os.path.isfile(path)}
+
 
 def _stamp(path):
     st = os.stat(path)
@@ -137,17 +143,37 @@ def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir
     frame_xml = os.path.join(frame_dir, 'xml_merging.xml')
     output_stamps = {path: _stamp(path) for path in outputs} if all(
         os.path.isfile(path) for path in outputs) else None
+    input_hashes = _file_hashes(files)
+    output_hashes = _file_hashes(outputs) if output_stamps else None
+    hashes_match = (not previous or not previous.get('hashes') or
+                    previous['hashes'].get('inputs') == input_hashes and
+                    previous['hashes'].get('outputs') == output_hashes)
+    solver_hashes_match = (not previous or not previous.get('hashes') or
+        {path: digest for path, digest in previous['hashes'].get('inputs', {}).items()
+         if path != xml_script} ==
+        {path: digest for path, digest in input_hashes.items()
+         if path != xml_script} and
+        {path: previous['hashes'].get('outputs', {}).get(path)
+         for path in outputs[:2]} ==
+        {path: output_hashes.get(path) for path in outputs[:2]})
+    if previous and output_stamps and not previous.get('hashes'):
+        previous['hashes'] = {'inputs': input_hashes, 'outputs': output_hashes}
+        part = manifest_path + '.part'
+        with open(part, 'w', encoding='utf-8') as handle:
+            json.dump(previous, handle, indent=2)
+        os.replace(part, manifest_path)
     if previous and output_stamps:
-        if previous.get('signature') == signature and previous.get('outputs') == output_stamps:
+        if (hashes_match and previous.get('signature') == signature
+                and previous.get('outputs') == output_stamps):
             return frame_xml, False
         legacy = any(old in str(previous.get('signature')) for old, _ in _LAYOUT_NAMES)
-        if (legacy and
+        if (legacy and hashes_match and
                 _canonical_manifest(previous.get('signature'), script, xml_script) ==
                 _canonical_manifest(signature, script, xml_script) and
                 _canonical_manifest(previous.get('outputs'), script, xml_script) ==
                 _canonical_manifest(output_stamps, script, xml_script)):
             return frame_xml, False
-    positions_reusable = bool(previous) and all(
+    positions_reusable = bool(previous) and solver_hashes_match and all(
         os.path.isfile(path) and previous.get('outputs', {}).get(path) == _stamp(path)
         for path in outputs[:2])
     solver_unchanged = (positions_reusable and isinstance(previous.get('signature'), dict) and
@@ -172,7 +198,9 @@ def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir
     part = manifest_path + '.part'
     with open(part, 'w', encoding='utf-8') as handle:
         json.dump({'signature': signature,
-                   'outputs': {path: _stamp(path) for path in outputs}},
+                   'outputs': {path: _stamp(path) for path in outputs},
+                   'hashes': {'inputs': _file_hashes(files),
+                              'outputs': _file_hashes(outputs)}},
                   handle, indent=2)
     os.replace(part, manifest_path)
     return frame_xml, True

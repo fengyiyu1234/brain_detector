@@ -34,7 +34,7 @@ The expected image layout is a channel directory containing row directories and 
 | 3 | Place filtered boxes in global coordinates, link detections across Z, and colocalize channels | `5_2d_global/`, `6_3d_global/`, `7_colocalization/` |
 | 4 | Save cell centroids and optional summary statistics | `7_colocalization/cell_centroids/` |
 
-`stop_after_detection: true` exits after Stage 2. With the tile solver enabled, `stop_before_stitching: true` exits after Stage 2.9 has written the XMLs. Without it, the stop point remains after tile filtering. Existing CSV and PKL checkpoints are reused on later runs. Keep the saved `runtime_config.json` with the results: it records the coordinate settings used by that run.
+`stop_after_detection: true` exits after Stage 2. With the tile solver enabled, `stop_before_stitching: true` exits after Stage 2.9 has written the XMLs. Without it, the stop point remains after tile filtering. Completed CSV and PKL checkpoints are reused only when their provenance manifests match the source files and settings. Keep `runtime_config.json` with the results: it records the original run, later runs, model and code hashes, and coordinate settings.
 
 Filtering has one path and no `stage_2_75_enabled` switch. In `pre_align`, raw detections are filtered once into `2_2d_filtered/` before channel alignment. The aligned single-channel CSVs are copied from `3_2d_aligned/` into `4_2d_filtered/` without a second filter; fused double-exposure CSVs are filtered when published. In `post_align`, raw detections are filtered directly into `4_2d_filtered/`.
 
@@ -112,15 +112,15 @@ All four channels' saved global detections use the **same final frame geometry**
 
 Stage 3 performs several distinct kinds of overlap handling:
 
-1. [`combine_predictions()`](src/core/stitcher.py) converts filtered tile detections to global positions and discards boxes whose centers fall in the left or upper neighbor's overlap region. This current cross-tile rule is a geometric mask, not IoU-based union of duplicate boxes.
+1. [`combine_predictions()`](src/core/stitcher.py) converts filtered tile detections to global positions. In tile overlap regions, it removes a later box when an earlier tile has a same-type box on the same Z slice with IoU above 0.4. The rejected ID, winner ID, and IoU are written to the stitch decisions CSV.
 2. [`run_z_linker()`](src/core/z_linker.py) links same-channel boxes across Z using one-to-one XY IoU matching. A track becomes one 3D cell, with a representative box at the median Z. `z_linker.soma` and `z_linker.tf` provide separate IoU, minimum-layer, maximum-span, and gap settings. With `min_z_layers: 1`, isolated single-slice detections remain.
-3. [`match_soma_3d_iou()`](src/core/stitcher.py) matches soma cells across channels using 3D IoU or IoMin and combines their marker labels. A later neuron/glia overlap pass gives glia priority. TF nuclei then annotate containing soma cells; the final `coloc_result.csv` contains soma cells with their marker combinations.
+3. [`match_soma_3d_iou()`](src/core/stitcher.py) matches soma cells across channels using 3D IoU or IoMin. Each matched pair becomes the axis-aligned union of its source 3D bounding boxes (minimum lower and maximum upper X/Y/Z coordinates); its center is recomputed from that union. A later neuron/glia overlap pass gives glia priority. Sox9 and Olig2 nuclei are then assigned independently to the same merged soma geometry. The final `coloc_result.csv` contains soma cells with their marker combinations and channel positivity status.
 
 `6_3d_global/<channel>_3d_tracked.csv` contains one representative row per Z-linked cell; the adjacent PKL holds its per-Z boxes and 3D extent. `7_colocalization/coloc_result.csv` contains the cross-channel soma result.
 
 **Configuration fields to treat carefully:** `ENABLE_Z_LINKER` and `detection_params.cross_tile_iomin_thresh` are present in some configs, but the current Python pipeline does not read them. Setting either one does not change Stage 3 behavior. The current code also does not read the solver's `tile_positions.csv` for global conversion.
 
-Changing alignment references, frame geometry, or `paths.pATHXML` after global checkpoints exist requires a fresh result directory or regeneration of the affected checkpoints. The pipeline checks saved runtime provenance to prevent reuse in a different frame.
+Changing alignment references or stitching frame geometry after global checkpoints exist requires a fresh result directory or regeneration of the affected checkpoints. Changes to filtered CSVs or Z-link settings invalidate the Stage 3 and Stage 4 manifests and trigger their rebuild. The exact stitching XML file is hashed in both manifests. Changing model content or detection settings while raw CSVs exist is rejected because those raw boxes must be recomputed first.
 
 ## Visualize results
 
@@ -183,13 +183,22 @@ without inferring a new pairing.
 
 New Stage 4 runs write three linked files under `7_colocalization/`:
 
-- `coloc_result.csv`: one row per colocalized soma, with a zero-based `coloc_id`
-  and a `source_3d` JSON object keyed by every matched channel ID. Each channel
-  contains a list so multiple matched TF tracks are retained.
+- `coloc_result.csv`: one row per soma, with a stable `coloc_id`, merged 3D
+  `cx,cy,cz,x1_3d,y1_3d,x2_3d,y2_3d,z_min,z_max,bounds_method`, and a
+  `source_3d` JSON object keyed by every matched channel ID. For matched soma
+  channels, the merged bounds are their 3D bounding-box union, and the legacy
+  `x1,y1,x2,y2` display box is its XY projection at the rounded center Z.
+  Single-channel somas retain their representative-Z display box. The CSV also
+  records `soma_positive_channels`, `tf_positive_channels` (JSON arrays),
+  unique-channel counts, and `soma_status`/`tf_status` as `negative`,
+  `single_positive`, `double_positive`, or `multi_positive`. TF channels are
+  assigned independently; double positive means both markers were assigned to
+  the soma, not necessarily that both were seen in the same nucleus. Each
+  channel in `source_3d` contains a list so multiple matched TF tracks remain.
 - `coloc_source_3d.csv`: one row per matched source track with its original
   Stage 3 center (`cx,cy,cz`) and 3D bounds
   (`x1_3d,y1_3d,x2_3d,y2_3d,z_min,z_max`).
-- `coloc_source_boxes.csv`: each source track's exact per-Z 2D boxes.
+- `coloc_source_boxes.csv`: each source track's exact per-Z 2D boxes and detection IDs.
 
 Join the flat files to the main result on `coloc_id`; join the two source
 files on `coloc_id,source_track`. All coordinates use the saved, aligned
@@ -197,6 +206,24 @@ global frame. Z values are one-based, as in the pipeline CSV files. These
 coordinates are the individual Stage 3 tracks before colocalization; they
 are not raw TIFF tile coordinates. On the next pipeline run, a Stage 4 checkpoint lacking these fields is
 rebuilt from the saved channel tracks.
+
+### Provenance files and coordinate definitions
+
+| Stage | Files | Key retained information |
+| --- | --- | --- |
+| Raw detection | `1_2d_raw/<tile>_<channel>_result.csv`, `_inputs.json` | Stable `detection_id`, original TIFF path, raw slice/Z, score and intensity definitions; TIFF size and modification time, output hash, and processed/missing/unreadable status per slice. |
+| YOLO / StarDist detail | `1_2d_raw/*_candidates.csv`, `*_instances.csv` | Every post-model YOLO window candidate with patch origin, kept/suppressed decision, winner ID and IoU; StarDist label, mask area, centroid and polygon vertices when supplied by the model. |
+| Filtering | `2_2d_filtered/` and `4_2d_filtered/` `*_result.csv`, `*_rejected.csv`, `*_filter_manifest.json` | Accepted IDs are preserved; rejected rows retain their first failing filter step in `rejection_reason`; containment NMS also records winner ID, IoMin, and threshold. Pre-aligned single channels have an empty Stage 2.75 rejection file because their filtering happened earlier. |
+| Alignment and fusion | `3_2d_aligned/*_result.csv`, `*_alignment_manifest.json`; `3_2d_aligned_fusion/*_result.csv`, `*_fusion_manifest.json`, `fusion_summary.csv` | Aligned rows retain raw slice/Z and TIFF path. Fusion rows retain both parent IDs, winning source ID, fusion IoU, and the winning source image. |
+| Global stitching | `5_2d_global/<channel>_2d_global.csv`, `*_stitch_decisions.csv` | Accepted detection ID and exact source tile/slice; cross-tile overlap rejections with competing ID and IoU. |
+| Z linking | `6_3d_global/<channel>_3d_tracked.csv`, `*_track_members.csv`, `*_track_rejections.csv`, `*_stage3_manifest.json` | Track ID, exact member detections, chosen representative Z, observed XY envelope, and tracks rejected by `min_z_layers`. |
+| Colocalization | `7_colocalization/coloc_result.csv`, `coloc_source_3d.csv`, `coloc_source_boxes.csv`, `coloc_match_evidence.csv`, `coloc_decisions.csv`, `_provenance_manifest.json` | Stable cell ID, all individual channel tracks and boxes, accepted match measurements, and cross-class/TF exclusion decisions. |
+
+`detection_id` links raw, filtered, aligned, fused, global and track-member rows. A fused row has its own ID; `parent_detection_ids` links to both exposures. `track_id` links track summaries to their member detections. `coloc_id` links the final cell to every participating channel track. `source_3d` is a JSON map from channel ID to a list, preserving multiple matched TF tracks from one channel. Each saved match measurement appears in `coloc_match_evidence.csv`.
+
+Raw boxes and `raw_z` use the original tile image frame. Aligned tile boxes use the stitching-reference tile frame. Global 2D, 3D and colocalization boxes use the final global frame. Pixel coordinates are zero-origin; slice Z is one-based. `source_trace_status` distinguishes an exact center-Z source member, a representative source member, and a merged soma union whose displayed XY box has no single source detection. The exported physical center coordinates use `cx_um = cx * xy_resolution_um`, `cy_um = cy * xy_resolution_um`, and `cz_um = (cz - 1) * z_resolution_um`. They are relative to the global pixel/slice origin, not an anatomical atlas origin. In individual Stage 3/source-track rows, `x1_3d...y2_3d` are the representative-centered matching volume and `observed_x1...y2` are the measured per-Z envelope. In a merged Stage 4 row, `x1_3d...y2_3d` are the union of the source matching volumes.
+
+Manifests are completion markers with input signatures and output SHA256 hashes. Newly written raw, alignment, Stage 3 and Stage 4 checkpoints are validated on resume. Legacy files without the required source fields can be read, but missing TIFF provenance or original track members cannot be reconstructed from a summary box. New Stage 3 runs rebuild legacy global/track checkpoints from available filtered CSVs. Keep all linked files together when moving result directories; absolute paths in manifests reflect their original location.
 
     python src/utils/visualize.py --config config/vis_config.json --mode prealign
 
