@@ -235,7 +235,7 @@ def _add_global_results(viewer, result_dir, routing, xy_bounds,
 
 def _attach_clicks(viewer, registry, result_dir, context, tile_contexts,
                    global_view, vis_cfg, paths, routing, anchor_dir):
-    """Inspect exact saved rows; load Stage 3 PKL only when a track is requested."""
+    """Inspect saved rows and print complete Stage 3 coordinates on click."""
     track_cache = {}
     fn_recorders = {}
     if not global_view:
@@ -285,7 +285,7 @@ def _attach_clicks(viewer, registry, result_dir, context, tile_contexts,
                     f"score={row.get('score', float('nan')):.3f} "
                     f"mean={row.get('mean', float('nan')):.1f}")
         print(f"[saved row] {label}: {row}")
-        if not is_shift or row["source"] != "6_3d_global":
+        if row["source"] != "6_3d_global":
             if is_shift and row["source"] == "s4":
                 v.status += " | Stage 4 stores representative z only"
             return
@@ -293,6 +293,7 @@ def _attach_clicks(viewer, registry, result_dir, context, tile_contexts,
         pkl_path = os.path.join(result_dir, "6_3d_global", f"{cid}_3d_tracked.pkl")
         if not os.path.isfile(pkl_path):
             v.status = f"Saved track unavailable: {pkl_path}"
+            print(f"[saved 3d] {v.status}")
             return
         if cid not in track_cache:
             with open(pkl_path, "rb") as handle:
@@ -308,6 +309,34 @@ def _attach_clicks(viewer, registry, result_dir, context, tile_contexts,
         track = track_for_summary(summary, track_cache[cid])
         if track is None:
             v.status = "No unique saved PKL track matches this Stage 3 row"
+            print(f"[saved 3d] {v.status}")
+            return
+        per_z_boxes = track["per_z_boxes"]
+        z_values = sorted(int(tz) for tz in per_z_boxes)
+        x1 = min(float(box[0]) for box in per_z_boxes.values())
+        y1 = min(float(box[1]) for box in per_z_boxes.values())
+        x2 = max(float(box[2]) for box in per_z_boxes.values())
+        y2 = max(float(box[3]) for box in per_z_boxes.values())
+        print(f"[saved 3d] {cid} {track['class']}: global XYZ "
+              f"x=[{x1:g}, {x2:g}], y=[{y1:g}, {y2:g}], "
+              f"z=[{z_values[0]}, {z_values[-1]}] (1-based), "
+              f"observed_layers={len(z_values)}", flush=True)
+        for tz in z_values:
+            gx1, gy1, gx2, gy2 = map(float, per_z_boxes[tz])
+            if global_view:
+                dz, dx, dy = tz - 1, gx1, gy1
+                dx2, dy2 = gx2, gy2
+            else:
+                dz = tz - 1 + position.z
+                dx, dy = gx1 - position.x, gy1 - position.y
+                dx2, dy2 = gx2 - position.x, gy2 - position.y
+            print(f"[saved 3d]   global z={tz}: "
+                  f"x=[{gx1:g}, {gx2:g}], y=[{gy1:g}, {gy2:g}] | "
+                  f"display z={dz}: x=[{dx:g}, {dx2:g}], "
+                  f"y=[{dy:g}, {dy2:g}]", flush=True)
+        v.status = (f"Saved {cid} track spans global z={z_values[0]}-{z_values[-1]} "
+                    f"({len(z_values)} observed layers)")
+        if not is_shift:
             return
         for layer in list(v.layers):
             if layer.name == "[saved track span]":
@@ -334,7 +363,6 @@ def _attach_clicks(viewer, registry, result_dir, context, tile_contexts,
                 span, shape_type="rectangle", name="[saved track span]",
                 edge_color="yellow", face_color=[0, 0, 0, 0],
                 edge_width=2)
-        v.status = f"Saved {cid} track spans z={track['z_min']}–{track['z_max']}"
 
     viewer.mouse_drag_callbacks.append(on_click)
 

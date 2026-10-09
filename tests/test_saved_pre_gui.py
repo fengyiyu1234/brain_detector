@@ -279,6 +279,38 @@ class SavedPrealignTests(unittest.TestCase):
                     if layer.name == "[saved track span]")
         self.assertEqual(tuple(span.data[0][0]), (3, 5, 3))
 
+    def test_regular_click_prints_complete_stage3_xyz(self):
+        track = {"cx": 25.0, "cy": 37.0, "cz": 2.0,
+                 "score": .8, "mean": 100.0, "class": "glia_GFP_RFP",
+                 "z_min": 1, "z_max": 3,
+                 "per_z_boxes": {1: [22, 34, 26, 38],
+                                 3: [24, 36, 28, 40]}}
+        path = self.result / "6_3d_global" / "RFP_3d_tracked.pkl"
+        with path.open("wb") as handle:
+            pickle.dump([track], handle)
+        class Viewer(FakeViewer):
+            def __init__(self, title):
+                super().__init__(title)
+                self.layers = Layers()
+        with patch("src.utils.saved_gui.napari.Viewer", Viewer):
+            run_saved_prealign(
+                self.vis, self.run["paths"], self.context.routing, self.context,
+                [(self.tile_path, self.tile)])
+        viewer = FakeViewer.made[-1]
+        viewer.layers.selection.active = next(
+            layer for layer in viewer.layers if layer.name == "[s3 saved summary] RFP")
+        viewer.layers.selection.active.visible = True
+        viewer.cursor.position = (3, 7, 5)
+        output = io.StringIO()
+        with patch("sys.stdout", output):
+            viewer.mouse_drag_callbacks[0](
+                viewer, SimpleNamespace(type="mouse_press", modifiers=[]))
+        printed = output.getvalue()
+        self.assertIn("global XYZ x=[22, 28], y=[34, 40], z=[1, 3] (1-based), observed_layers=2", printed)
+        self.assertIn("global z=1: x=[22, 26], y=[34, 38] | display z=2: x=[2, 6], y=[4, 8]", printed)
+        self.assertIn("global z=3: x=[24, 28], y=[36, 40] | display z=4: x=[4, 8], y=[6, 10]", printed)
+        self.assertFalse(any(layer.name == "[saved track span]" for layer in viewer.layers))
+
     def test_partial_run_keeps_local_2d_and_ignores_stale_vis_xml(self):
         frame_xml = Path(self.context.frame_xml)
         frame_xml.unlink()
