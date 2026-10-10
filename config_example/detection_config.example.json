@@ -114,7 +114,7 @@
             "max_cell_z_span": 3,
             "max_z_gap": 0,
             "gmm_p_thresh": 0.5,
-            "max_center_dist_ratio": 0.3,
+            "max_center_dist_ratio": 0.35,
             "containment_z_pad": 1
         }
     },
