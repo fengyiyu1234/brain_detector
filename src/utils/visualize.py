@@ -15,8 +15,8 @@ Reads config/vis_config.json and launches napari in one of three modes:
     [s4] colocalization result.
 
   mode: "2d"
-    Channel-aligned images and tile-local 2D boxes.  2d_source selects
-    aligned raw boxes or filtered boxes.  Ctrl+click records false negatives.
+    Images and tile-local 2D boxes from the selected pipeline stage.
+    Only aligned stages apply channel offsets.  Ctrl+click records false negatives.
     Does not load XML or run z-linking.
 
 Usage
@@ -47,7 +47,9 @@ import napari
 from qtpy.QtCore import QTimer
 from qtpy.QtWidgets import QApplication, QMessageBox, QWidget, QGridLayout, QLabel, QSpinBox, QLineEdit
 
+from src.utils.video_export import add_video_export_panel
 from src.config.loader import load_config
+from src.utils.tile_2d import SOURCES_2D, tile_2d_inputs
 from src.utils.io import listTile
 from src.utils.markers import channel_marker, class_markers, split_class
 from src.core.z_linker import run_z_linker
@@ -1710,26 +1712,11 @@ def _load_second_intensity_image(ch, paths, anchor_dir, tile_path, z_range,
 # ── Tile-local 2D view ────────────────────────────────────────────────────────────
 
 def _run_2d(vis_cfg, paths, routing_config, tile_path, tile_name):
-    """Show aligned raw or filtered tile-local detections without XML or z-linking."""
-    source = vis_cfg.get('2d_source', 'raw')
-    if source not in ('raw', 'filtered'):
-        raise ValueError("2d_source must be 'raw' or 'filtered'")
-    csv_dir = os.path.join(paths['pATHRESULT'], {
-        'raw': '3_2d_aligned',
-        'filtered': '4_2d_filtered',
-    }[source])
-    if not os.path.isdir(csv_dir):
-        raise FileNotFoundError(f"2D {source} result directory does not exist: '{csv_dir}'")
-    offset_path = os.path.join(paths['pATHRESULT'], '3_2d_aligned',
-                               f"{tile_name}_offsets.json")
-    if not os.path.isfile(offset_path):
-        raise FileNotFoundError(f"Channel alignment offsets do not exist: '{offset_path}'")
-    offsets = load_offsets(os.path.dirname(offset_path), tile_name)
-    for ch in routing_config:
-        shift = offsets.get(ch['id'])
-        if not isinstance(shift, dict) or not all(k in shift for k in ('dx', 'dy', 'dz')):
-            raise ValueError(f"Offsets '{offset_path}' lack dx/dy/dz for '{ch['id']}'")
-        print(f"[align] {ch['id']}: ({shift['dx']:+d}, {shift['dy']:+d}, {shift['dz']:+d})")
+    """Show a saved 2D pipeline stage with images in the matching frame."""
+    source = vis_cfg.get('2d_source', 'filtered')
+    csv_dir, offsets = tile_2d_inputs(
+        paths['pATHRESULT'], source, tile_name, [ch['id'] for ch in routing_config])
+    print(f"[2d {source}] Reading {csv_dir}")
 
     z_range = _resolve_z_range(vis_cfg, tile_path)
     if z_range[1] <= z_range[0]:
@@ -1822,6 +1809,7 @@ def _run_2d(vis_cfg, paths, routing_config, tile_path, tile_name):
         viewer.mouse_drag_callbacks.append(_on_click)
     _show_only_images_initially(viewer, vis_cfg)
     viewer.reset_view()
+    add_video_export_panel(viewer, vis_cfg)
 
 
 def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
@@ -2146,6 +2134,7 @@ def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
 
     _show_only_images_initially(viewer, vis_cfg)
     viewer.reset_view()
+    add_video_export_panel(viewer, vis_cfg)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -2203,8 +2192,8 @@ def main():
     )
     parser.add_argument('--mode', choices=('2d', 'prealign', 'post'),
                         help='Override mode from vis_config.json')
-    parser.add_argument('--2d-source', dest='source_2d', choices=('raw', 'filtered'),
-                        help='Select aligned raw or filtered 2D detections')
+    parser.add_argument('--2d-source', dest='source_2d', choices=tuple(SOURCES_2D),
+                        help='Select raw, filtered, aligned, or aligned_filtered pipeline outputs')
     parser.add_argument('--direct', action='store_true',
                         help='Use the original command-line tile selection instead of the launcher')
     args = parser.parse_args()
@@ -2240,8 +2229,8 @@ def main():
                           if ch.get('active', True)]
         if not paths.get('pATHRESULT') or not routing_config:
             sys.exit("2d mode requires paths.pATHRESULT and active channels_routing.")
-        if vis_cfg.get('2d_source', 'raw') not in ('raw', 'filtered'):
-            sys.exit("2d_source must be 'raw' or 'filtered'.")
+        if vis_cfg.get('2d_source', 'filtered') not in SOURCES_2D:
+            sys.exit(f"2d_source must be one of {', '.join(SOURCES_2D)}")
         context = None
     elif mode == 'prealign':
         from src.utils.saved_view import saved_run_context

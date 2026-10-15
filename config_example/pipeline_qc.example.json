@@ -1,0 +1,43 @@
+{
+  "seed": 2026,
+  "relational_checks": true,
+  "verify_manifest_hashes": false,
+  "verify_input_files": false,
+  "scratch_dir": null,
+  "review_per_file": 3,
+  "plots": true,
+  "path_mappings": {},
+  "checks": {
+    "detection": true,
+    "filtering": true,
+    "alignment": true,
+    "geometry": true,
+    "global": true,
+    "tracks": true,
+    "coloc": true,
+    "exports": true
+  },
+  "thresholds": {
+    "filter_retention_min": 0.25,
+    "single_layer_fraction_max": 0.8,
+    "span_cap_fraction_max": 0.5,
+    "seam_success_fraction_min": 0.5,
+    "seam_residual_xy_px_max": 5,
+    "seam_residual_z_max": 1,
+    "tf_center_margin": 0.05,
+    "soma_match_margin": 0.03
+  },
+  "samples": [
+    {
+      "id": "sample_A",
+      "enabled": true,
+      "result_dir": "/path/to/sample_A/detection_results",
+      "xml": "/path/to/sample_A/reference_channel/xml_merging.xml"
+    },
+    {
+      "id": "sample_B",
+      "enabled": false,
+      "result_dir": "/path/to/sample_B/detection_results"
+    }
+  ]
+}

@@ -15,6 +15,7 @@ from qtpy.QtWidgets import (
 )
 
 from src.config.loader import load_config
+from src.utils.tile_2d import SOURCES_2D
 
 
 STYLE = """
@@ -297,7 +298,9 @@ class VisualizeLauncher(QMainWindow):
         self.view_space.addItems(['local', 'global'])
         form.addRow('View coordinates', self.view_space)
         self.source_2d = QComboBox()
-        self.source_2d.addItems(['filtered', 'raw'])
+        for key in ('filtered', 'raw', 'aligned', 'aligned_filtered'):
+            directory, label, _ = SOURCES_2D[key]
+            self.source_2d.addItem(f'{label} ? {directory}', key)
         form.addRow('2D source', self.source_2d)
         self.stage = QComboBox()
         self.stage.addItems(['all', 's1', 's3', 's4'])
@@ -476,12 +479,13 @@ class VisualizeLauncher(QMainWindow):
             for widget, key, default in [
                 (self.mode, 'mode', 'prealign'),
                 (self.view_space, 'view_space', 'local'),
-                (self.source_2d, '2d_source', 'filtered'),
                 (self.stage, 'stage', 'all'),
             ]:
                 value = str(self.config.get(key, default))
                 if widget.findText(value) >= 0:
                     widget.setCurrentText(value)
+            source_index = self.source_2d.findData(self.config.get('2d_source', 'filtered'))
+            self.source_2d.setCurrentIndex(max(0, source_index))
             for widget, key in [
                 (self.z_start, 'z_start'), (self.z_count, 'z_count'),
                 (self.global_z_start, 'global_z_start'),
@@ -695,7 +699,7 @@ class VisualizeLauncher(QMainWindow):
     def _read_controls(self):
         self.config['mode'] = self.mode.currentText()
         self.config['view_space'] = self.view_space.currentText()
-        self.config['2d_source'] = self.source_2d.currentText()
+        self.config['2d_source'] = self.source_2d.currentData()
         self.config['stage'] = self.stage.currentText()
         self.config['z_start'] = _nullable_int(self.z_start, 'z_start')
         self.config['z_count'] = _nullable_int(self.z_count, 'z_count')

@@ -7,7 +7,8 @@
     // on the saved final-frame XML axes.
     "view_space": "local",
     "global_z_start": null,
-    // Choose raw or filtered aligned tile detections in 2d mode.
+    // 2d_source: raw=1_2d_raw, filtered=2_2d_filtered (unshifted images).
+    // aligned=3_2d_aligned, aligned_filtered=4_2d_filtered (shifted images).
     "2d_source": "filtered",
     // Set a CSV path to save false-negative annotations.
     "fn_ann_path": null,
@@ -20,6 +21,9 @@
     "z_start": 0,
     // Maximum number of displayed slices.
     "z_count": 50,
+
+    // Defaults for the Napari Video export dock (start/end are set in the viewer).
+    "video_export": {"fps": 10, "output_dir": "exports/videos"},
     // Replace paths to match the detection config and keep frame_channel consistent.
     "samples": {
         "example_sample": {

@@ -1,0 +1,32 @@
+{
+  "mode": "points3d",
+  "coordinate_frame": "Olig2 global frame; XY pixels; Z one-based slices",
+  "predictions": "annotations/predictions.csv",
+  "ground_truth": "annotations/ground_truth.csv",
+  "output_dir": "qc_gt_results",
+  "voxel_size_um": [
+    0.65,
+    0.65,
+    8.0
+  ],
+  "distance_threshold_um": 10,
+  "iou_threshold": 0.5,
+  "class_aware": false,
+  "markers": [
+    "Sox9",
+    "Olig2"
+  ],
+  "max_pairs_per_roi": 2000000,
+  "rois": [
+    {
+      "id": "brainA_roi01",
+      "specimen_id": "brainA",
+      "exhaustive": true
+    },
+    {
+      "id": "brainA_empty01",
+      "specimen_id": "brainA",
+      "exhaustive": true
+    }
+  ]
+}

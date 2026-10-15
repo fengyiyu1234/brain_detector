@@ -12,6 +12,7 @@ import pickle
 import numpy as np
 import napari
 
+from src.utils.video_export import add_video_export_panel
 from src.utils.markers import class_markers
 from src.utils.saved_view import (
     global_to_local_rows, read_global_boxes, read_tile_boxes,
@@ -408,6 +409,7 @@ def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles, progres
                 viewer.dims.ndisplay = 3
             _show_only_images_initially(viewer, vis_cfg)
             viewer.reset_view()
+            add_video_export_panel(viewer, vis_cfg)
             if progress:
                 progress(tile_index, len(selected_tiles), tile_name)
         return
@@ -451,6 +453,7 @@ def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles, progres
         viewer.dims.ndisplay = 3
     _show_only_images_initially(viewer, vis_cfg)
     viewer.reset_view()
+    add_video_export_panel(viewer, vis_cfg)
 
 
 def _load_offsets_if_present(result_dir, tile_name):

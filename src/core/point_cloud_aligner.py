@@ -1154,7 +1154,8 @@ def apply_shift_to_csv(in_csv_path, dx, dy, dz, out_csv_path, slice_names=None,
 def _atomic_to_csv(df, path):
     """先写 .part 再改名：进程中途被杀不会留下半截 CSV 被当成已完成。"""
     tmp = path + '.part'
-    df.to_csv(tmp, index=False)
+    with open(tmp, 'w', encoding='utf-8', newline='', buffering=8 * 1024 * 1024) as handle:
+        df.to_csv(handle, index=False)
     os.replace(tmp, path)
 
 
@@ -1240,6 +1241,30 @@ def tile_alignment_done(tile_name, det_dir, align_dir, routing):
     return True
 
 
+def alignment_sample_window(n_slices, settings):
+    """One-based half-open TIFF window, or None for legacy median sampling.
+
+    An explicit start never moves silently. Fractional starts retain the
+    previous end-clamping behavior for compatibility.
+    """
+    explicit_start = settings.get('sample_z_start_slice')
+    fraction = settings.get('sample_z_start_fraction')
+    if explicit_start is None and fraction is None:
+        return None
+    count = settings.get('sample_z_count', settings.get('sample_z_center_count', 50))
+    if explicit_start is not None:
+        stop = explicit_start + count
+        if stop - 1 > n_slices:
+            raise ValueError(
+                f'Requested alignment images {explicit_start}-{stop - 1}, '
+                f'but tile has only {n_slices} slices')
+        return explicit_start, stop
+    if n_slices < count:
+        raise ValueError(f'Tile has {n_slices} slices, fewer than requested {count}')
+    start = min(int(n_slices * fraction), n_slices - count) + 1
+    return start, start + count
+
+
 def align_tile(tile_path, det_dir, align_dir, routing, settings):
     """
     Stage 2.5 的单 tile 流程：各通道轻量 z-link → 两步对齐 → 写对齐 CSV → 最后写 offsets JSON。
@@ -1253,6 +1278,7 @@ def align_tile(tile_path, det_dir, align_dir, routing, settings):
     slice_names = [os.path.splitext(f)[0] for f in sorted(
         f for f in os.listdir(tile_path)
         if f.lower().endswith(('.tif', '.tiff')) and not f.startswith('.'))]
+    sample_window = alignment_sample_window(len(slice_names), settings)
 
     # 1. 对每个通道轻量 z-link，得到 per-tile 3D vol_list
     measurement_source = settings.get('measured_offsets_source')
@@ -1302,13 +1328,23 @@ def align_tile(tile_path, det_dir, align_dir, routing, settings):
 
         # 2. 估计 tile z 中心；3. 两步体素对齐
         z_center = float(np.median(z_counts)) if z_counts else 0.0
+        if sample_window is not None:
+            z_lo, z_hi = sample_window
+            z_center = (z_lo + z_hi) / 2
+            # Exclude cells starting just after the requested core image window.
+            per_ch_vol_lists = {
+                cid: build_cell_boxes(cells, z_lo, z_hi - 1)
+                for cid, cells in per_ch_vol_lists.items()
+            }
         diagnostics = {}
         shifts, scores = compute_tile_channel_shifts(
             per_ch_vol_lists,
             soma_ch_ids=settings['soma_ch_ids'],
             tf_ch_ids=settings['tf_ch_ids'],
             z_center=z_center,
-            z_half_window=settings['sample_z_center_count'] // 2,
+            z_half_window=(settings['sample_z_center_count'] / 2
+                           if sample_window is not None or 'sample_z_count' in settings
+                           else settings['sample_z_center_count'] // 2),
             bin_size=settings['voxel_bin_size_px'],
             xy_res_um=settings['xy_resolution_um'],
             z_res_um=settings['z_resolution_um'],
@@ -1342,6 +1378,14 @@ def align_tile(tile_path, det_dir, align_dir, routing, settings):
                    for cid, values in shifts.items()},
         'scores': scores,
     }
+    if sample_window is not None:
+        lo, hi = sample_window
+        measurement_payload['sample_window'] = {
+            'z_start': lo, 'z_stop_exclusive': hi, 'count': hi - lo,
+            'total_slices': len(slice_names),
+            'first_slice_name': slice_names[lo - 1],
+            'last_slice_name': slice_names[hi - 2],
+        }
     os.makedirs(align_dir, exist_ok=True)
     measurement_file = os.path.join(
         align_dir, f'{tile_name}_measured_offsets.json')
@@ -1502,6 +1546,25 @@ def resolve_align_settings(config, routing_config):
     pa = config.get('pre_align_params', {})
     dp = config.get('detection_params', {})
     zl = config.get('z_linker', {})
+    sample_count = pa.get('sample_z_count', pa.get('sample_z_center_count', 50))
+    sample_start = pa.get('sample_z_start_slice')
+    sample_fraction = pa.get('sample_z_start_fraction')
+    if ('sample_z_count' in pa and 'sample_z_center_count' in pa
+            and pa['sample_z_count'] != pa['sample_z_center_count']):
+        raise ValueError('sample_z_count and legacy sample_z_center_count disagree')
+    if sample_start is not None:
+        if isinstance(sample_start, bool) or not isinstance(sample_start, int) or sample_start < 1:
+            raise ValueError('sample_z_start_slice must be a positive integer (1-based)')
+        if sample_fraction is not None:
+            raise ValueError('Specify sample_z_start_slice OR sample_z_start_fraction, not both')
+    if sample_fraction is not None:
+        if (isinstance(sample_fraction, bool)
+                or not isinstance(sample_fraction, (int, float))
+                or not np.isfinite(sample_fraction) or not 0 <= sample_fraction < 1):
+            raise ValueError('sample_z_start_fraction must be finite and in [0, 1)')
+    if sample_start is not None or sample_fraction is not None or 'sample_z_count' in pa:
+        if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count < 1:
+            raise ValueError('sample_z_count must be a positive integer')
     soma_ids = [ch['id'] for ch in routing_config if ch.get('type', 'soma') == 'soma']
     tf_ids   = [ch['id'] for ch in routing_config if ch.get('type') == 'tf']
 
@@ -1551,7 +1614,10 @@ def resolve_align_settings(config, routing_config):
         'soma_ch_ids': sorted(soma_ids, key=lambda c: c != ref),
         'tf_ch_ids': tf_ids,
         'z_link': {'soma': _z_link(zl.get('soma', {})), 'tf': _z_link(zl_tf)},
-        'sample_z_center_count': pa.get('sample_z_center_count', 50),
+        'sample_z_center_count': sample_count,
+        **({'sample_z_count': sample_count} if 'sample_z_count' in pa else {}),
+        **({'sample_z_start_slice': sample_start} if sample_start is not None else {}),
+        **({'sample_z_start_fraction': sample_fraction} if sample_fraction is not None else {}),
         'voxel_bin_size_px': pa.get('voxel_bin_size_px', 4),
         'xy_search_range_px': pa.get('xy_search_range_px', 30),
         'z_search_range_slices': pa.get('z_search_range_slices', 5),

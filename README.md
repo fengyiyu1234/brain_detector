@@ -9,14 +9,14 @@ In `pre_align`, set `tile_position_params.enabled: true` to solve global tile po
 1. Copy [`config_example/detection_config.example.json`](config_example/detection_config.example.json) to `config/config.json` and [`config_example/visualization_config.example.json`](config_example/visualization_config.example.json) to `config/vis_config.json`.
 2. Replace the example image, model, and result paths. `config/` is local and ignored by Git; the files in `config_example/` are generic templates. Configuration files accept `//` comments.
 3. Set `pipeline_mode: "pre_align"` and `tile_position_params.enabled: true` to solve tile positions from detections. Set `stop_before_stitching: true` to stop after the XMLs are written, before Stage 3.
-4. Run detection and inspect the aligned tile results:
+4. Run detection and inspect the filtered tile results:
 
 ```bash
 python scripts/run_inference.py --config config/config.json
 python src/utils/visualize.py --config config/vis_config.json --mode 2d --2d-source filtered
 ```
 
-The viewer's `2d` mode reads `4_2d_filtered/` and shifts the displayed raw images into the same tile-local frame. It does not load XML.
+The viewer's `2d` mode with `--2d-source filtered` reads `2_2d_filtered/` with unshifted images. Use `--2d-source aligned_filtered` to read `4_2d_filtered/` with saved channel shifts. It does not load XML.
 
 The expected image layout is a channel directory containing row directories and tile directories, for example `<channel>/305500/305500_319100/*.tif`. Active channel IDs, their types, models, and directory keys are defined in `channels_routing`.
 
@@ -142,8 +142,40 @@ removing fields; click **Apply JSON** before selecting tiles after changing a
 sample path. **Save config as** writes a new JSON file; opening a viewer uses
 a temporary config and leaves the source config untouched.
 
+For presentation videos, use the **Video export** dock in any viewer mode.
+Switch to 2D XY view, choose visible image channels and detection layers, and
+adjust contrast and zoom. Set **Start slice**, **End slice (inclusive)**,
+**Slice step** (1 includes every slice), and **Frames / second**, then click
+**Export video...** to save MP4 (or AVI if the MP4 encoder is unavailable).
+Indices match the zero-based Napari Z slider; they are relative to its loaded
+range, while the optional video label shows the displayed world Z coordinate.
+For 50 loaded slices, export 0 through 49 at 10 FPS for a five-second movie.
+Reverse sweeps are supported by setting start greater than end.
+Only the canvas is recorded, preserving visible channels, detection boxes,
+colors, contrast, and zoom. Export once with boxes hidden for raw cells, then
+again with result layers visible for a matching detection movie. Keep the
+view and window size unchanged during export. **Cancel** discards the partial
+movie; completion/cancellation restores the original slice. Existing files
+are replaced only after a successful export. Resolution follows the canvas
+size. Optional config defaults: `"video_export": {"fps": 10,
+"output_dir": "exports/videos"}` (paths relative to the working directory).
+
 `src/utils/visualize.py` reads `config/vis_config.json` by default. In
-`2d` mode, **2D source** chooses one raw or filtered detection set. In
+`2d` mode, **2D source** selects the saved pipeline output explicitly:
+
+| Source | Saved directory | Image placement |
+| --- | --- | --- |
+| `raw` | `1_2d_raw` | Unshifted |
+| `filtered` | `2_2d_filtered` | Unshifted |
+| `aligned` | `3_2d_aligned` | Saved channel offsets |
+| `aligned_filtered` | `4_2d_filtered` | Saved channel offsets |
+
+`raw` and `filtered` work before alignment and do not require offsets.
+These source names now follow the numbered pipeline stages: old configs using
+`raw` for Stage 3 or `filtered` for Stage 4 should use `aligned` or
+`aligned_filtered` respectively. The viewer reads saved CSVs each time it opens;
+refiltering Stage 2 does not refresh existing Stage 3 or Stage 4 outputs.
+ In
 `prealign` mode, the raw and filtered 2D checkboxes independently control
 additional overlays and can both be enabled. The launcher shows these controls
 only in their applicable modes. To use the original command-line flow, add
@@ -227,6 +259,124 @@ Manifests are completion markers with input signatures and output SHA256 hashes.
 
     python src/utils/visualize.py --config config/vis_config.json --mode prealign
 
+## Channel alignment sensitivity evaluation
+
+The T70 settings are also versioned in `config_example/align_validation.example.json`;
+copy that file to `config/EGFR/2/align_validation_t70.json` on a fresh checkout.
+
+Reuse saved detections and offsets; this command runs on CPU and does not rerun
+inference or alignment:
+
+```bash
+python src/utils/validate_align_shifts.py \
+  --sample /rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/T70/detection_results3 \
+  --eval-config config/EGFR/2/align_validation_t70.json
+```
+
+Pass the actual results directory explicitly (`detection_results2`,
+`detection_results3`, etc.). The script prefers its `runtime_config.json` and
+`3_2d_aligned/_align_settings.json`; `--config` supplies the original inference
+config only when the runtime config is missing. Original TIFF directories are
+only needed for legacy results without `1_2d_raw/*_inputs.json` slice manifests.
+On another machine, the fallback also checks the sibling channel folder
+(e.g. `<sample>/640nm`). Missing/unprocessed slices are excluded; Z-downsampled
+detections are rejected.
+
+The T70 evaluation config selects 10 random eligible tiles, one 80 µm Z window
+per tile (10 slices at 8 µm spacing), and the full common valid XY interior.
+Each channel receives its saved final offset; GFP is only the fixed channel
+for the three pairwise comparisons. X/Y scans span ±30 px in 2 px steps;
+Z spans ±5 slices in single-slice steps. All source detections are available
+before cropping, so cells can enter the fixed window during a shift.
+The common interior excludes image boundaries that would lack real source
+data for any scan point or the unaligned baseline; exact bounds are saved.
+
+Use the same config for every Z window length: set
+`sampling.z_size_slices` to the number of slices (10 = 80 um, 30 = 240 um
+at 8 um spacing). The example exposes this parameter directly; no separate
+center/240 um config is needed.
+
+For all completed tiles with a central 30-slice window, edit that same config:
+
+```json
+{
+  "sampling": {
+    "tile_selection": "all",
+    "z_selection": "center",
+    "z_size_slices": 30,
+    "regions_per_tile": 1,
+    "held_out": false,
+    "min_cells": 0
+  }
+}
+```
+
+This is a partial settings example; retain the remaining fields in the config.
+The center is determined from common valid image-slice support after allowing
+for offsets, the whole scan, and the unaligned baseline. Windows are not moved
+to find stronger signal. Sparse and empty tiles are kept; both-empty IoU is
+undefined, while one-empty IoU is zero. Central sampling may overlap the data
+used to solve offsets, so it measures sensitivity rather than independent
+held-out accuracy. For held-out evaluation, keep `z_selection="random"`
+and `held_out=true`.
+
+Set `output.dir` to a different name when retaining results from another
+sampling setup. Per-tile checkpoints under `tile_curves/` and `progress.json`
+are written as tiles finish. Aggregated curves report both `n_tiles` and
+`n_defined_tiles`.
+
+Set `output.per_tile_plots=true` to also save each tile's channel-by-axis
+PNG/PDF under `tile_plots/`; `tile_plots/index.csv` maps tiles to images.
+Replot existing tables without repeating the analysis:
+
+```bash
+python src/utils/validate_align_shifts.py \
+  --sample /rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/T70/detection_results3 \
+  --eval-config config/EGFR/2/align_validation_t70.json \
+  --plot-only --per-tile-plots
+```
+
+The unaligned baseline applies GFP's saved offset to both raw channels,
+preserving their original relative positions in the final evaluation frame.
+The main metric is binary occupancy IoU of z-linked detection boxes using
+the alignment rasterizer, including inferred Z extent for single-slice cells.
+It is not an image-intensity or instance-segmentation metric. TF containment
+is retained as an auxiliary metric in the per-tile summary. Sox9/Olig2 were
+optimized with joint references, so their pairwise IoU peak need not be at zero.
+
+Edit `sampling.z_size_slices`, sample size, scan ranges, channels, or output
+formats in the evaluation JSON. CLI options override the JSON, for example
+`--z-size 30 --n-tiles 5 --workers 2`. For physical-depth input, set
+`z_size_slices=null` and provide `z_depth_um`, or use `--z-depth-um 160`.
+A non-null `z_size_slices` takes precedence over JSON `z_depth_um`; the CLI
+`--z-depth-um` clears that slice override. `--xy-size` selects a smaller square crop. `--no-plots` saves
+all tables without importing matplotlib.
+
+By default the complete inverse-mapped scan/baseline source windows must lie
+outside the solver's raw Z window plus a cell-span guard and inferred-volume padding. Ineligible tiles are
+replaced in deterministic random order. If 10 eligible tiles cannot be found,
+partial tables and the sampling manifest are saved and the command exits with
+an error. Set `sampling.held_out=false` for in-window sensitivity evaluation,
+or explicitly set `insufficient_depth_policy="allow_in_window"` to permit a
+marked fallback. No fallback occurs silently.
+
+Outputs default to `<results>/alignment_validation/`:
+
+- `sampling.json`: resolved settings, candidate/selected tiles, rejected reasons,
+  exact windows, processed-slice sources and completion status.
+- `<sample>_curves.csv`: per-window intersection, union, IoU, baseline and offsets.
+- `<sample>_pooled_curves.csv`: sum(intersection)/sum(union), equal-tile mean and SD.
+- `<sample>_summary.csv`, `<sample>_pooled_summary.csv`: aligned/unaligned values,
+  absolute and relative improvement, peak location and half-widths.
+- `<sample>_alignment_sensitivity.png/pdf`: channel rows × X/Y/Z columns;
+  thin tile curves, thick pooled curve, zero marker and unaligned baseline.
+
+Relative improvement is a fraction (1 means 100%) and is undefined for a zero
+baseline. Empty-union IoU is undefined. Pooled IoU describes the sampled tile
+windows; overlapping tiles are not deduplicated into a whole-brain estimate.
+Tables are saved before plotting so they remain available if matplotlib fails.
+
+
 ## Code map
 
 - [`scripts/run_inference.py`](scripts/run_inference.py): pipeline orchestration, checkpoints, and global frame selection.
@@ -241,3 +391,21 @@ Manifests are completion markers with input signatures and output SHA256 hashes.
 - [`src/utils/visualize.py`](src/utils/visualize.py): napari tile viewer.
 
 Legacy `post_align` and XML comparison tools remain in the repository for older datasets. The workflow above describes the current `pre_align` path and its checked-in integration limits.
+
+
+## Saved-output pipeline QC
+
+Run the standalone QC without loading models or rebuilding checkpoints:
+
+```bash
+python src/utils/pipeline_qc.py --config config/qc_config.json --samples T4 T70
+```
+
+Copy [the generic config](config_example/pipeline_qc.example.json) for other samples.
+QC reads each result's saved runtime settings, checks detection/filter/stitch/track/source/export
+integrity, and writes JSON, Markdown, CSV, and SVG reports under the result's pipeline_qc directory.
+The global_qc.py entry point also accepts this config and retains its old single-sample CLI.
+Independent annotated ROI evaluation is available in compare_qc_gt.py with
+[its config template](config_example/qc_ground_truth.example.json).
+See [QC usage and publication validation](docs/pipeline_qc.md) for scope, GT formats,
+path mappings, thresholds, and independent test-set design.

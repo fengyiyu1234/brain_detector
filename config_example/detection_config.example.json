@@ -81,6 +81,10 @@
         // Reference used to measure channel shifts.
         "reference_channel": "GFP",
         "tf_align_mode": "sequential_joint",
+        // Optional fixed window: 1-based position in sorted TIFF sequence.
+        // "sample_z_start_slice": 501,
+        // "sample_z_count": 100, // Replace sample_z_center_count when using this.
+        // Without a fixed start, sampling remains centered on the detected cells.
         "sample_z_center_count": 50,
         "voxel_bin_size_px": 4,
         "xy_search_range_px": 30,

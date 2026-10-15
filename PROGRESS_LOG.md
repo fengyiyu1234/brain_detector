@@ -766,3 +766,62 @@ Olig2 逐 tile 包含数中位数 54 → 122。
 - Stage 4 applies Sox9 and Olig2 containment independently to the same merged soma geometry. The marker order does not change final cell labels. `coloc_result.csv` now exposes merged 3D center/bounds, `bounds_method`, soma/TF positive channel lists and counts, and negative/single/double/multi positivity status. Its legacy XY box is the union projection for multi-soma matches.
 - The Stage 4 code hash invalidates an earlier Stage 4 manifest and rebuilds these outputs from saved Stage 3 tracks; saved raw detections or alignment shifts do not need to be recomputed for this code change. Status is defined at the soma level; two TF assignments do not by themselves prove both markers occupy one nucleus.
 - Verification: the full test suite passed 78 tests after the core change; after the viewer label and source-trace test, the focused colocalization suite passed 6 tests and saved-viewer suite passed 16 tests. `git diff --check` reported no whitespace errors. T70 data were not rerun.
+
+---
+
+## 2026-10-12 Channel alignment quality check: offset sensitivity and per-tile plots
+
+Recorded the completed T70 evaluation and the quality-check feature added during the preceding session.
+
+### Implementation and decisions
+
+- Extended `src/utils/validate_align_shifts.py` to quantify saved channel offsets by additional positive/negative X, Y and Z translations. It reuses filtered detections and saved offsets on CPU; it does not rerun inference or optimize/replace the offsets.
+- Coordinates remain in the saved final offset frame (Olig2 for T70). GFP is the fixed channel for three pairwise comparisons: GFP/RFP, GFP/Sox9 and GFP/Olig2. Plot coordinate zero means the saved alignment plus zero additional translation.
+- Metric: binary 3D occupancy IoU of z-linked detection boxes, including the alignment rasterizer's inferred Z extent for single-slice cells. This is detection-box IoU, not raw-image intensity or segmentation-mask IoU. Pooled IoU is sum(intersection) / sum(union); equal-tile mean and SD are also exported.
+- The unaligned baseline applies GFP's saved offset to both raw channels, preserving their original relative displacement while evaluating the same ROI. All shifts and the baseline use one common valid XY/Z footprint; cells outside the ROI can move into it during a scan.
+- Retained the original random-tile, random-window held-out mode. Added `sampling.tile_selection="all"` and `sampling.z_selection="center"` for all completed alignment tiles with one center window each. The center is calculated from actual common image-slice support with offset/scan/baseline margins, independently of detection density. Processed-slice manifests are preferred; legacy T70 results use original TIFF filename indices.
+- Center sampling requires `held_out=false` and one region per tile. For this run, `min_cells=0` retains sparse/empty tiles rather than selecting stronger signal or replacing tiles. Both-empty union gives undefined IoU (NaN); one-empty occupancy gives IoU zero. Aggregate curves record both `n_tiles` and per-shift `n_defined_tiles`.
+- All-tile evaluation uses dynamically scheduled worker jobs and writes each completed tile's CSV into `tile_curves/`, plus `progress.json`. Final tables and `sampling.json` record exact windows, offsets, settings, source support, eligibility and completion. Per-tile checkpoint CSVs provide intermediate results; automatic resume from these evaluation checkpoints is not implemented.
+- Added `output.per_tile_plots=true` / `--per-tile-plots`: one 3 x 3 figure per tile, with channel rows and X/Y/Z columns, in PNG/PDF. Each plot uses that tile's own unaligned baseline, saved-alignment line, scanned maximum and exact Z bounds. Empty panels explicitly state that IoU is undefined and retain the actual scan-axis range. `tile_plots/index.csv` maps tiles to figure files.
+- Added `--plot-only` to render existing scan tables without loading detections or recomputing IoU. Figure captions explain red curves/points, gray individual-tile curves in the overview, orange unaligned baselines, blue zero-shift lines and black scanned maxima. Lines connect evaluated points; there is no fitted curve. Panels use independent Y scales.
+
+### T70 results2 run and outputs
+
+- Config: `config/EGFR/2/align_validation_t70_all_center240.json`; versioned template: `config_example/align_validation_all_center240.example.json`. The earlier random-window template remains `config_example/align_validation.example.json`.
+- Included all 45 completed tiles, one central 30-slice window per tile: 240 um at 8 um Z spacing. XY resolution is 0.65 um/px; occupancy bins are 4 px. X/Y scan +/-30 px at 2 px steps; Z scan +/-5 slices at 1-slice steps. Eight CPU workers were used.
+- All 45 tiles completed with no exclusions: 9,855 per-tile scan records and 219 pooled scan points. Zero-additional-shift IoU is defined for 39 tiles per channel; six retained tiles have both-empty center occupancy.
+- Current output directory: `Y:/Fengyi/EGFR_brain/T70/detection_results2/alignment_validation2_center240/`. It was renamed from the earlier `alignment_validation_all_center240`; the evaluation config now uses the current name. The earlier 10-tile/80-um output remains in `detection_results2/alignment_validation/`.
+
+| Pair | Unaligned pooled IoU | Aligned pooled IoU | Relative improvement |
+|---|---:|---:|---:|
+| GFP/RFP | 0.098748 | 0.205529 | 108.14% |
+| GFP/Sox9 | 0.089713 | 0.100421 | 11.94% |
+| GFP/Olig2 | 0.067794 | 0.074102 | 9.31% |
+
+- Artifacts: `T70_alignment_sensitivity.png/pdf`, `T70_curves.csv`, `T70_pooled_curves.csv`, `T70_summary.csv`, `T70_pooled_summary.csv`, `sampling.json`, `analysis_notes.md`, per-tile checkpoint CSVs, and 45 PNG plus 45 PDF figures under `tile_plots/`.
+- Empty-at-zero tiles: `305500_353000`, `305500_364300`, `316800_364300`, `384700_364300`, `396000_319100`, `396000_364300`.
+
+Reproduce the analysis on HPC (CPU only):
+
+```bash
+python src/utils/validate_align_shifts.py \
+  --sample /rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/T70/detection_results2 \
+  --eval-config config/EGFR/2/align_validation_t70_all_center240.json
+```
+
+Regenerate the overview and all per-tile figures from saved measurements:
+
+```bash
+python src/utils/validate_align_shifts.py \
+  --sample /rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/T70/detection_results2 \
+  --eval-config config/EGFR/2/align_validation_t70_all_center240.json \
+  --plot-only --per-tile-plots
+```
+
+### Interpretation, verification and remaining work
+
+- A nonzero IoU peak alone does not establish an alignment error. The plotted image-center 30-slice region can differ from the solver's detection-centered approximately 50-slice region. In sequential-joint alignment, Sox9 optimizes soma containment against the GFP/RFP collection, while Olig2 also uses fixed Sox9 spatial support; neither directly optimizes the plotted pairwise GFP IoU.
+- For the 39 nonempty tiles, median relative extra IoU gains from zero to each tile's scanned X/Y peak were RFP 0.32%/0%, Sox9 0.66%/0.71%, and Olig2 1.25%/1.01%. Most nonzero peak shifts therefore reflect a shallow local IoU landscape. Larger deviations worth investigating include Sox9 X on `305500_341700` (-15.6 um, about 15% extra IoU) and Olig2 Y on `328100_364300` (+9.1 um, about 17.3% extra IoU).
+- Center windows may overlap solver data, so this run is a sensitivity evaluation rather than independent held-out validation. Tile overlaps are not deduplicated into a whole-brain estimate. The active T70 job `scripts/logs/lsf_t70_360749.out` explicitly reused old offsets rather than rerunning alignment; current solver code does not by itself establish the exact historical implementation that generated those offsets.
+- Verification completed during implementation: 19 focused regression tests passed (`tests.test_validate_align_shifts`, `tests.test_alignment_frames`); a separate smoke run verified serial/parallel equality and PNG/PDF rendering. All 45 real-data center windows were independently checked against source slice counts and saved offset/scan margins. Checked final table sizes, all 45 PNG/PDF pairs, the tile index, representative populated/empty plots, and `git diff --check`.
+- Next diagnostic, not yet implemented or run: repeat sensitivity scans in each tile's original solver Z window using its actual optimization target (RFP IoU, Sox9 containment, Olig2 joint score), then inspect clear nonzero improvements and boundary peaks. Do not automatically replace saved offsets with peaks from the current pairwise-IoU plots.

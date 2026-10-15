@@ -1,0 +1,56 @@
+{
+  "comparison": {
+    "fixed_channel": "GFP",
+    "moving_channels": [
+      "RFP",
+      "Sox9",
+      "Olig2"
+    ],
+    "coordinate_frame": "saved_offsets",
+    "include_unaligned_baseline": true
+  },
+  "sampling": {
+    "tile_selection": "random",
+    "n_tiles": 10,
+    "seed": 42,
+    "regions_per_tile": 1,
+    "xy_mode": "full_tile",
+    "z_selection": "random",
+    "z_size_slices": 10,
+    "held_out": true,
+    "insufficient_depth_policy": "replace_tile",
+    "z_guard_slices": null,
+    "min_cells": 15,
+    "max_attempts": 50
+  },
+  "sweep": {
+    "x": {
+      "range_px": 8,
+      "step_px": 1
+    },
+    "y": {
+      "range_px": 8,
+      "step_px": 1
+    },
+    "z": {
+      "range_slices": 2,
+      "step_slices": 1
+    }
+  },
+  "metric": {
+    "type": "voxel_iou",
+    "xy_bin_size_px": 1,
+    "aggregation": "pooled"
+  },
+  "output": {
+    "dir": "alignment_qc_local_contrast",
+    "plot_units": "um",
+    "formats": [
+      "png",
+      "pdf"
+    ],
+    "show_tile_curves": true,
+    "per_tile_plots": false
+  },
+  "workers": 4
+}
