@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 
-from src.core.provenance import file_sha256
+from src.core.provenance import file_sha256, file_stamp, output_manifest_valid, write_output_manifest, content_signature
 
 
 def _file_hashes(paths):
@@ -144,7 +144,7 @@ def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir
     output_stamps = {path: _stamp(path) for path in outputs} if all(
         os.path.isfile(path) for path in outputs) else None
     input_hashes = _file_hashes(files)
-    output_hashes = _file_hashes(outputs) if output_stamps else None
+    output_hashes = _file_hashes(outputs)
     hashes_match = (not previous or not previous.get('hashes') or
                     previous['hashes'].get('inputs') == input_hashes and
                     previous['hashes'].get('outputs') == output_hashes)
@@ -173,14 +173,24 @@ def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir
                 _canonical_manifest(previous.get('outputs'), script, xml_script) ==
                 _canonical_manifest(output_stamps, script, xml_script)):
             return frame_xml, False
+    solver_manifest = os.path.join(report_dir, '_solver_manifest.json')
+    solver_signature = {
+        'reference_channel': ref, 'frame_channel': frame,
+        'options': params.get('options') or {},
+        'geometry_config': {key: value for key, value in signature['geometry_config'].items() if key != 'paths'},
+        'inputs': {os.path.basename(path): file_stamp(path, with_hash=True)
+                   for path in files if os.path.isfile(path) and path != xml_script},
+        'image_tiles': {ch['id']: list(tile_names) for ch in routing},
+    }
     positions_reusable = bool(previous) and solver_hashes_match and all(
-        os.path.isfile(path) and previous.get('outputs', {}).get(path) == _stamp(path)
+        os.path.isfile(path) and previous.get('hashes', {}).get('outputs', {}).get(path) == file_sha256(path)
         for path in outputs[:2])
-    solver_unchanged = (positions_reusable and isinstance(previous.get('signature'), dict) and
-                        _solver_signature(previous['signature'], xml_script) ==
-                        _solver_signature(signature, xml_script))
+    solver_unchanged = output_manifest_valid(solver_manifest, solver_signature) or (
+        positions_reusable and isinstance(previous.get('signature'), dict) and
+        _solver_signature(previous['signature'], xml_script) == _solver_signature(signature, xml_script))
     if solver_unchanged:
         # A changed XML destination or serialization does not change tile geometry.
+        write_output_manifest(solver_manifest, outputs[:2], solver_signature)
         subprocess.run(xml_command, check=True)
     else:
         global_dirs = ('5_2d_global', '6_3d_global', '7_colocalization')
@@ -192,6 +202,7 @@ def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir
         subprocess.run(command, check=True)
         if not os.path.isfile(position_csv):
             raise RuntimeError(f"Tile solver finished without positions CSV: {position_csv}")
+        write_output_manifest(solver_manifest, outputs[:2], solver_signature)
         subprocess.run(xml_command, check=True)
     if not all(os.path.isfile(path) for path in outputs):
         raise RuntimeError("Tile solver/XML generator finished without all expected outputs")

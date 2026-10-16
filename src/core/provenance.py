@@ -82,22 +82,60 @@ def write_output_manifest(path, outputs, input_signature, metadata=None):
     atomic_json(path, payload)
 
 
-def output_manifest_valid(path, input_signature):
-    """Reject missing, modified, or truncated members of a completed group."""
-    try:
-        with open(path, encoding="utf-8") as handle:
-            payload = json.load(handle)
-        if (payload.get("schema_version") != PROVENANCE_SCHEMA_VERSION
-                or payload.get("input_signature") != input_signature):
+def content_signature(value):
+    """Compare content, not mount points or timestamps, when a hash is available."""
+    if isinstance(value, (list, tuple)):
+        return [content_signature(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if 'sha256' in value and 'size' in value:
+        return {'sha256': value['sha256'], 'size': value['size']}
+    result = {key: content_signature(item) for key, item in value.items()}
+    # A filter checkpoint belongs to one channel. Older manifests embedded all
+    # channels in filter_settings; those unrelated parameters are not dependencies.
+    if result.get('stage') in ('pre_align_filter', 'final_filter'):
+        settings = dict(result.get('filter_settings', {}))
+        settings.pop('params', None)
+        result['filter_settings'] = settings
+    # File collections use stable result-relative names across Windows and HPC.
+    return {(key.replace('\\', '/').rsplit('/', 1)[-1]
+             if isinstance(item, dict) and 'sha256' in item and 'size' in item
+             else key): item for key, item in result.items()}
+
+
+def manifest_output_path(manifest, name):
+    """Map an output to this run, preserving sibling stages and subdirectories."""
+    parent = Path(manifest).parent
+    parts = name.replace('\\', '/').split('/')
+    if parent.name in parts:
+        # Use the last occurrence; a mount ancestor may share the stage's name.
+        index = len(parts) - 1 - parts[::-1].index(parent.name)
+        return parent.joinpath(*parts[index + 1:])
+    if len(parts) >= 2:
+        return parent.parent / parts[-2] / parts[-1]
+    return parent / parts[-1]
+
+
+def manifest_outputs_valid(path, payload):
+    """Resolve relocated outputs relative to their manifest, never to another run."""
+    if not payload.get('outputs'):
+        return False
+    for name, stamp in payload['outputs'].items():
+        actual = manifest_output_path(path, name)
+        if (not actual.is_file() or actual.stat().st_size != stamp['size']
+                or file_sha256(actual) != stamp['sha256']):
             return False
-        for name, stamp in payload["outputs"].items():
-            if not os.path.isfile(name):
-                return False
-            if os.path.getsize(name) != stamp["size"]:
-                return False
-            if file_sha256(name) != stamp["sha256"]:
-                return False
-        return True
+    return True
+
+
+def output_manifest_valid(path, input_signature):
+    """Reject incomplete groups; allow identical content on a different mount."""
+    try:
+        with open(path, encoding='utf-8') as handle:
+            payload = json.load(handle)
+        return (payload.get('schema_version') == PROVENANCE_SCHEMA_VERSION
+                and content_signature(payload.get('input_signature')) == content_signature(input_signature)
+                and manifest_outputs_valid(path, payload))
     except (OSError, ValueError, KeyError, TypeError):
         return False
 

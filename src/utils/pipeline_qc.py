@@ -373,7 +373,8 @@ class PipelineQC:
             if tile not in self.positions:
                 self.finding("global", "FAIL", "tile_absent_in_xml", tile)
                 continue
-            path = self.result / "4_2d_filtered" / f"{tile}_{cid}_result.csv"
+            from src.core.resume import saved_channel_directory
+            path = Path(saved_channel_directory(self.result, self.channels[cid], self.config)) / f"{tile}_{cid}_result.csv"
             for row in self.rows(path, BOX | {"detection_id"}, "global"):
                 z = integer(row["z"]) - self.positions[tile][2]
                 if len(self.positions) == 1 or 1 <= z <= self.canvas["depth"]:

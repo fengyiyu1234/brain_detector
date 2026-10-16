@@ -5,7 +5,6 @@ import csv
 import json
 import os
 from pathlib import Path
-import shutil
 import sys
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
@@ -24,6 +23,7 @@ import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 from src.config.loader import load_config, expand_double_exposure_channels
 from src.core.result_layout import migrate_result_layout, result_paths
+from src.core.resume import (channel_sources, downstream_directory, resume_config, raw_detection_settings)
 from src.utils.logger import setup_logging
 from src.utils.io import (listTile, listTile_from_local_csvs, loadTeraxml,
                           save_run_metadata, compute_grid_fallback_offsets)
@@ -94,7 +94,7 @@ def run_stage3_channel_pool(routing, n_workers, src_dir, global_2d_dir, channel_
                             geom, zl_params, log_dir):
     """Run global 2D stitching and Z-Link for each channel; return results by channel ID."""
     def _args(ch):
-        return (ch, src_dir, global_2d_dir, channel_3d_dir, geom,
+        return (ch, src_dir[ch['id']] if isinstance(src_dir, dict) else src_dir, global_2d_dir, channel_3d_dir, geom,
                 zl_params['soma' if ch.get('type', 'soma') == 'soma' else 'tf'])
 
     logging.info(f"阶段 3: {len(routing)} 个通道的拼接 + Z-Link，{n_workers} 个进程并行")
@@ -187,11 +187,6 @@ def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filter
             project_root, 'src', 'core', 'detection_filter.py')),
     }
     settings_file = os.path.join(filtered_dir, "_filter_settings.json")
-    try:
-        with open(settings_file, encoding="utf-8") as handle:
-            same_settings = json.load(handle) == filter_signature
-    except (OSError, ValueError):
-        same_settings = False
     missing = [os.path.join(raw_dir, f"{tile}_{ch['id']}_result.csv")
                for tile, ch in jobs
                if not os.path.isfile(os.path.join(raw_dir, f"{tile}_{ch['id']}_result.csv"))]
@@ -211,8 +206,11 @@ def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filter
             source, {'stage': 'pre_align_filter',
                      'params': params_by_channel[ch['id']],
                      'filter_settings': filter_signature})
-        if (same_settings and output_manifest_valid(manifest_path, signature)):
+        if output_manifest_valid(manifest_path, signature):
             continue
+        if os.path.isfile(target) and any((Path(filtered_dir).parent / '3_2d_aligned').glob(f'{tile}_*_result.csv')):
+            raise ValueError(f'Filtered checkpoint conflicts with saved alignment: {target}. '
+                             'Archive affected alignment/downstream results before refiltering.')
         params = params_by_channel[ch['id']]
         raw = provenance_columns(pd.read_csv(source), tile, ch['id'])
         filtered, stats, rejected = filter_detection_df(
@@ -241,17 +239,19 @@ def validate_reused_provenance(previous, current, derived, model_hashes):
     if not (has_raw or has_tracks):
         return
     if previous is None:
-        raise ValueError("Existing checkpoints lack runtime_config.json provenance")
+        logging.warning("Adopting legacy checkpoints with current configuration.")
+        return
     if has_raw:
-        keys = ('models', 'model_classes', 'channels_routing', 'pipeline_mode')
+        keys = ('models', 'model_classes', 'pipeline_mode')
         changed = [key for key in keys if previous.get(key) != current.get(key)]
-        old_detection = dict(previous.get('detection_params') or {})
-        new_detection = dict(current.get('detection_params') or {})
-        for transient in ('generate_histograms', 'sTARTID', 'eNDID'):
-            old_detection.pop(transient, None)
-            new_detection.pop(transient, None)
-        if old_detection != new_detection:
-            changed.append('detection_params')
+        def detection_routing(cfg):
+            active = [ch for ch in cfg.get('channels_routing', []) if ch.get('active', True)]
+            return [{k: ch.get(k) for k in ('id', 'model', 'type', 'dir_key')}
+                    for ch in expand_double_exposure_channels(active)]
+        if detection_routing(previous) != detection_routing(current):
+            changed.append('detection channel routing')
+        if raw_detection_settings(previous) != raw_detection_settings(current):
+            changed.append('detection_params (inference only)')
         old_hashes = (previous.get('provenance') or {}).get('model_sha256')
         def content_only(fingerprints):
             return {name: {key: value for key, value in record.items()
@@ -278,7 +278,7 @@ def validate_global_checkpoints(derived, tile_names, routing):
         cid = ch['id']
         source_times = [
             os.path.getmtime(os.path.join(
-                derived['pATH_DET_FILTERED'], f"{tile}_{cid}_result.csv"))
+                downstream_directory(derived, ch), f"{tile}_{cid}_result.csv"))
             for tile in tile_names
         ]
         newest = max(source_times, default=0)
@@ -314,9 +314,9 @@ def stage4_input_signature(derived, routing, config, geometry_source=None):
         },
         "filtered_inputs": {
             ch["id"]: {
-                name: file_stamp(os.path.join(derived["pATH_DET_FILTERED"], name),
+                name: file_stamp(os.path.join(downstream_directory(derived, ch), name),
                                  with_hash=True)
-                for name in sorted(os.listdir(derived["pATH_DET_FILTERED"]))
+                for name in sorted(os.listdir(downstream_directory(derived, ch)))
                 if name.endswith(f"_{ch['id']}_result.csv")
             }
             for ch in routing if ch.get("active", True)
@@ -425,7 +425,7 @@ if __name__ == '__main__':
         raise ValueError("❌ 配置文件中缺失 pATHRESULT 输出根目录！")
         
     pipeline_mode = config.get('pipeline_mode', 'post_align')  # "post_align" | "pre_align"
-    start_from_stage = config.get('start_from_stage', 1)
+    config.pop('start_from_stage', None)  # obsolete; all runs resume automatically
     pre_align_cfg = config.get('pre_align_params', {})
     tile_position_cfg = config.get('tile_position_params', {})
     solve_tile_positions = pipeline_mode == 'pre_align' and tile_position_cfg.get('enabled', False)
@@ -442,6 +442,10 @@ if __name__ == '__main__':
     # Create all required directories.
     os.makedirs(base_res_path, exist_ok=True)
     for p_key, p_path in derived.items():
+        if p_key == 'pATH_DET_FILTERED' and pipeline_mode == 'pre_align' and not any(ch.get('double_exposure') for ch in config['channels_routing'] if ch.get('active', True)):
+            continue
+        if p_key == 'pATH_DET_FUSED' and not any(ch.get('double_exposure') for ch in config['channels_routing'] if ch.get('active', True)):
+            continue
         if not p_path.lower().endswith(('.txt', '.csv')):
             os.makedirs(p_path, exist_ok=True)
 
@@ -479,49 +483,38 @@ if __name__ == '__main__':
     detect_routing_config = expand_double_exposure_channels(routing_config)
     config['channels_routing_detect'] = detect_routing_config
 
-    if start_from_stage < 2:
-        logging.info("=== 多通道路径检查 ===")
-        for ch in detect_routing_config:
-            d_path = paths.get(ch['dir_key'])
-            if not d_path or not os.path.exists(d_path):
-                raise FileNotFoundError(f"❌ 通道 {ch['id']} 路径不存在: {d_path}")
-            logging.info(f"[{ch['type'].upper()}] {ch['id']}: {d_path}")
-        logging.info("=====================")
-    else:
-        logging.info(f"[start_from_stage={start_from_stage}] 跳过网络通道路径校验。")
-
-    # List tiles from the anchor channel.
+    # Discover the full expected tile set from image directory names. This does
+    # not load images and cannot silently omit a tile with no raw CSV yet.
     anchor_ch_id = anchor_ch['id']
-    if start_from_stage >= 2:
-        logging.info(f"[start_from_stage={start_from_stage}] 跳过网络扫描，从本地 CSV 推导 Tile 列表...")
-        dirnames, pATHTILE_all = listTile_from_local_csvs(
-            derived['pATH_DET_RES'], anchor_ch_id, anchor_dir
-        )
-        if not pATHTILE_all:
-            raise ValueError(
-                f"❌ start_from_stage={start_from_stage} 但在 {derived['pATH_DET_RES']} "
-                f"中未找到 *_{anchor_ch_id}_result.csv 文件。请先完成 Stage 2 检测。"
-            )
-        logging.info(f"  从本地 CSV 推导出 {len(pATHTILE_all)} 个 Tile。")
-    else:
+    if os.path.isdir(anchor_dir):
         dirnames, pATHTILE_all = listTile(anchor_dir)
-        if not pATHTILE_all:
-            raise ValueError(f"❌ 在锚点目录 {anchor_dir} 中没有找到合法的 Tile！")
+    else:
+        logging.warning('Image root unavailable; discovering existing tiles from raw CSVs.')
+        dirnames, pATHTILE_all = listTile_from_local_csvs(
+            derived['pATH_DET_RES'], anchor_ch_id, anchor_dir)
+    if not pATHTILE_all:
+        raise ValueError('No tiles found in images or saved raw detections')
+    logging.info('Automatic resume: checking %s tiles', len(pATHTILE_all))
 
-    previous_path = os.path.join(base_res_path, 'runtime_config.json')
-    previous = load_config(previous_path) if os.path.isfile(previous_path) else None
+    previous = resume_config(base_res_path, config, args.config)
+    if previous.get('resume_bootstrap'):
+        config['resume_bootstrap'] = previous['resume_bootstrap']
     model_hashes = model_fingerprints(config.get('models'), project_root)
     validate_reused_provenance(previous, config, derived, model_hashes)
     if align_settings is not None:
         validate_cached_geometry(previous, config, base_res_path, align_settings)
 
+    config['downstream_layout_version'] = 2
     save_run_metadata(config, start_time, model_hashes=model_hashes)
+    derived['channel_sources'] = channel_sources(config, derived)
 
     # Select the requested tile range.
     sTARTID = dp.get('sTARTID') or 1
     eNDID = dp.get('eNDID') or len(pATHTILE_all)
     target_indices = list(range(sTARTID - 1, eNDID))
     pATHTILE = [pATHTILE_all[i] for i in target_indices]
+
+    pATHTILE_all = pATHTILE
 
     # TeraStitcher XML is needed only for global stitching in Stage 3.
     # Detection and tile-level alignment/filtering can run before stitching finishes.
@@ -540,11 +533,9 @@ if __name__ == '__main__':
             tasks_to_run.append((i, path, config))
 
     if tasks_to_run:
-        if start_from_stage >= 2:
-            raise FileNotFoundError(
-                f"start_from_stage={start_from_stage} reuses raw detections in "
-                f"{derived['pATH_DET_RES']}; {len(tasks_to_run)} tile(s) have missing "
-                "CSV files. Complete Stage 2 before resuming.")
+        for ch in detect_routing_config:
+            if not os.path.isdir(paths.get(ch['dir_key'], '')):
+                raise FileNotFoundError(f"Missing images needed to complete detections: {ch['id']}")
         num_gpus = torch.cuda.device_count()
         num_processes = max(1, num_gpus)
         logging.info(f"阶段 2: 发现 {len(tasks_to_run)} 个缺失结果，启动 {num_processes} 个进程 ({num_gpus} GPU)...")
@@ -565,6 +556,10 @@ if __name__ == '__main__':
             if os.path.isfile(_raw_manifest):
                 validate_raw_input_manifest(_raw_manifest, _raw_csv)
             else:
+                with open(_raw_csv, newline='', encoding='utf-8') as handle:
+                    header = next(csv.reader(handle), [])
+                if not {'slice_name', 'x1', 'y1', 'x2', 'y2', 'score', 'mean', 'class', 'z'} <= set(header):
+                    raise ValueError(f'Incomplete legacy raw CSV: {_raw_csv}')
                 logging.warning("Legacy raw CSV has no TIFF/input manifest: %s", _raw_csv)
 
     if config.get('stop_after_detection', False):
@@ -710,7 +705,7 @@ if __name__ == '__main__':
 
     # ==========================================
     # Stage 2.75: publish filtered, aligned tile CSVs for Stage 3.
-    # Pre-align copies already-filtered single channels; fused channels are filtered here.
+    # Regular pre-align channels read 3_2d_aligned directly; only fused/post-align inputs are filtered here.
     # ==========================================
     _filter_params_by_channel = {
         ch['id']: resolve_filter_params(config, ch) for ch in routing_config
@@ -724,17 +719,15 @@ if __name__ == '__main__':
             project_root, 'src', 'core', 'detection_filter.py')),
     }
     _filter_dst = derived['pATH_DET_FILTERED']
-    os.makedirs(_filter_dst, exist_ok=True)
+    _final_filter_channels = [ch for ch in routing_config
+                              if pipeline_mode != 'pre_align' or ch.get('double_exposure')]
+    if _final_filter_channels:
+        os.makedirs(_filter_dst, exist_ok=True)
     _filter_settings_file = os.path.join(_filter_dst, "_filter_settings.json")
-    try:
-        with open(_filter_settings_file, encoding="utf-8") as handle:
-            _same_filter_settings = json.load(handle) == _filter_signature
-    except (OSError, ValueError):
-        _same_filter_settings = False
     _tile_names_all = [os.path.split(p)[-1] for p in pATHTILE_all]
     _expected_filter_inputs = [
         (_tn, _ch, source_dir_for_channel(derived, pipeline_mode, _ch))
-        for _tn in _tile_names_all for _ch in routing_config
+        for _tn in _tile_names_all for _ch in _final_filter_channels
     ]
     _missing_sources = [
         os.path.join(_src, f"{_tn}_{_ch['id']}_result.csv")
@@ -761,7 +754,7 @@ if __name__ == '__main__':
         return (os.path.isfile(target) and os.path.isfile(rejected)
                 and output_manifest_valid(manifest, signature))
 
-    _filter_done = _same_filter_settings and bool(_expected_filter_inputs) and all(
+    _filter_done = all(
         _filtered_checkpoint_ready(_tn, _ch, _src)
         for _tn, _ch, _src in _expected_filter_inputs
     )
@@ -782,19 +775,7 @@ if __name__ == '__main__':
                 _in_csv, {'stage': 'final_filter', 'channel': _ch_id,
                           'params': _filter_params_by_channel[_ch_id],
                           'filter_settings': _filter_signature})
-            if (_same_filter_settings and
-                    _filtered_checkpoint_ready(_tn, _ch, _src)):
-                continue
-            if pipeline_mode == 'pre_align' and not _ch.get('double_exposure'):
-                if os.path.abspath(_in_csv) != os.path.abspath(_out_csv):
-                    part = _out_csv + '.part'
-                    shutil.copyfile(_in_csv, part)
-                    os.replace(part, _out_csv)
-                empty_rejected = pd.read_csv(_in_csv, nrows=0)
-                empty_rejected['rejection_reason'] = pd.Series(dtype=str)
-                atomic_write_csv(empty_rejected, _rejected_path)
-                write_output_manifest(
-                    _manifest_path, [_out_csv, _rejected_path], _signature)
+            if _filtered_checkpoint_ready(_tn, _ch, _src):
                 continue
             _params = _filter_params_by_channel[_ch_id]
             _input_df = provenance_columns(
@@ -819,7 +800,7 @@ if __name__ == '__main__':
             json.dump(_filter_signature, handle, indent=2)
         os.replace(part, _filter_settings_file)
 
-    pATH_SRC_CSV = _filter_dst
+    pATH_SRC_CSV = derived['channel_sources']
 
     # ==========================================
     # Stage 2.8: generate raw 2D histograms of intensity and area.
@@ -962,8 +943,34 @@ if __name__ == '__main__':
         logging.info("Direct image stitching enabled; stitching raw channels before Stage 3.")
         run_direct_stitching(Path(args.config), skip_completed=True)
 
-    stale_stage3_channels = validate_global_checkpoints(
-        derived, [os.path.basename(p) for p in pATHTILE_all], routing_config)
+    routing_config = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
+    num_tiles = len(pATHTILE_all)
+    BOX_COLS  = ["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]
+
+    # Run global 2D stitching and Z-Link independently for each channel.
+    # Existing checkpoints: 5_2d_global/<ch>_2d_global.csv and 6_3d_global/<ch>_3d_tracked.pkl.
+    zl      = config.get('z_linker', {})
+    zl_soma = zl.get('soma', {})
+    zl_tf   = zl.get('tf', {})
+    zl_params = {
+        'soma': dict(iou_thresh=zl_soma.get('iou_thresh', 0.35),
+                     min_z_layers=zl_soma.get('min_z_layers', 1),
+                     max_cell_z_span=zl_soma.get('max_cell_z_span', 5),
+                     max_z_gap=zl_soma.get('max_z_gap', 0)),
+        'tf':   dict(iou_thresh=zl_tf.get('iou_thresh', 0.25),
+                     min_z_layers=zl_tf.get('min_z_layers', 1),
+                     max_cell_z_span=zl_tf.get('max_cell_z_span', 3),
+                     max_z_gap=zl_tf.get('max_z_gap', 0)),
+    }
+    geom = {'dir_dict': dir_dict, 'disp_mat_fin': disp_mat_fin, 'z_start': z_start, 'Z': Z,
+            'H': H, 'W': W, 'tile_size': tile_size, 'num_tiles': num_tiles,
+            'xml_source': pATHxml}
+    ch_results = run_stage3_channel_pool(
+        routing_config, stage3_worker_count(config, len(routing_config)),
+        pATH_SRC_CSV, derived['pATH_GLOBAL_2D'], derived['pATH_CHANNEL_3D'], geom, zl_params,
+        base_res_path)
+
+
     bbox_path = os.path.join(derived['pATH_COLOCALIZATION'], "coloc_result.csv")
     source_3d_path = os.path.join(
         derived['pATH_COLOCALIZATION'], 'coloc_source_3d.csv')
@@ -972,7 +979,7 @@ if __name__ == '__main__':
     manifest_path = os.path.join(
         derived['pATH_COLOCALIZATION'], '_provenance_manifest.json')
     final_results = None
-    source_checkpoint_ready = (not stale_stage3_channels and output_manifest_valid(
+    source_checkpoint_ready = (output_manifest_valid(
         manifest_path, stage4_input_signature(derived, routing_config, config, pATHxml)))
     if source_checkpoint_ready:
         columns = set(pd.read_csv(bbox_path, nrows=0).columns)
@@ -992,33 +999,6 @@ if __name__ == '__main__':
             final_results = final_results.reshape(1, -1)
     else:
         logging.info("阶段 3: 开始合并 Tile 并运行 Z-Linker (先独立 3D 追踪，再 3D 共定位)...")
-
-        routing_config = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
-        num_tiles = len(pATHTILE_all)
-        BOX_COLS  = ["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]
-
-        # Run global 2D stitching and Z-Link independently for each channel.
-        # Existing checkpoints: 5_2d_global/<ch>_2d_global.csv and 6_3d_global/<ch>_3d_tracked.pkl.
-        zl      = config.get('z_linker', {})
-        zl_soma = zl.get('soma', {})
-        zl_tf   = zl.get('tf', {})
-        zl_params = {
-            'soma': dict(iou_thresh=zl_soma.get('iou_thresh', 0.35),
-                         min_z_layers=zl_soma.get('min_z_layers', 1),
-                         max_cell_z_span=zl_soma.get('max_cell_z_span', 5),
-                         max_z_gap=zl_soma.get('max_z_gap', 0)),
-            'tf':   dict(iou_thresh=zl_tf.get('iou_thresh', 0.25),
-                         min_z_layers=zl_tf.get('min_z_layers', 1),
-                         max_cell_z_span=zl_tf.get('max_cell_z_span', 3),
-                         max_z_gap=zl_tf.get('max_z_gap', 0)),
-        }
-        geom = {'dir_dict': dir_dict, 'disp_mat_fin': disp_mat_fin, 'z_start': z_start, 'Z': Z,
-                'H': H, 'W': W, 'tile_size': tile_size, 'num_tiles': num_tiles,
-                'xml_source': pATHxml}
-        ch_results = run_stage3_channel_pool(
-            routing_config, stage3_worker_count(config, len(routing_config)),
-            pATH_SRC_CSV, derived['pATH_GLOBAL_2D'], derived['pATH_CHANNEL_3D'], geom, zl_params,
-            base_res_path)
 
         soma_ch_ids = [ch['id'] for ch in routing_config
                        if ch.get('type', 'soma') == 'soma' and ch.get('active', True)]
@@ -1248,6 +1228,17 @@ if __name__ == '__main__':
     # ==========================================
     report_path = os.path.join(derived['pATH_COLOCALIZATION'], "global_summary_statistics.csv")
 
+    export_manifest = os.path.join(derived['pATH_COLOCALIZATION'], '_exports_manifest.json')
+    export_signature = {
+        'colocalization': file_stamp(bbox_path, with_hash=True),
+        'generate_analysis_report': config.get('generate_analysis_report', False),
+        'export_version': 1,
+    }
+    if output_manifest_valid(export_manifest, export_signature):
+        logging.info('Exports complete; all pipeline checkpoints reused successfully.')
+        sys.exit(0)
+    export_paths = []
+
     if final_results is not None and len(final_results) > 0:
         df_final = pd.read_csv(bbox_path)
         total_cells = len(df_final)
@@ -1311,9 +1302,13 @@ if __name__ == '__main__':
             # Sanitize labels for output filenames.
             safe_label = str(label).replace('/', '_').replace('\\', '_')
             save_path = os.path.join(derived['pATH_CENTROIDS'], f"ob_{safe_label}.csv")
-            out_df.to_csv(save_path, index=False)
+            atomic_write_csv(out_df, save_path)
+            export_paths.append(save_path)
             
         logging.info(f"已生成所有 {len(combo_counts)} 种子类型的质心文件，保存在: {derived['pATH_CENTROIDS']}")
+        if config.get('generate_analysis_report', False):
+            export_paths.append(report_path)
+        write_output_manifest(export_manifest, export_paths, export_signature)
         logging.info("Stage 4 complete: cell centroids written.")
 
     logging.info(f"🎉 动态多通道推断全部完成！总耗时: {(time.time() - start_time)/60:.2f} 分钟。")

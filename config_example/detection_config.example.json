@@ -2,6 +2,7 @@
 // Current Stage 3 still reads XML geometry; IoU tile positions alone are not consumed by run_inference.py.
 // Use the matching solver-generated XML only if Stage 3 is enabled.
 {
+    // Automatic resume: validate and reuse completed stages; no start stage is needed.
     // Replace model paths with installed model files.
     "models": {
         "yolo_path": "models/train18_best_0515.pt",
@@ -78,6 +79,23 @@
         // "output_dir_hpc": "/rsstu/users/.../brain_sample/stitched_direct_4x"
     },
     "pre_align_params": {
+        // Alignment-only linking; independent of downstream z_linker.
+        "z_linker": {
+            "soma": {
+                "iou_thresh": 0.35,
+                "min_z_layers": 1,
+                "max_cell_z_span": 5,
+                "max_z_gap": 0
+            },
+            "tf": {
+                "iou_thresh": 0.25,
+                "min_z_layers": 1,
+                "max_cell_z_span": 3,
+                "max_z_gap": 0,
+                "max_center_dist_ratio": 0.35,
+                "containment_z_pad": 1
+            }
+        },
         // Reference used to measure channel shifts.
         "reference_channel": "GFP",
         "tf_align_mode": "sequential_joint",
@@ -98,7 +116,7 @@
     // True writes the solved XMLs, then exits before global cell stitching.
     "stop_before_stitching": true,
     // Use 1 for detection; use 2 to read pATHRESULT/1_tile_2d_raw and skip detection.
-    "start_from_stage": 1,
+
     "ENABLE_Z_LINKER": true,
     "stage3_n_workers": null,
     // Z linking and cross-channel matching settings.

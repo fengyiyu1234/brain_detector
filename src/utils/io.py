@@ -218,4 +218,8 @@ def save_run_metadata(cfg, start_time_stamp, model_hashes=None):
         previous.get('origin_run_info', previous.get('run_info'))
         if previous else run_info)
     metadata['run_info'] = run_info
+    snapshot_dir = Path(cfg['paths']['pATHRESULT']) / 'run_configs'
+    snapshot_dir.mkdir(exist_ok=True)
+    snapshot_name = datetime.datetime.fromtimestamp(start_time_stamp).strftime('%Y%m%d_%H%M%S_%f')
+    atomic_json(snapshot_dir / (snapshot_name + '.json'), metadata)
     atomic_json(save_path, metadata)

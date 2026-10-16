@@ -57,6 +57,16 @@ class Tile2DTests(unittest.TestCase):
                     box = viewer.add_shapes.call_args.args[0][0]
                     self.assertEqual(box[0].tolist(), [1, 12, 10+index])
 
+    def test_final_input_routes_to_aligned_without_duplicate_directory(self):
+        from src.core.resume import saved_channel_directory
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); aligned = root / '3_2d_aligned'; aligned.mkdir()
+            (aligned / 'tile_Olig2_result.csv').write_text('z\n1\n')
+            (aligned / 'tile_offsets.json').write_text(json.dumps({'Olig2': dict(dx=0, dy=0, dz=0)}))
+            directory, _ = tile_2d_inputs(tmp, 'aligned_filtered', 'tile', ['Olig2'])
+            self.assertEqual(Path(directory), aligned)
+            self.assertEqual(Path(saved_channel_directory(tmp, {'id': 'Olig2'})), aligned)
+
     def test_prefilter_needs_no_alignment_and_ignores_old_offsets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

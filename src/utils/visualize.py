@@ -1765,7 +1765,12 @@ def _run_2d(vis_cfg, paths, routing_config, tile_path, tile_name):
     box_registry = []
     for ch in routing_config:
         cid = ch['id']
-        csv_path = os.path.join(csv_dir, f"{tile_name}_{cid}_result.csv")
+        if source == 'aligned_filtered':
+            from src.core.resume import saved_channel_directory
+            source_dir = saved_channel_directory(paths['pATHRESULT'], ch)
+        else:
+            source_dir = csv_dir
+        csv_path = os.path.join(source_dir, f"{tile_name}_{cid}_result.csv")
         (shapes, colors, box_meta), _ = _load_tile_csv_shapes(csv_path, z_range)
         if not os.path.isfile(csv_path):
             print(f"[2d {source}] Missing {cid}: {csv_path}")
@@ -1825,7 +1830,7 @@ def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
 
     base_res     = paths['pATHRESULT']
     raw_dir      = os.path.join(base_res, '1_2d_raw')
-    filtered_dir = os.path.join(base_res, '4_2d_filtered')
+    from src.core.resume import saved_channel_directory
     fused_dir    = os.path.join(base_res, '3_2d_aligned_fusion')
     s3_dir    = os.path.join(base_res, '6_3d_global')
     coloc_csv = os.path.join(base_res, '7_colocalization', 'coloc_result.csv')
@@ -1913,7 +1918,7 @@ def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
     if stage_cfg in ('all', 's1'):
         for ch in routing_config:
             cid = ch['id']
-            csv_p = os.path.join(filtered_dir, f"{tile_name}_{cid}_result.csv")
+            csv_p = os.path.join(saved_channel_directory(base_res, ch), f"{tile_name}_{cid}_result.csv")
             (shapes, colors, meta), (rej_s, rej_c, _) = _load_tile_csv_shapes(
                 csv_p, z_range,
                 raw_vol=raw_vols.get(cid), filt=_get_ch_filter(filter_cfg, ch),
@@ -1990,7 +1995,7 @@ def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
             _per_ch_vols[cid] = vols
         else:
             # Trace fallback reproduces saved Stage 3, so it reads the saved filtered CSV.
-            csv_p = os.path.join(filtered_dir, f"{tile_name}_{cid}_result.csv")
+            csv_p = os.path.join(saved_channel_directory(base_res, ch), f"{tile_name}_{cid}_result.csv")
             zl_p  = zl_soma if ctype == 'soma' else zl_tf
             print(f"[trace] {cid}: pkl not found, falling back to saved filtered CSV re-z-link")
             _per_ch_vols[cid] = _run_zlink_for_csv(

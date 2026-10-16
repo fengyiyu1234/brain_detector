@@ -172,8 +172,10 @@ def _add_tile_2d(viewer, result_dir, tile_name, routing, offsets,
             for directory, label, visible, needs_shift in stages:
                 if not offsets and directory != "1_2d_raw":
                     continue  # No saved transform for aligned stages yet.
-                path = os.path.join(
-                    result_dir, directory, f"{tile_name}_{cid}_result.csv")
+                from src.core.resume import saved_channel_directory
+                stage_dir = (saved_channel_directory(result_dir, ch) if directory == '4_2d_filtered'
+                             else os.path.join(result_dir, directory))
+                path = os.path.join(stage_dir, f"{tile_name}_{cid}_result.csv")
                 if not os.path.isfile(path):
                     continue
                 source_range = ((z_range[0] - o["dz"], z_range[1] - o["dz"])

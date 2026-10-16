@@ -45,3 +45,5 @@ src/gui/
 
 # Shared pipeline QC documentation
 !docs/pipeline_qc.md
+
+!docs/pipeline_resume.md

@@ -67,6 +67,10 @@ class SavedPrealignTests(unittest.TestCase):
     tile = "000100_000200"
 
     def setUp(self):
+        # Saved-row tests use a minimal viewer, not a video-export-capable viewer.
+        video_panel = patch('src.utils.saved_gui.add_video_export_panel')
+        video_panel.start()
+        self.addCleanup(video_panel.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)

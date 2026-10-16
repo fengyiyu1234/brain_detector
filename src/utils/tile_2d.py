@@ -18,6 +18,8 @@ def tile_2d_inputs(result_dir, source, tile_name, channel_ids):
         raise ValueError(f"Unknown 2d_source {source!r}; choose {', '.join(SOURCES_2D)}")
     directory, _, aligned = SOURCES_2D[source]
     csv_dir = os.path.join(result_dir, directory)
+    if source == 'aligned_filtered' and not os.path.isdir(csv_dir):
+        csv_dir = os.path.join(result_dir, '3_2d_aligned')
     if not os.path.isdir(csv_dir):
         raise FileNotFoundError(f"2D {source} result directory does not exist: '{csv_dir}'")
     if not aligned:

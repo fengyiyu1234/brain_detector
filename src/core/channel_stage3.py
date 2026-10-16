@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
-"""
-Stage 3 的单通道部分：全局 2D 拼接 → Z-Link → 落盘。
+"""Independent per-channel global stitching and Z-Link checkpoints.
 
-各通道之间互不依赖，run_inference.py 把每个通道交给一个进程并行执行；跨通道的
-3D 共定位（3A/3B/3C）仍在主进程里做。每一步都保留原来的 checkpoint 语义：
-  5_2d_global/<ch>_2d_global.csv  存在 → 不再拼接；tile/slice 溯源信息从它的 tile_name/slice_name 列恢复
-  6_3d_global/<ch>_3d_tracked.pkl     存在 → 不再 Z-Link
+The global manifest is committed before linking starts. The track manifest
+references the global CSV content; changing link parameters never restitches.
+The combined manifest remains for downstream provenance and legacy readers.
 """
 
 import csv
+import json
 import logging
 import os
 import pickle
@@ -20,7 +19,7 @@ from src.core.stitcher import combine_predictions
 from src.core.z_linker import run_z_linker
 from src.utils.markers import channel_marker
 from src.core.provenance import (stable_id, file_stamp, file_sha256,
-                                 output_manifest_valid, write_output_manifest)
+                                 output_manifest_valid, write_output_manifest, content_signature, manifest_outputs_valid)
 
 BOX_COLS = ["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]
 TRACE_COLS = ["tile_name", "slice_name"]   # 全局 2D CSV 里每个框的来源，续跑时据此恢复溯源信息
@@ -136,6 +135,36 @@ def _stage3_input_signature(ch_id, src_dir, geom, zl_params):
     }
 
 
+def _global_signature(signature):
+    result = {k: v for k, v in signature.items() if k not in ('z_linker', 'code_sha256')}
+    result['stitcher_sha256'] = signature['code_sha256']['stitcher.py']
+    result['algorithm_version'] = 1
+    return result
+
+
+def _track_signature(global_csv, params):
+    return {'global_2d': file_stamp(global_csv, with_hash=True), 'z_linker': params,
+            'algorithm_version': 1,
+            'code_sha256': file_sha256(os.path.join(os.path.dirname(__file__), 'z_linker.py'))}
+
+
+def _adopt_legacy_global(manifest, signature, outputs):
+    """Split a validated old combined checkpoint without recomputing its 2D data."""
+    try:
+        with open(manifest, encoding='utf-8') as handle:
+            old = json.load(handle)
+        if content_signature(_global_signature(old['input_signature'])) != content_signature(signature):
+            return False
+        names = {os.path.basename(path) for path in outputs}
+        subset = {name: stamp for name, stamp in old['outputs'].items()
+                  if name.replace('\\', '/').rsplit('/', 1)[-1] in names}
+        # Outputs are in the global directory, not beside the old combined manifest.
+        return len(subset) == len(outputs) and manifest_outputs_valid(
+            os.path.join(os.path.dirname(outputs[0]), '_legacy.json'), {'outputs': subset})
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def stitch_and_link_channel(ch, src_dir, global_2d_dir, channel_3d_dir, geom, zl_params):
     """
     一个通道的 Stage 3 前半段。返回 {'ch_id', 'metadata'}；3D 结果写到 pkl/csv，由主进程读回。
@@ -156,11 +185,41 @@ def stitch_and_link_channel(ch, src_dir, global_2d_dir, channel_3d_dir, geom, zl
         os.path.join(channel_3d_dir, f"{ch_id}_track_members.csv"),
         os.path.join(channel_3d_dir, f"{ch_id}_track_rejections.csv"),
     ]
-    use_cached_global = manifest_ready and os.path.isfile(global_2d)
+    global_manifest = os.path.join(global_2d_dir, f'{ch_id}_global_manifest.json')
+    track_manifest = os.path.join(channel_3d_dir, f'{ch_id}_tracks_manifest.json')
+    global_signature = _global_signature(input_signature)
+    global_outputs = [global_2d, sidecars[0]]
+    global_ready = output_manifest_valid(global_manifest, global_signature)
+    if not global_ready and not os.path.isfile(global_manifest):
+        global_ready = _adopt_legacy_global(manifest_path, global_signature, global_outputs)
+        if global_ready:
+            write_output_manifest(global_manifest, global_outputs, global_signature)
+    tracks_ready = (os.path.isfile(global_2d) and output_manifest_valid(
+        track_manifest, _track_signature(global_2d, zl_params)))
+    if global_ready and not tracks_ready and not os.path.isfile(track_manifest):
+        try:
+            with open(manifest_path, encoding='utf-8') as handle:
+                legacy = json.load(handle)
+            old = legacy['input_signature']
+            track_outputs = [pkl_path, *sidecars[1:]]
+            names = {os.path.basename(path) for path in track_outputs}
+            subset = {name: stamp for name, stamp in legacy['outputs'].items()
+                      if name.replace('\\', '/').rsplit('/', 1)[-1] in names}
+            tracks_ready = (
+                content_signature(_global_signature(old)) == content_signature(global_signature)
+                and old['z_linker'] == zl_params
+                and old['code_sha256']['z_linker.py'] == input_signature['code_sha256']['z_linker.py']
+                and len(subset) == len(track_outputs)
+                and manifest_outputs_valid(track_manifest, {'outputs': subset}))
+            if tracks_ready:
+                write_output_manifest(track_manifest, track_outputs, _track_signature(global_2d, zl_params))
+        except (OSError, ValueError, KeyError, TypeError):
+            tracks_ready = False
+    use_cached_global = global_ready and os.path.isfile(global_2d)
     if use_cached_global:
         cached_cols = set(pd.read_csv(global_2d, nrows=0).columns)
         use_cached_global = {'detection_id', *TRACE_COLS} <= cached_cols
-    need_relink = not (manifest_ready and os.path.isfile(pkl_path)
+    need_relink = not (tracks_ready and os.path.isfile(pkl_path)
                        and all(os.path.isfile(path) for path in sidecars))
 
     mat = None
@@ -209,6 +268,7 @@ def stitch_and_link_channel(ch, src_dir, global_2d_dir, channel_3d_dir, geom, zl
             os.replace(tmp, global_2d)
             logging.info(f"✔️ [{ch_id}] 全局2D: {len(mat)} 框 → {global_2d}")
         packed = _pack_metadata(metadata)
+        write_output_manifest(global_manifest, global_outputs, global_signature)
         need_relink = True
 
     if not need_relink:
@@ -254,6 +314,9 @@ def stitch_and_link_channel(ch, src_dir, global_2d_dir, channel_3d_dir, geom, zl
         logging.info(f"✔️ [{ch_id}] Z-Link {kind}: {len(vol_list)} 个细胞 → {out_3d}")
 
     if need_relink:
+        write_output_manifest(track_manifest, [pkl_path, *sidecars[1:]],
+                              _track_signature(global_2d, zl_params))
+    if need_relink or not manifest_ready:
         outputs = [global_2d, pkl_path, *sidecars]
         if all(os.path.isfile(path) for path in outputs):
             write_output_manifest(manifest_path, outputs, input_signature)

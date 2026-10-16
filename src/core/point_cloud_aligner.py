@@ -1219,11 +1219,25 @@ def tile_alignment_done(tile_name, det_dir, align_dir, routing):
     offsets_file = os.path.join(align_dir, f"{tile_name}_offsets.json")
     if not os.path.isfile(offsets_file):
         return False
-    from src.core.provenance import output_manifest_valid
+    from src.core.provenance import content_signature, manifest_outputs_valid, manifest_output_path
     manifest_path = os.path.join(align_dir, f"{tile_name}_alignment_manifest.json")
-    if os.path.isfile(manifest_path) and not output_manifest_valid(
-            manifest_path, _alignment_input_signature(tile_name, det_dir, routing)):
-        return False
+    has_manifest = os.path.isfile(manifest_path)
+    if has_manifest:
+        signature = _alignment_input_signature(tile_name, det_dir, routing)
+        with open(manifest_path, encoding='utf-8') as handle:
+            saved = json.load(handle)
+        old_signature = dict(saved['input_signature'])
+        # This release changes only checkpoint validation, not alignment math.
+        compatible = {'6d196d39d7575663d876da188ab9e1708bfb4d88bf5eade84c38c7f96668364d'}
+        if old_signature.get('aligner_sha256') in compatible:
+            old_signature['aligner_sha256'] = signature['aligner_sha256']
+        if any(not manifest_output_path(manifest_path, name).is_file()
+               for name in saved.get('outputs', {})):
+            return False
+        if (content_signature(old_signature) != content_signature(signature)
+                or not manifest_outputs_valid(manifest_path, saved)):
+            raise ValueError(f'Existing alignment checkpoint conflicts with inputs or outputs: {manifest_path}. '
+                             'Preserve reviewed results; archive affected alignment before recomputing.')
     primary = {ch['id'] for ch in routing}
     for cid in _aligned_channel_ids(routing):
         in_csv = os.path.join(det_dir, f"{tile_name}_{cid}_result.csv")
@@ -1232,10 +1246,10 @@ def tile_alignment_done(tile_name, det_dir, align_dir, routing):
             if cid in primary:
                 return False   # 让 align_tile 重跑并把缺失报出来，而不是悄悄当成已完成
             continue
-        if os.path.getmtime(offsets_file) < os.path.getmtime(in_csv):
+        if not has_manifest and os.path.getmtime(offsets_file) < os.path.getmtime(in_csv):
             return False
         if (not os.path.isfile(out_csv)
-                or os.path.getmtime(out_csv) < os.path.getmtime(in_csv)
+                or (not has_manifest and os.path.getmtime(out_csv) < os.path.getmtime(in_csv))
                 or _count_lines(in_csv) != _count_lines(out_csv)):
             return False
     return True
@@ -1489,7 +1503,8 @@ def validate_cached_geometry(previous, current, results_dir, settings):
     if not (has_alignment or has_global):
         return
     if previous is None:
-        raise ValueError("Existing alignment/global checkpoints lack runtime_config.json provenance")
+        logging.warning("Legacy alignment: checking saved stage settings and coordinate frames.")
+        return
 
     old_routing = [ch for ch in previous.get('channels_routing', [])
                    if ch.get('active', True)]
@@ -1545,7 +1560,7 @@ def resolve_align_settings(config, routing_config):
     """
     pa = config.get('pre_align_params', {})
     dp = config.get('detection_params', {})
-    zl = config.get('z_linker', {})
+    zl = pa.get('z_linker', config.get('z_linker', {}))
     sample_count = pa.get('sample_z_count', pa.get('sample_z_center_count', 50))
     sample_start = pa.get('sample_z_start_slice')
     sample_fraction = pa.get('sample_z_start_fraction')

@@ -130,7 +130,9 @@ def _open_tile_viewer(
         )
         image_layer.contrast_limits_range = (0, 65535)
 
-        csv_path = os.path.join(filtered_dir, f"{tile_name}_{channel_id}_result.csv")
+        from src.core.resume import saved_channel_directory
+        source_dir = filtered_dir or saved_channel_directory(paths['pATHRESULT'], channel)
+        csv_path = os.path.join(source_dir, f"{tile_name}_{channel_id}_result.csv")
         (shapes, colors, _), _ = _load_tile_csv_shapes(csv_path, z_range, filt=None)
         if shapes:
             _add_labels_layer(
@@ -157,7 +159,7 @@ def main() -> int:
         raise ValueError("Config requires paths and at least one active channels_routing entry.")
 
     base_result = paths["pATHRESULT"]
-    filtered_dir = os.path.abspath(args.filtered_dir or os.path.join(base_result, "4_2d_filtered"))
+    filtered_dir = os.path.abspath(args.filtered_dir) if args.filtered_dir else None
     align_dir = os.path.join(base_result, "3_2d_aligned")
     pipeline_mode = config.get("pipeline_mode", "post_align")
     anchor_dir = os.path.abspath(paths[channels[0]["dir_key"]])
