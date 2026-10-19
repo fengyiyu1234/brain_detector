@@ -1,0 +1,30 @@
+{
+  "enabled": false,
+  "reference_channel": "GFP",
+  "soma_channels": [
+    "RFP"
+  ],
+  "tf_channels": [
+    "Sox9",
+    "Olig2"
+  ],
+  "xy_range_um": 20,
+  "z_range_um": 40,
+  "workers": 4,
+  "fail_on_error": false,
+  "output_dir": "qc/alignment",
+  "formats": [
+    "png",
+    "pdf"
+  ],
+  "path_mappings": {},
+  "previous_landmarks": null,
+  "roi_manifest": null,
+  "sampling": {
+    "seed": 42,
+    "z_size_slices": 10,
+    "z_guard_slices": null,
+    "max_attempts": 50,
+    "min_pairs": 10
+  }
+}

@@ -10,9 +10,10 @@ python -u scripts/run_inference.py --config config/EGFR/2/config_EGFR_t70.json
 expected tiles from image folders, checks completed artifacts, and computes missing
 work. If the image root is unavailable it can discover already recorded raw tiles;
 this fallback cannot discover tiles which never produced a CSV. Image-dependent
-stages still require their image folders. `stop_after_detection` and
-`stop_before_stitching` remain supported; the latter includes enabled tile-position
-solving and XML generation before stopping.
+stages still require their image folders. `stop_after_step` selects a named boundary or stage number;
+`null` completes the pipeline. Use `"detection"` for raw detection or
+`"tile_positions"` for enabled tile solving and XML publication. See
+[all stop boundaries](alignment_qc.md).
 
 ## Inputs and storage
 

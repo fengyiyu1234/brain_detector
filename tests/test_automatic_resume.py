@@ -156,6 +156,17 @@ class PipelineEntryResumeTests(unittest.TestCase):
             initial = accepted.stat().st_mtime_ns
             command = [sys.executable, 'scripts/run_inference.py', '--config', str(config_path)]
             env = {**os.environ, 'PYTHONIOENCODING': 'utf-8'}
+            # Every requested stop must return successfully before later products are made.
+            for step in ('setup', 'detection', 'filtering', 'alignment', 'publish_filtered', 'z_linking', 'colocalization'):
+                stopped = subprocess.run(command + ['--stop-after-step', step], capture_output=True,
+                                         text=True, encoding='utf-8', env=env, timeout=120)
+                self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+                self.assertIn('stop_after_step=' + step, stopped.stdout + stopped.stderr)
+                if step in ('setup', 'detection', 'filtering', 'alignment', 'publish_filtered'):
+                    self.assertFalse((results / '5_2d_global/GFP_2d_global.csv').exists())
+                if step != 'colocalization':
+                    self.assertFalse((results / '7_colocalization/coloc_result.csv').exists())
+                self.assertFalse(any((results / '7_colocalization/cell_centroids').glob('*.csv')))
             for iteration in range(2):
                 result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', env=env, timeout=120)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -168,7 +179,7 @@ class PipelineEntryResumeTests(unittest.TestCase):
                     self.assertEqual(global_time, (results / '5_2d_global/GFP_2d_global.csv').stat().st_mtime_ns)
                     self.assertIn('all pipeline checkpoints reused', result.stdout + result.stderr)
             self.assertTrue((results / 'runtime_config.json').is_file())
-            self.assertEqual(len(list((results / 'run_configs').glob('*.json'))), 2)
+            self.assertEqual(len(list((results / 'run_configs').glob('*.json'))), 9)
 
 
 class GeometryResumeTests(unittest.TestCase):

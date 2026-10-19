@@ -825,3 +825,53 @@ python src/utils/validate_align_shifts.py \
 - Center windows may overlap solver data, so this run is a sensitivity evaluation rather than independent held-out validation. Tile overlaps are not deduplicated into a whole-brain estimate. The active T70 job `scripts/logs/lsf_t70_360749.out` explicitly reused old offsets rather than rerunning alignment; current solver code does not by itself establish the exact historical implementation that generated those offsets.
 - Verification completed during implementation: 19 focused regression tests passed (`tests.test_validate_align_shifts`, `tests.test_alignment_frames`); a separate smoke run verified serial/parallel equality and PNG/PDF rendering. All 45 real-data center windows were independently checked against source slice counts and saved offset/scan margins. Checked final table sizes, all 45 PNG/PDF pairs, the tile index, representative populated/empty plots, and `git diff --check`.
 - Next diagnostic, not yet implemented or run: repeat sensitivity scans in each tile's original solver Z window using its actual optimization target (RFP IoU, Sox9 containment, Olig2 joint score), then inspect clear nonzero improvements and boundary peaks. Do not automatically replace saved offsets with peaks from the current pairwise-IoU plots.
+
+---
+
+## 2026-10-16 自动续跑、分阶段 checkpoint 与 T70 下游衔接
+
+### 背景与问题
+
+- T70 已完成 2D detection、filter、channel alignment 和人工 quality check，本次目标是保留已有结果并继续下游。
+- 作业 `387352` 在主流程检查历史配置时退出：`Existing checkpoints lack runtime_config.json provenance`。当前 `config_EGFR_t70.json` 已加载成功；结果目录缺的是历史 `runtime_config.json`，但存在独立对齐流程生成的 `alignment_runtime_config.json`。
+- `detection_results3` 中 raw、filtered、aligned 各有 180 份结果 CSV（45 tiles × 4 通道）；当时 `4_2d_filtered` 至下游目录尚无结果文件。
+- 原 `start_from_stage>=2` 只禁止重新检测，仍会进入过滤和对齐检查。GFP/RFP 的 filter manifest 嵌入了旧 Sox9/Olig2 参数，导致本通道参数未变也可能被判失效，继而触发对齐重算。全局 2D 与 Z-Link 共用完成记录，也会让 Z-Link 中断导致重新拼接。
+
+### 修改与关键决定
+
+1. **统一自动续跑入口**：移除样本配置中的 `start_from_stage`。每次从入口检查各阶段，复用有效结果、补齐缺失任务。优先从图像目录发现预期 tiles；图像根目录不可用时可从已有 raw CSV 推导，但该回退不能发现从未产生 CSV 的 tile。保留 `stop_after_detection` 和 `stop_before_stitching`。
+2. **取消普通通道的重复 CSV**：`pre_align` 且无双曝光时，全局拼接直接读取 `3_2d_aligned`，不再复制到 `4_2d_filtered`。双曝光通道仍经过融合及最终过滤，`post_align` 仍读取最终过滤目录；混合曝光按通道选择输入。`2_2d_filtered` 保留，供对齐和 tile position 求解使用。已有旧目录不自动删除。
+3. **按阶段、通道比较配置**：raw inference 比较排除过滤、几何和报告参数；过滤 checkpoint 只依赖本通道参数及源文件内容，不再因其他通道参数变化失效。带 hash 的文件按内容比较，兼容挂载路径变化和仅时间戳变化。
+4. **分离对齐与下游 Z-Link 参数**：样本配置新增 `pre_align_params.z_linker`，保存对齐内部临时 linking 原有参数；顶层 `z_linker` 继续控制下游追踪／共定位。旧配置缺少新字段时保留原回退行为。
+5. **补建配置快照与历史**：缺少 `runtime_config.json` 时，以当前 `--config` 补建运行记录，并利用已有 `alignment_runtime_config.json` 提供历史对齐上下文。`resume_bootstrap_config.json` 明确标记历史 raw 来源未经验证；每次运行另存解析后的快照到 `run_configs/`，不把当前模型信息冒充为已验证的历史检测来源。
+6. **保护已检查的对齐结果**：完整对齐结果的参数、输入或输出出现冲突时，明确报错，不自动覆盖；缺失的输出组可恢复。此次 checkpoint 代码变更显式兼容原 aligner 指纹，未修改其数值对齐算法。文件一致性校验不等于自动完成了人工准确性评估。
+7. **同步入口**：更新保存结果的可视化、review GUI 和 pipeline QC，使其支持直接读取 aligned 数据；更新 `scripts/inference_t70.sh` 的续跑说明、10 份 EGFR 与 7 份 TSC JSON 配置及 detection 示例配置。
+
+### 各断点的恢复行为
+
+| 阶段 | 完成记录与恢复方式 |
+|---|---|
+| Detection | 按 tile／通道复用有效 CSV 和已有 input manifest；补检测缺失通道，损坏的完整结果明确报错 |
+| 2D filter | 按 tile／通道 filter manifest 复用；与已有对齐冲突时保护对齐输入 |
+| Channel alignment | 检查 manifest、offsets、CSV 行数和坐标系；完整冲突停止，缺失组补算 |
+| Fusion／final filter | 按 tile／通道独立复用或重建 |
+| Tile positions | 新增 `_solver_manifest.json`，求解完成后立即记录，XML 生成失败不丢失已求位置 |
+| XML | 保留 `_pipeline_manifest.json`；求解结果有效时只补 XML |
+| Global 2D | 新增 `<channel>_global_manifest.json`，在 Z-Link 开始前提交完成记录 |
+| Z-Link | 新增 `<channel>_tracks_manifest.json`；中断或修改 linking 参数时复用 global 2D |
+| Colocalization | 先校验上游阶段，再使用 `_provenance_manifest.json` 决定复用／重建 |
+| 质心／报告导出 | 新增 `_exports_manifest.json`；从已有共定位结果补导出 |
+
+完整旧版 Stage 3 combined manifest 可校验并拆分接入新 checkpoint，无需重算有效的 2D／3D 输出。恢复规则见 [docs/pipeline_resume.md](docs/pipeline_resume.md)。主要实现涉及 `scripts/run_inference.py`、新增 `src/core/resume.py`、`provenance.py`、`channel_stage3.py`、`point_cloud_aligner.py`、`tile_position_pipeline.py` 和 `src/utils/io.py`。
+
+### 验证与当前状态
+
+- **74 项相关测试通过**，覆盖自动续跑、按阶段配置比较、旧 manifest 兼容、混合曝光输入选择、XML 中断恢复、Z-Link 中断／参数变化后的恢复，以及可视化和 QC 路径。
+- 新增 `tests/test_automatic_resume.py`：真实主入口使用临时小数据从已有过滤／对齐结果完成下游，随后再次运行同一命令，验证复用全部 checkpoint、对齐 CSV 和 global 2D 不被重写，且不生成 `4_2d_filtered`。
+- 全部 10 份 EGFR、7 份 TSC 配置通过解析检查；修改的 Python 文件编译检查和 `git diff --check` 通过。
+- T70 只读抽查：当前对齐设置与保存记录一致；tile `384700_364300` 的四通道 filter／alignment 内容校验通过，可复用。此项不是对全部 45 tiles 大型 CSV 的完整内容验证。
+- **本次没有提交 HPC 作业，没有修改 T70 已有结果数据。** EGFR/TSC 配置和提交脚本受仓库现有 `.gitignore` 规则影响，修改保存在本地工作区，不能只用普通 Git diff 判断是否已更新。
+
+### 下一步
+
+使用原 `scripts/inference_t70.sh` 提交 T70，检查日志是否复用检测、过滤和对齐，并从 tile positions／XML、全局 2D、Z-Link、共定位及导出继续。实际 T70 全样本下游尚未运行验证；如果发现已完成结果的真实冲突，应检查具体文件及阶段记录，不直接覆盖人工检查后的结果。

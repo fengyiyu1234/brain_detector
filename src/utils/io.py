@@ -196,6 +196,7 @@ def save_run_metadata(cfg, start_time_stamp, model_hashes=None):
         project_root / 'scripts' / 'run_inference.py',
         *(project_root / 'src' / 'core').glob('*.py'),
         *(project_root / 'src' / 'utils').glob('*.py'),
+        *(project_root / 'src' / 'qc').glob('*.py'),
     ]
     metadata['provenance'] = {
         "schema_version": PROVENANCE_SCHEMA_VERSION,

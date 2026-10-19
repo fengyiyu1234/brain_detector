@@ -8,7 +8,7 @@ In `pre_align`, set `tile_position_params.enabled: true` to solve global tile po
 
 1. Copy [`config_example/detection_config.example.json`](config_example/detection_config.example.json) to `config/config.json` and [`config_example/visualization_config.example.json`](config_example/visualization_config.example.json) to `config/vis_config.json`.
 2. Replace the example image, model, and result paths. `config/` is local and ignored by Git; the files in `config_example/` are generic templates. Configuration files accept `//` comments.
-3. Set `pipeline_mode: "pre_align"` and `tile_position_params.enabled: true` to solve tile positions from detections. Set `stop_before_stitching: true` to stop after the XMLs are written, before Stage 3.
+3. Set `pipeline_mode: "pre_align"` and `tile_position_params.enabled: true` to solve tile positions from detections. Set `stop_after_step: "tile_positions"` to stop after the XMLs are written.
 4. Run detection and inspect the filtered tile results:
 
 ```bash
@@ -34,11 +34,11 @@ The expected image layout is a channel directory containing row directories and 
 | 3 | Place filtered boxes in global coordinates, link detections across Z, and colocalize channels | `5_2d_global/`, `6_3d_global/`, `7_colocalization/` |
 | 4 | Save cell centroids and optional summary statistics | `7_colocalization/cell_centroids/` |
 
-`stop_after_detection: true` exits after Stage 2. With the tile solver enabled, `stop_before_stitching: true` exits after Stage 2.9 has written the XMLs. Without it, the stop point remains after tile filtering. Completed CSV and PKL checkpoints are reused only when their provenance manifests match the source files and settings. Keep `runtime_config.json` with the results: it records the original run, later runs, model and code hashes, and coordinate settings.
+`stop_after_step` selects any named processing boundary or its stage number; `null` runs all steps. For example, `"detection"` (2) stops after raw detection, `"alignment"` (2.5) after saved channel offsets, `"alignment_qc"` (2.55) after optional QC, `"tile_positions"` (2.9) after XML publication, `"z_linking"` (3) after channel stitching/tracking, and `"colocalization"` (3.5) before exports. Disabled optional boundaries are rejected before processing. See [all steps and QC options](docs/alignment_qc.md). Completed CSV and PKL checkpoints are reused only when their provenance manifests match the source files and settings. Keep `runtime_config.json` with the results: it records the original run, later runs, model and code hashes, and coordinate settings.
 
 Filtering has one path and no `stage_2_75_enabled` switch. In `pre_align`, raw detections are filtered once into `2_2d_filtered/` before channel alignment. The aligned single-channel CSVs are copied from `3_2d_aligned/` into `4_2d_filtered/` without a second filter; fused double-exposure CSVs are filtered when published. In `post_align`, raw detections are filtered directly into `4_2d_filtered/`.
 
-`start_from_stage: 1` scans image directories. Values of 2 or greater read existing raw detection CSVs from `paths.pATHRESULT/1_2d_raw` and skip detection. In `pre_align`, the pipeline filters these CSVs before estimating tile channel shifts; Stage 3 stitches the aligned, filtered CSVs.
+Runs automatically validate and reuse completed checkpoints; `start_from_stage` is obsolete. Set `stop_after_step` to `null` or a later boundary to resume beyond a previous stop.
 
 ## Four-channel alignment in `pre_align`
 
@@ -409,3 +409,7 @@ Independent annotated ROI evaluation is available in compare_qc_gt.py with
 [its config template](config_example/qc_ground_truth.example.json).
 See [QC usage and publication validation](docs/pipeline_qc.md) for scope, GT formats,
 path mappings, thresholds, and independent test-set design.
+
+## Optional alignment sensitivity QC
+
+Set `qc.alignment.enabled: true` or pass `--alignment-qc` to inference. The QC reads saved channel offsets and held-out detections/images; it writes RFP/soma voxel IoU and Sox9/Olig2 bright-region center sensitivity into `<results>/qc/alignment/`. Run it independently with `python -m src.qc.alignment --sample <results> --qc-config config_example/alignment_qc.example.json`. See [alignment QC and stop controls](docs/alignment_qc.md).

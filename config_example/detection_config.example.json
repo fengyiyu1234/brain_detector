@@ -68,7 +68,7 @@
     },
     // With enabled=true, run_inference.py stitches raw images after XML generation.
     // src/core/stitch_raw_tiles.py can also run separately with this config.
-    // stop_before_stitching=true exits before direct image stitching.
+    // stop_after_step="tile_positions" exits after XML generation, before image stitching.
     // Omit markers to stitch every active channel; list a subset if needed.
     "direct_stitching": {
         "enabled": false,
@@ -112,10 +112,40 @@
         "tile_overlap_pct": 15,
         "n_workers": 4
     },
-    "stop_after_detection": false,
-    // True writes the solved XMLs, then exits before global cell stitching.
-    "stop_before_stitching": true,
-    // Use 1 for detection; use 2 to read pATHRESULT/1_tile_2d_raw and skip detection.
+    // Stop after a named step or stage number; null completes the pipeline.
+    "stop_after_step": "tile_positions",
+    // Optional alignment sensitivity QC; also runnable with python -m src.qc.alignment.
+    "qc": {
+      "alignment": {
+        "enabled": false,
+        "reference_channel": "GFP",
+        "soma_channels": [
+          "RFP"
+        ],
+        "tf_channels": [
+          "Sox9",
+          "Olig2"
+        ],
+        "xy_range_um": 20,
+        "z_range_um": 40,
+        "workers": 4,
+        "fail_on_error": false,
+        "output_dir": "qc/alignment",
+        "formats": [
+          "png",
+          "pdf"
+        ],
+        "sampling": {
+          "seed": 42,
+          "z_size_slices": 10,
+          "z_guard_slices": null,
+          "max_attempts": 50,
+          "min_pairs": 10
+        }
+      }
+    },
+
+
 
     "ENABLE_Z_LINKER": true,
     "stage3_n_workers": null,

@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 from src.config.loader import load_config, expand_double_exposure_channels
 from src.core.result_layout import migrate_result_layout, result_paths
+from src.core.pipeline_steps import resolve_stop_step, stop_after
 from src.core.resume import (channel_sources, downstream_directory, resume_config, raw_detection_settings)
 from src.utils.logger import setup_logging
 from src.utils.io import (listTile, listTile_from_local_csvs, loadTeraxml,
@@ -414,8 +415,18 @@ if __name__ == '__main__':
         default=os.path.join(project_root, 'config', 'config.json'),
         help='Path to config.json (default: <project_root>/config/config.json)',
     )
+    parser.add_argument('--stop-after-step', help='Stop after a named step or stage number; none runs all steps')
+    qc_switch = parser.add_mutually_exclusive_group()
+    qc_switch.add_argument('--alignment-qc', dest='alignment_qc', action='store_true')
+    qc_switch.add_argument('--no-alignment-qc', dest='alignment_qc', action='store_false')
+    parser.set_defaults(alignment_qc=None)
     args = parser.parse_args()
     config = load_config(args.config)
+    if args.stop_after_step is not None:
+        config['stop_after_step'] = None if args.stop_after_step.lower() == 'none' else args.stop_after_step
+    if args.alignment_qc is not None:
+        config.setdefault('qc', {}).setdefault('alignment', {})['enabled'] = args.alignment_qc
+    resolve_stop_step(config)
     config['device'] = device
     paths = config['paths']
     dp = config['detection_params']
@@ -516,6 +527,8 @@ if __name__ == '__main__':
 
     pATHTILE_all = pATHTILE
 
+    stop_after(config, 'setup')
+
     # TeraStitcher XML is needed only for global stitching in Stage 3.
     # Detection and tile-level alignment/filtering can run before stitching finishes.
 
@@ -562,10 +575,7 @@ if __name__ == '__main__':
                     raise ValueError(f'Incomplete legacy raw CSV: {_raw_csv}')
                 logging.warning("Legacy raw CSV has no TIFF/input manifest: %s", _raw_csv)
 
-    if config.get('stop_after_detection', False):
-        logging.info("🛑 stop_after_detection=true：Stage 1 完成，正常退出。Stage 2~5 可在 CPU 或单 GPU 上单独运行。")
-        sys.exit(0)
-
+    stop_after(config, 'detection')
     # ==========================================
     # Stage 2.5: align channel point clouds in pre-align mode.
     # ==========================================
@@ -574,6 +584,7 @@ if __name__ == '__main__':
             config, [os.path.basename(p) for p in pATHTILE_all],
             detect_routing_config, derived['pATH_DET_RES'],
             derived['pATH_DET_PREALIGN_FILTERED'])
+    stop_after(config, 'filtering')
 
     if pipeline_mode == 'pre_align':
         align_done_flag = os.path.join(derived['pATH_ALIGN_OFFSETS'], "_align_done.flag")
@@ -622,6 +633,14 @@ if __name__ == '__main__':
             [ch['id'] for ch in routing_config],
             align_settings['stitching_reference_channel'],
         )
+
+    stop_after(config, 'alignment')
+    from src.qc.run_qc import run_alignment_stage
+    qc_report = run_alignment_stage(config, base_res_path,
+                                    [os.path.basename(p) for p in pATHTILE_all])
+    if config.get('stop_after_step') == 'alignment_qc' and qc_report['status'] == 'failed':
+        raise RuntimeError('Alignment QC failed; see qc/alignment/run_details.json')
+    stop_after(config, 'alignment_qc')
 
     _de_channels = [ch for ch in routing_config if ch.get('double_exposure')]
     _tile_names_all = [os.path.split(p)[-1] for p in pATHTILE_all]
@@ -702,6 +721,8 @@ if __name__ == '__main__':
 
         write_fusion_summary(_tile_names_all, _de_channels, _fusion_dst)
 
+
+    stop_after(config, 'fusion')
 
     # ==========================================
     # Stage 2.75: publish filtered, aligned tile CSVs for Stage 3.
@@ -802,6 +823,8 @@ if __name__ == '__main__':
 
     pATH_SRC_CSV = derived['channel_sources']
 
+    stop_after(config, 'publish_filtered')
+
     # ==========================================
     # Stage 2.8: generate raw 2D histograms of intensity and area.
     # Input: _filter_src (raw CSV).
@@ -848,10 +871,10 @@ if __name__ == '__main__':
             plt.close(fig)
         logging.info(f"✔️ [2.8] 直方图输出至: {_hist_dir}")
 
+    stop_after(config, 'histograms')
+
     # ==========================================
     # Tile-level stages do not need TeraStitcher XML.
-    # Set stop_before_stitching=true to stop here while stitching is unfinished.
-    # After stitching, set it to false; checkpoints resume at Stage 3.
     # Stage 2.9: optionally solve tile geometry and publish XMLs before Stage 3.
     # The stop point below leaves the generated XMLs ready for image merging.
     if solve_tile_positions:
@@ -867,10 +890,7 @@ if __name__ == '__main__':
         logging.info("Stage 2.9 tile positions %s: %s",
                      "computed" if recomputed else "reused", frame_xml)
 
-    if config.get('stop_before_stitching', False):
-        logging.info("stop_before_stitching=true: tile stages and enabled tile "
-                     "position solving are complete; exiting before Stage 3.")
-        sys.exit(0)
+    stop_after(config, 'tile_positions')
 
     # Load TeraStitcher XML.
     # Use generated frame XML for tile-position solving; otherwise use configured paths.
@@ -942,6 +962,7 @@ if __name__ == '__main__':
         from src.core.stitch_raw_tiles import run as run_direct_stitching
         logging.info("Direct image stitching enabled; stitching raw channels before Stage 3.")
         run_direct_stitching(Path(args.config), skip_completed=True)
+    stop_after(config, 'image_stitching')
 
     routing_config = [ch for ch in config.get('channels_routing', []) if ch.get('active', True)]
     num_tiles = len(pATHTILE_all)
@@ -970,6 +991,8 @@ if __name__ == '__main__':
         pATH_SRC_CSV, derived['pATH_GLOBAL_2D'], derived['pATH_CHANNEL_3D'], geom, zl_params,
         base_res_path)
 
+
+    stop_after(config, 'z_linking')
 
     bbox_path = os.path.join(derived['pATH_COLOCALIZATION'], "coloc_result.csv")
     source_3d_path = os.path.join(
@@ -1223,6 +1246,8 @@ if __name__ == '__main__':
              decisions_path, *class_paths],
             stage4_input_signature(derived, routing_config, config, pATHxml))
 
+    stop_after(config, 'colocalization')
+
     # ==========================================
     # Stage 4: generate analysis statistics and centroids.
     # ==========================================
@@ -1235,6 +1260,7 @@ if __name__ == '__main__':
         'export_version': 1,
     }
     if output_manifest_valid(export_manifest, export_signature):
+        stop_after(config, 'exports')
         logging.info('Exports complete; all pipeline checkpoints reused successfully.')
         sys.exit(0)
     export_paths = []
@@ -1310,5 +1336,7 @@ if __name__ == '__main__':
             export_paths.append(report_path)
         write_output_manifest(export_manifest, export_paths, export_signature)
         logging.info("Stage 4 complete: cell centroids written.")
+
+    stop_after(config, 'exports')
 
     logging.info(f"🎉 动态多通道推断全部完成！总耗时: {(time.time() - start_time)/60:.2f} 分钟。")
