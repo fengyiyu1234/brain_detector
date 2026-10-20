@@ -49,3 +49,6 @@ src/gui/
 !docs/pipeline_resume.md
 
 !docs/alignment_qc.md
+
+# PC-local launch scripts (for example inference_t70_local.py)
+/scripts/*_local.*

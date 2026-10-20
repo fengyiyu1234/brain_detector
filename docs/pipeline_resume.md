@@ -1,4 +1,4 @@
-﻿# Automatic pipeline resume
+# Automatic pipeline resume
 
 Run the same command for new and interrupted samples:
 
@@ -66,3 +66,36 @@ Updates to alignment checkpoint handling in this release explicitly recognize th
 previous aligner fingerprint because its numerical algorithm is unchanged. Future
 numerical changes must update compatibility/version checks, not silently accept
 old algorithm fingerprints.
+
+## Windows PC: resume T70
+
+From the project root in PowerShell, run:
+
+```powershell
+cmd /d /c scripts\inference_t70_local.cmd
+```
+
+The CMD wrapper selects this PC's `%LOCALAPPDATA%\miniconda3\envs\brain_detector\python.exe`.
+Alternatively, activate the `brain_detector` environment and run
+`python -u scripts/inference_t70_local.py` directly. `/d` skips CMD AutoRun hooks.
+
+The launcher reads `config/EGFR/2/config_EGFR_t70.json`, maps the four image
+folders and `detection_results3` to the accessible Windows sample folder, and
+writes the resolved config to `detection_results3/local_config.json` (replaced
+on each launch). Console logs remain under `scripts/logs/t70_local_*.log`.
+It retains the existing inference/filter/alignment parameters and uses the normal
+automatic resume entry point. Missing runtime metadata is handled by that entry
+point. By default alignment/tile solving use four CPU workers and Stage 3 runs
+one channel at a time to reduce peak memory.
+
+```powershell
+# Check paths and generate the local config without starting the pipeline:
+cmd /d /c scripts\inference_t70_local.cmd --prepare-only
+# Adjust CPU workers; Stage 3 remains one channel at a time:
+cmd /d /c scripts\inference_t70_local.cmd --workers 4 --stage3-workers 1
+# Optional alternate sample storage (must contain all images and results):
+cmd /d /c scripts\inference_t70_local.cmd --sample-dir D:\EGFR_brain\T70
+```
+
+Computation runs on the PC; the default sample folders still reside on the Y:
+network share, which must stay reachable. Keep the console open during the run.

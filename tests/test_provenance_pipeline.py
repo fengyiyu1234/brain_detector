@@ -184,6 +184,51 @@ class ProvenancePipelineTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'input image changed'):
                 validate_raw_input_manifest(manifest, output)
 
+    def test_raw_manifest_relocated_image_paths_keep_integrity_checks(self):
+        from src.core.provenance import file_stamp
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            tile = root / '640nm' / '305500' / '305500_319100'
+            tile.mkdir(parents=True)
+            image = tile / '305500_319100_254000.tiff'
+            image.write_bytes(b'original image')
+            stamp = file_stamp(image)
+            output = root / 'tile_GFP_result.csv'
+            output.write_bytes(b'id\n1\n')
+            manifest = root / 'tile_GFP_inputs.json'
+            for prefix in ('/hpc/T70/640nm/305500/', 'Z:\\old\\T70\\640nm\\305500\\'):
+                with self.subTest(prefix=prefix):
+                    record = {**stamp, 'status': 'processed',
+                              'path': prefix + '305500_319100/' + image.name}
+                    manifest.write_text(json.dumps({
+                        'images': [record], 'output_size': output.stat().st_size,
+                        'output_sha256': file_sha256(output),
+                    }), encoding='utf-8')
+                    original_manifest = manifest.read_bytes()
+                    validate_raw_input_manifest(manifest, str(output), image_dir=tile)
+                    self.assertEqual(manifest.read_bytes(), original_manifest)
+                    import os
+                    if os.name == 'nt':
+                        payload = json.loads(original_manifest)
+                        payload['images'][0]['mtime_ns'] += 43
+                        manifest.write_text(json.dumps(payload), encoding='utf-8')
+                        validate_raw_input_manifest(manifest, str(output), image_dir=tile)
+                        payload['images'][0]['mtime_ns'] = stamp['mtime_ns'] + 100
+                        manifest.write_text(json.dumps(payload), encoding='utf-8')
+                        with self.assertRaisesRegex(RuntimeError, 'input image changed'):
+                            validate_raw_input_manifest(manifest, str(output), image_dir=tile)
+                        manifest.write_bytes(original_manifest)
+                    image.write_bytes(b'changed image content')
+                    with self.assertRaisesRegex(RuntimeError, 'input image changed'):
+                        validate_raw_input_manifest(manifest, str(output), image_dir=tile)
+                    image.unlink()
+                    with self.assertRaisesRegex(RuntimeError, 'input image disappeared'):
+                        validate_raw_input_manifest(manifest, str(output), image_dir=tile)
+                    image.write_bytes(b'original image')
+                    # Restore the original stamp for the next path spelling.
+                    import os
+                    os.utime(image, ns=(stamp['mtime_ns'], stamp['mtime_ns']))
+
     def test_manifest_detects_modified_member(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

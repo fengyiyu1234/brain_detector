@@ -160,8 +160,8 @@ def model_fingerprints(models, project_root):
     return result
 
 
-def validate_raw_input_manifest(manifest_path, output_path):
-    """Check a completed raw CSV against its TIFF inputs and recorded output."""
+def validate_raw_input_manifest(manifest_path, output_path, image_dir=None):
+    """Check raw outputs and TIFF stamps, resolving relocated inputs in image_dir."""
     with open(manifest_path, encoding="utf-8") as handle:
         manifest = json.load(handle)
     if (os.path.getsize(output_path) != manifest.get("output_size") or
@@ -180,12 +180,27 @@ def validate_raw_input_manifest(manifest_path, output_path):
         path = image.get("path")
         if not path:
             continue
+        if image_dir is not None:
+            # The caller supplies this channel's current tile directory. Never
+            # fall back to another sample/channel at a recorded absolute path.
+            parts = path.replace("\\", "/").split("/")
+            if (len(parts) < 2 or parts[-2] != Path(image_dir).name
+                    or parts[-1] in ("", ".", "..")):
+                raise RuntimeError(f"Raw input image tile differs from current tile: {path}")
+            path = os.path.join(image_dir, parts[-1])
         exists = os.path.isfile(path)
         if image.get("status") == "processed" and not exists:
             raise RuntimeError(f"Raw input image disappeared: {path}")
         if exists:
             now = file_stamp(path)
+            recorded_mtime = image.get("mtime_ns")
+            current_mtime = now["mtime_ns"]
+            # SMB exposes Linux timestamps at Windows FILETIME's 100 ns
+            # precision. Discard only the unrepresentable fractional ticks.
+            if os.name == "nt" and isinstance(recorded_mtime, int):
+                recorded_mtime //= 100
+                current_mtime //= 100
             if (now["size"] != image.get("size") or
-                    now["mtime_ns"] != image.get("mtime_ns")):
+                    current_mtime != recorded_mtime):
                 raise RuntimeError(f"Raw input image changed: {path}")
     return manifest

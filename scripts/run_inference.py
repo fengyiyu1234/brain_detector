@@ -567,7 +567,9 @@ if __name__ == '__main__':
             _raw_csv = os.path.join(derived['pATH_DET_RES'], _prefix + '_result.csv')
             _raw_manifest = os.path.join(derived['pATH_DET_RES'], _prefix + '_inputs.json')
             if os.path.isfile(_raw_manifest):
-                validate_raw_input_manifest(_raw_manifest, _raw_csv)
+                _image_dir = os.path.join(
+                    paths[_ch['dir_key']], os.path.relpath(_tile_path, anchor_dir))
+                validate_raw_input_manifest(_raw_manifest, _raw_csv, image_dir=_image_dir)
             else:
                 with open(_raw_csv, newline='', encoding='utf-8') as handle:
                     header = next(csv.reader(handle), [])
