@@ -804,6 +804,11 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
                      dtype=float)
     s_zmin = np.array([s['z_min'] for s in soma_vol_list])
     s_zmax = np.array([s['z_max'] for s in soma_vol_list])
+    # 质心距离硬门限要求 dist <= ratio * soma_radius <= ratio * max_radius，
+    # 所以查询半径取 ratio * max_radius 不会漏掉任何能通过门限的配对；
+    # 旧的 2 * max_radius 在有个别超大 soma 框时会让候选数膨胀约 80 倍（ERH: 650px vs 114px）。
+    # 微小容差只为防止浮点边界上的舍入差异。
+    query_radius = max_center_dist_ratio * max_radius * (1 + 1e-9) + 1e-6
 
     # 分块批量处理：一次查询一整块 TF 的候选 soma，包含判断用数组运算（与逐个比较逐位相同）；
     # 只有通过包含判断的配对才进入原来的逐对距离判定，候选顺序与单点查询相同，
@@ -817,7 +822,7 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
         t_zmin = np.array([t['z_min'] for t in chunk])
         t_zmax = np.array([t['z_max'] for t in chunk])
 
-        cands = tree.query_ball_point(tf_pts, r=max_radius * 2, return_sorted=False, workers=-1)
+        cands = tree.query_ball_point(tf_pts, r=query_radius, return_sorted=False, workers=-1)
         counts = np.fromiter((len(c) for c in cands), dtype=np.int64, count=len(cands))
         if counts.sum() == 0:
             continue

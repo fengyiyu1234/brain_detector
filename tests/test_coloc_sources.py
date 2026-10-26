@@ -122,6 +122,16 @@ class ColocSourcesTest(unittest.TestCase):
         self.assertEqual(json.loads(results[0][1]['tf_positive_channels']),
                          ['Sox9', 'Olig2'])
 
+    def test_tf_on_center_distance_boundary_still_matches(self):
+        # radius = hypot(40, 30) / 2 = 25, gate = 0.4 * 25 = 10; the TF sits at exactly 10px,
+        # so the search radius (derived from the gate) must not drop it.
+        soma = volume("neuron_GFP", 20, 15, 10, (0, 0, 40, 30), {10: (0, 0, 40, 30)})
+        sox9 = volume("nucleus_Sox9", 30, 15, 10, (28, 13, 32, 17), {10: (28, 13, 32, 17)})
+        annotate_soma_with_tf_containment(
+            [soma], [sox9], z_pad=0, max_center_dist_ratio=0.4, source_channel="Sox9")
+        self.assertEqual(soma["class"], "neuron_GFP_Sox9")
+        self.assertEqual(soma["match_evidence"][0]["center_distance"], 10.0)
+
     def test_tf_positivity_counts_unique_channels(self):
         soma = {'source_tracks': [('GFP', {}), ('Sox9', {}), ('Sox9', {})]}
         status = colocalization_status(soma, ['GFP', 'RFP'], ['Sox9', 'Olig2'])

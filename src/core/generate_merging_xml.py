@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from src.config.loader import load_config
+from src.config.loader import load_config, require_resolved_result_dir
 
 TILE_RE = re.compile(r"^(\d+)_(\d+)$")
 AXES = ("x", "y", "z")
@@ -264,6 +264,8 @@ def main():
     parser.add_argument("--force", action="store_true", help="Replace existing generated XMLs")
     args = parser.parse_args()
     config = load_config(args.config)
+    if not args.positions:
+        require_resolved_result_dir(config)
     positions = args.positions or (Path(config["paths"]["pATHRESULT"]) /
                                    "5_2d_global/tile_positions/tile_positions.csv")
     generate(args.config, positions, args.bytes_per_channel, args.force)

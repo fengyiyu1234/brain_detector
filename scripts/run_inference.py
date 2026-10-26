@@ -21,7 +21,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
-from src.config.loader import load_config, expand_double_exposure_channels
+from src.config.loader import load_config, expand_double_exposure_channels, expand_result_date
 from src.core.result_layout import migrate_result_layout, result_paths
 from src.core.pipeline_steps import resolve_stop_step, stop_after
 from src.core.resume import (channel_sources, downstream_directory, resume_config, raw_detection_settings)
@@ -421,7 +421,7 @@ if __name__ == '__main__':
     qc_switch.add_argument('--no-alignment-qc', dest='alignment_qc', action='store_false')
     parser.set_defaults(alignment_qc=None)
     args = parser.parse_args()
-    config = load_config(args.config)
+    config = expand_result_date(load_config(args.config))
     if args.stop_after_step is not None:
         config['stop_after_step'] = None if args.stop_after_step.lower() == 'none' else args.stop_after_step
     if args.alignment_qc is not None:

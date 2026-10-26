@@ -37,6 +37,30 @@ def load_config(config_path):
     return json.loads(_strip_comments(raw))
 
 
+def expand_result_date(config):
+    """Replace '{date}' in paths.pATHRESULT with today's date (YYYYMMDD), in place.
+
+    Only run_inference.py and its launchers call this; QC/GUI tools keep reading
+    the resolved path from the saved runtime/local config. To resume a run on a
+    later day, replace '{date}' with the original date in the config."""
+    import datetime
+    paths = config.get('paths', {})
+    if paths.get('pATHRESULT'):
+        paths['pATHRESULT'] = paths['pATHRESULT'].replace(
+            '{date}', datetime.date.today().strftime('%Y%m%d'))
+    return config
+
+
+def require_resolved_result_dir(config):
+    """Fail if paths.pATHRESULT still contains '{date}' (for tools that must not guess a date)."""
+    result = config.get('paths', {}).get('pATHRESULT') or ''
+    if '{date}' in result:
+        raise ValueError(
+            f"paths.pATHRESULT still contains '{{date}}': {result}. "
+            "Set the fixed result directory (e.g. replace {date} with the run date) in the config.")
+    return config
+
+
 def expand_double_exposure_channels(routing_config):
     """For each active channel with double_exposure=true, append a synthetic
     detection-only entry for its second_intensity_id/dir_key. Used ONLY for Stage 2

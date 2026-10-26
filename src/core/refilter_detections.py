@@ -16,7 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import pandas as pd
 
-from src.config.loader import load_config
+from src.config.loader import load_config, require_resolved_result_dir
 from src.core.provenance import file_stamp, provenance_columns
 from src.core.provenance import file_stamp, provenance_columns
 from src.core.detection_filter import (
@@ -62,7 +62,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     started = time.time()
-    config = load_config(args.config)
+    config = require_resolved_result_dir(load_config(args.config))
     channels = [ch for ch in config.get("channels_routing", []) if ch.get("active", True)]
     selected_ids = args.channels or [ch["id"] for ch in channels]
     by_id = {ch["id"]: ch for ch in channels}

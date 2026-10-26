@@ -20,7 +20,7 @@ import os
 from pathlib import Path
 import time
 
-from src.config.loader import load_config
+from src.config.loader import load_config, require_resolved_result_dir
 from src.core.detection_filter import (
     FILTER_SCHEMA_VERSION, filter_detection_df, resolve_filter_params,
 )
@@ -174,7 +174,10 @@ def main(argv=None):
     started = time.time()
     if args.workers < 1:
         raise ValueError('--workers must be positive')
-    config = local_config(load_config(args.config), args.local_root, args.results_dir)
+    config = load_config(args.config)
+    if not args.results_dir:
+        require_resolved_result_dir(config)
+    config = local_config(config, args.local_root, args.results_dir)
     if config.get('pipeline_mode') != 'pre_align':
         raise ValueError('This entry point requires pipeline_mode=pre_align')
     routing = [ch for ch in config['channels_routing'] if ch.get('active', True)]
