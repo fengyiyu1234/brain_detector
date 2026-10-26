@@ -875,3 +875,43 @@ python src/utils/validate_align_shifts.py \
 ### 下一步
 
 使用原 `scripts/inference_t70.sh` 提交 T70，检查日志是否复用检测、过滤和对齐，并从 tile positions／XML、全局 2D、Z-Link、共定位及导出继续。实际 T70 全样本下游尚未运行验证；如果发现已完成结果的真实冲突，应检查具体文件及阶段记录，不直接覆盖人工检查后的结果。
+
+---
+
+## 2026-10-26 对齐层数改为 100、gpu30 作业卡住、续跑 checkpoint 提速
+
+### 背景与问题
+
+- 所有样本的对齐采样层数统一改为 100：12 份 config 的 `sample_z_center_count` 50 → 100（EGFR4、t10、t4、ET10、ETail、TSC10/11/12q/12q_local/12t/18/8）。t70、ERH 原本已是 `sample_z_count: 100`（ERH 实际取第 501–600 层）。
+- LSF bme_gpu 作业在 gpu30 上全部卡在 `Starting`，从未进入 `Running`（本人 423258、423391，以及他人 423080）。Slurm 中 gpu30 为 `DOWN+NOT_RESPONDING`，且本账户在 `gpu_partners` 只有 `short_gpu` QOS，没有 bme partner QOS，暂不改用 Slurm。`gpu_l40s` 组实际有 gpu27–31，gpu31 可正常运行，临时用 `bsub -m gpu31` 提交。
+- ERH 重跑时 Checkpoint 1 之后长时间无输出；而且在只改了共定位代码的情况下，Stage 2.6 融合和 Stage 3 拼接也被重新计算。
+
+### 修改与关键决定
+
+1. **ET10 结果归档**：改为 100 层后，ET10 因 `check_align_settings` 报 50 → 100 不一致而退出。已将 `3_2d_aligned`、`5_2d_global`、`6_3d_global`、`7_colocalization` 移到 `detection_results_20261021/old_results_align50/`（未删除），保留 `1_2d_raw`、`2_2d_filtered`。其他用 50 层跑过对齐的样本需要做同样的归档。
+2. **Checkpoint 1 后的 raw 校验改为只查文件是否存在**（`scripts/run_inference.py`）：原逻辑对每个 tile×通道的 raw CSV 及 sidecar 计算 sha256，并对每张 TIFF 做 stat（ERH 约 19 万次 `/rsstu` 访问）。如今只确认 `*_result.csv` 存在。代价是不再自动发现原始 TIFF 或 raw CSV 被替换；`validate_raw_input_manifest` 保留，可在需要时手动调用。
+3. **融合与拼接 checkpoint 只对实际调用的函数做 hash**：原来 Stage 2.6 的 `fusion_code_sha256` 和 Stage 3 拼接签名都对整个 `stitcher.py` 做 hash，commit `93f26c8` 只改了共定位函数 `annotate_soma_with_tf_containment`，也会触发两步重算。
+   - 新增 `provenance.source_sha256(module, names)`，只对列出的函数源码和常量做 hash，支持用 `'package.module:name'` 写其他模块里的函数。
+   - `stitcher.py` 末尾新增 `FUSION_CODE`（`fuse_dual_intensity_2d` 及其辅助函数、常量、`src.utils.markers:clean_markers`）和 `STITCH_CODE`（`combine_predictions` 等）。
+   - `run_inference.py` 的融合签名、`channel_stage3.py` 的 `code_sha256['stitcher.py']` 改为使用上述 hash。Stage 4 共定位签名不变，仍对整个 `stitcher.py`、`run_inference.py` 做 hash。
+   - 新增 `tests/test_checkpoint_code_lists.py`：用 AST 追踪列表中函数用到的项目内函数和常量（包括跨模块），有遗漏时测试失败。规则写进了新建的 `CLAUDE.md`。
+4. **作业脚本**：`inference_ET10.sh` 增加带时间戳的分步日志（同时写 `.out`/`.err`），python 加 `-u`，并加 GPU 检查和退出码；`inference_ET10.slurm` 资源与 sh 对齐（4 CPU、128G、12h、`gpu:1`），也加了分步日志。
+
+### ERH 双曝光说明
+
+旧作业 401644（10/20）已做过 GFP 双曝光融合，Stage 3 的 GFP 用的就是融合结果（991072 框 / 524897 细胞，与这次重跑一致）。该作业在 Stage 3 共定位时以 exit 140 被终止（24h 时限），`7_colocalization` 为空。本次重跑覆盖 `5_2d_global`/`6_3d_global` 不会改变结果，共定位会首次完成。
+
+另外，ERH 有 15 个 tile 的对齐得分为 0、偏移全为 0（主要在 x=376600 一列，可能是 501–600 层细胞太少的边缘 tile），尚未进一步核查。
+
+### 验证与当前状态
+
+- 本机 `brain_detector` 环境下以下测试全部通过：test_automatic_resume（9）、test_provenance_pipeline（10）、test_pipeline_steps（2）、test_coloc_sources（7）、test_stitcher_overlap（3）、test_pipeline_filter_inputs（3）、test_checkpoint_code_lists（2）。
+- 首次使用新的 hash 方式时，已有的融合和拼接 checkpoint 会再失效一次（预计融合约 3 min，拼接十几分钟），之后无关改动不再触发重算。正在运行的 ERH 作业 423504 用的是旧代码。
+- 代码改动尚未 commit。
+
+### 下一步
+
+- 用 `bsub -m gpu31` 重新提交 ET10，确认 Stage 2.5 按 100 层重算。
+- 检查其他样本（ETail、TSC 等）是否已有 50 层的对齐结果，如有则归档。
+- 联系 HPC：gpu30 作业卡在启动阶段；确认 bme GPU 在 Slurm 下的 QOS/分区安排。
+- 核查 ERH 那 15 个对齐得分为 0 的 tile。

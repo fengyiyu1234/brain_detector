@@ -15,10 +15,11 @@ import pickle
 import numpy as np
 import pandas as pd
 
+from src.core import stitcher
 from src.core.stitcher import combine_predictions
 from src.core.z_linker import run_z_linker
 from src.utils.markers import channel_marker
-from src.core.provenance import (stable_id, file_stamp, file_sha256,
+from src.core.provenance import (stable_id, file_stamp, file_sha256, source_sha256,
                                  output_manifest_valid, write_output_manifest, content_signature, manifest_outputs_valid)
 
 BOX_COLS = ["x1", "y1", "x2", "y2", "score", "mean", "class", "z"]
@@ -128,9 +129,10 @@ def _stage3_input_signature(ch_id, src_dir, geom, zl_params):
         },
         'z_linker': zl_params,
         'code_sha256': {
-            name: file_sha256(os.path.join(os.path.dirname(__file__), name))
-            for name in ('channel_stage3.py', 'stitcher.py', 'z_linker.py',
-                         'provenance.py')
+            **{name: file_sha256(os.path.join(os.path.dirname(__file__), name))
+               for name in ('channel_stage3.py', 'z_linker.py', 'provenance.py')},
+            # Only the stitching functions, so colocalization edits keep 5_2d_global.
+            'stitcher.py': source_sha256(stitcher, stitcher.STITCH_CODE),
         },
     }
 

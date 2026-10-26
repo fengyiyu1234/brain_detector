@@ -1031,3 +1031,16 @@ def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, d
             (all_predictions[zi][ti], np.array(rows, dtype=object)))
 
     return all_predictions
+
+
+# Names hashed (via provenance.source_sha256) into the Stage 2.6 fusion and
+# Stage 3 stitching checkpoints; edits to other functions, e.g. colocalization,
+# no longer force those stages to recompute. Add any new helper they call;
+# helpers from other modules use 'package.module:name'. Guarded by
+# tests/test_checkpoint_code_lists.py.
+FUSION_CODE = ('fuse_dual_intensity_2d', 'merge_soma_detections_2d',
+               '_raw_df_to_tagged_box_matrix', '_iou_matrix_2d', '_merge_class',
+               'split_class', 'src.utils.markers:clean_markers',
+               '_CELL_TYPE_PRIORITY', '_DUAL_LO_TAG', '_DUAL_HI_TAG',
+               '_RAW_COLS', '_BOX_COLS')
+STITCH_CODE = ('combine_predictions', 'stitchDetection', 'non_max_suppression_iou')

@@ -26,6 +26,21 @@ def file_sha256(path, chunk_size=1024 * 1024):
     return digest.hexdigest()
 
 
+def source_sha256(module, names):
+    """Hash only the named functions/constants, so unrelated edits elsewhere in
+    the module do not invalidate checkpoints that never call them.
+    'package.module:name' refers to a helper defined in another module."""
+    import importlib
+    import inspect
+    digest = hashlib.sha256()
+    for name in names:
+        owner, _, attr = name.rpartition(':')
+        obj = getattr(importlib.import_module(owner) if owner else module, attr)
+        text = inspect.getsource(obj) if callable(obj) else repr(obj)
+        digest.update(f"{name}\0{text}\0".encode("utf-8"))
+    return digest.hexdigest()
+
+
 def file_stamp(path, with_hash=False):
     stat = os.stat(path)
     result = {"path": str(Path(path)), "size": stat.st_size,

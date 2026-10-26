@@ -43,7 +43,8 @@ from src.core.coloc_sources import (cell_id, coloc_display_box, colocalization_s
 from src.core.provenance import (provenance_columns, file_sha256, file_stamp,
                                  model_fingerprints, atomic_json,
                                  output_manifest_valid, write_output_manifest,
-                                 validate_raw_input_manifest)
+                                 source_sha256)
+from src.core import stitcher
 from src.core.tile_position_pipeline import run_tile_position_stage, tile_position_frame
 from src.core.stitcher import (match_soma_3d_iou, merge_soma_volumes_union, soma_match_metrics,
                                annotate_soma_with_tf_containment,
@@ -558,24 +559,17 @@ if __name__ == '__main__':
     else:
         logging.info("✔️ Checkpoint 1 达成: 所有 Tile 检测完成。")
 
-    # Verify newly generated raw checkpoints before downstream reuse. Legacy
-    # CSVs without manifests remain usable, but their TIFF content is unknown.
-    for _tile_path in pATHTILE:
-        _tile = os.path.basename(_tile_path)
-        for _ch in detect_routing_config:
-            _prefix = f"{_tile}_{_ch['id']}"
-            _raw_csv = os.path.join(derived['pATH_DET_RES'], _prefix + '_result.csv')
-            _raw_manifest = os.path.join(derived['pATH_DET_RES'], _prefix + '_inputs.json')
-            if os.path.isfile(_raw_manifest):
-                _image_dir = os.path.join(
-                    paths[_ch['dir_key']], os.path.relpath(_tile_path, anchor_dir))
-                validate_raw_input_manifest(_raw_manifest, _raw_csv, image_dir=_image_dir)
-            else:
-                with open(_raw_csv, newline='', encoding='utf-8') as handle:
-                    header = next(csv.reader(handle), [])
-                if not {'slice_name', 'x1', 'y1', 'x2', 'y2', 'score', 'mean', 'class', 'z'} <= set(header):
-                    raise ValueError(f'Incomplete legacy raw CSV: {_raw_csv}')
-                logging.warning("Legacy raw CSV has no TIFF/input manifest: %s", _raw_csv)
+    # Only check that raw checkpoints exist. Full manifest validation
+    # (CSV hashes + a stat per TIFF) is too slow on /rsstu; use
+    # validate_raw_input_manifest manually when input changes are suspected.
+    _missing_raw = [
+        os.path.join(derived['pATH_DET_RES'], f"{os.path.basename(p)}_{ch['id']}_result.csv")
+        for p in pATHTILE for ch in detect_routing_config
+        if not os.path.isfile(os.path.join(
+            derived['pATH_DET_RES'], f"{os.path.basename(p)}_{ch['id']}_result.csv"))]
+    if _missing_raw:
+        raise FileNotFoundError(
+            f"{len(_missing_raw)} raw detection CSV(s) missing; first: {_missing_raw[0]}")
 
     stop_after(config, 'detection')
     # ==========================================
@@ -668,8 +662,7 @@ if __name__ == '__main__':
                 'iou_threshold': channel.get('fusion_iou_thresh', 0.3),
                 'inputs': {path: file_stamp(path, with_hash=True)
                            for path in paths},
-                'fusion_code_sha256': file_sha256(os.path.join(
-                    project_root, 'src', 'core', 'stitcher.py')),
+                'fusion_code_sha256': source_sha256(stitcher, stitcher.FUSION_CODE),
             }
 
         def _fusion_manifest(tile, channel):
