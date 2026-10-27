@@ -12,7 +12,8 @@ import pandas as pd
 from src.core.detection_filter import filter_detection_df
 from src.core.provenance import (output_manifest_valid, provenance_columns,
                                  write_output_manifest, validate_raw_input_manifest,
-                                 file_sha256)
+                                 file_sha256, model_fingerprints,
+                                 comparable_model_fingerprints)
 from src.core.stitcher import (combine_predictions, fuse_dual_intensity_2d,
                                stitchDetection)
 from src.core.z_linker import run_z_linker
@@ -239,6 +240,29 @@ class ProvenancePipelineTest(unittest.TestCase):
             self.assertTrue(output_manifest_valid(manifest, {"config": "one"}))
             output.write_text("id\n2\n", encoding="utf-8")
             self.assertFalse(output_manifest_valid(manifest, {"config": "one"}))
+
+    def test_model_fingerprint_ignores_unrelated_weights_in_stardist_basedir(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "models" / "sd").mkdir(parents=True)
+            (root / "models" / "sd" / "weights_best.h5").write_bytes(b"sd")
+            (root / "models" / "yolo.pt").write_bytes(b"yolo")
+            models = {"stardist_basedir": "models", "stardist_name": "sd",
+                      "yolo_path": "models/yolo.pt"}
+            current = model_fingerprints(models, root)
+            self.assertEqual(set(current["stardist_basedir"]["files"]), {"sd/weights_best.h5"})
+            # Records written before the fix hashed every file in the basedir.
+            legacy = json.loads(json.dumps(current))
+            legacy["stardist_basedir"]["files"]["old_unused.pt"] = "deleted"
+            self.assertEqual(comparable_model_fingerprints(legacy, models),
+                             comparable_model_fingerprints(current, models))
+            (root / "models" / "sd" / "weights_best.h5").write_bytes(b"retrained")
+            self.assertNotEqual(comparable_model_fingerprints(legacy, models),
+                                comparable_model_fingerprints(
+                                    model_fingerprints(models, root), models))
+            (root / "models" / "yolo.pt").write_bytes(b"retrained")
+            changed = model_fingerprints(models, root)
+            self.assertNotEqual(current["yolo_path"], changed["yolo_path"])
 
 
 if __name__ == "__main__":

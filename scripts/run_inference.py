@@ -41,7 +41,8 @@ from src.core.coloc_sources import (cell_id, coloc_display_box, colocalization_s
                                     write_match_evidence, write_source_3d,
                                     write_source_boxes)
 from src.core.provenance import (provenance_columns, file_sha256, file_stamp,
-                                 model_fingerprints, atomic_json,
+                                 model_fingerprints, comparable_model_fingerprints,
+                                 atomic_json,
                                  output_manifest_valid, write_output_manifest,
                                  source_sha256)
 from src.core import stitcher
@@ -255,12 +256,10 @@ def validate_reused_provenance(previous, current, derived, model_hashes):
         if raw_detection_settings(previous) != raw_detection_settings(current):
             changed.append('detection_params (inference only)')
         old_hashes = (previous.get('provenance') or {}).get('model_sha256')
-        def content_only(fingerprints):
-            return {name: {key: value for key, value in record.items()
-                           if key in ('sha256', 'files', 'configured_value')}
-                    for name, record in fingerprints.items()}
+        models = current.get('models')
         if (old_hashes is not None and
-                content_only(old_hashes) != content_only(model_hashes)):
+                comparable_model_fingerprints(old_hashes, models) !=
+                comparable_model_fingerprints(model_hashes, models)):
             changed.append('model_content')
         if changed:
             raise ValueError(

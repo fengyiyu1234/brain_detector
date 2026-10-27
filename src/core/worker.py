@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 import torch
 from src.utils.logger import setup_logging
+from src.utils.io import listTile
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,15 @@ def stardist_regions_with_scores(labels, details, image):
             raise ValueError(f"StarDist label {region.label} has no instance probability")
         yield region, float(probabilities[index])
 
+def tile_progress(pATHTEST, anchor_root):
+    """Return '（k/N）' for this tile within the anchor channel's full tile list."""
+    try:
+        tiles = [os.path.abspath(p) for p in listTile(anchor_root)[1]]
+        return f"（{tiles.index(os.path.abspath(pATHTEST)) + 1}/{len(tiles)}）"
+    except (OSError, ValueError):
+        return ""
+
+
 def process_single_tile(i, pATHTEST, config):
     current_logger = logging.getLogger(__name__)
     dir_name = os.path.basename(pATHTEST)
@@ -153,7 +163,8 @@ def process_single_tile(i, pATHTEST, config):
         return [], dir_name
 
     # --- 3. 打印确认通道路由 (模型已在 init_worker 中加载) ---
-    print(f"\n[{dir_name}] === 确认通道推理路由 ===")
+    progress = tile_progress(pATHTEST, paths[routing_config[0]['dir_key']])
+    print(f"\n[{dir_name}]{progress} === 确认通道推理路由 ===")
     for ch in channels_to_run:
         ch_dir = paths.get(ch['dir_key'], 'Unknown')
         print(f" -> 通道: {ch['id']} ({ch.get('type', 'N/A')}) | 模型: {ch['model'].upper()} | 路径: {ch_dir}")
@@ -531,7 +542,7 @@ def process_single_tile(i, pATHTEST, config):
     # =========================================================
     # 步骤 6: 彻底移除局部统计，仅做内存清理与退出
     # =========================================================
-    print(f"✅ Tile {dir_name} 单通道 2D 特征提取完成，已移交至全局 CSV。")
+    print(f"✅ Tile {dir_name}{progress} 单通道 2D 特征提取完成，已移交至全局 CSV。")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

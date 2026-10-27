@@ -915,3 +915,48 @@ python src/utils/validate_align_shifts.py \
 - 检查其他样本（ETail、TSC 等）是否已有 50 层的对齐结果，如有则归档。
 - 联系 HPC：gpu30 作业卡在启动阶段；确认 bme GPU 在 Slurm 下的 QOS/分区安排。
 - 核查 ERH 那 15 个对齐得分为 0 的 tile。
+
+---
+
+## 2026-10-27 TSC 配置统一为 pre_align，与 ETail 同步
+
+### 背景
+
+TSC 样本（10、8、11、12q、12t、18）准备从头重新检测。原配置混用 `post_align`（TSC8）和 `pre_align`，通道命名不一致（`GFP`/`GFP2` 与 `GFP_3`/`GFP_20`/`GFP_25`），且 12t 的 `GFP_3` 实际指向 `640nm_5`。
+
+### 修改与关键决定
+
+1. 6 份 `config/TSC/*.json` 由同一模板生成，对齐、z_linker、检测和过滤参数与 `config/EGFR/3/config_EGFR_ETail.json` 一致：全部改为 `pre_align`，启用 `tile_position_params`（workers 4），`n_workers` 4，`sample_z_center_count` 100，开启 alignment QC 和 direct_stitching，新增 `stage3_n_workers: null`；删除已不再读取的 `stage_2_75_enabled`、`n_permutations`、`max_soma_sample`。原配置备份在本机 scratchpad（会话临时目录）。
+2. **与 ETail 不同之处（TSC 只有 RFP/GFP/Sox9）**：`sequential_joint` 硬性要求 GFP/RFP + Sox9/Olig2，因此改用 `tf_align_mode: "chain"`（GFP→RFP 用 voxel IoU，Sox9→RFP 用 containment）；`stitching_reference_channel` 和 `reference_channel` 均为 RFP（561nm）。
+3. **双曝光命名统一为 `GFP` + `GFP2`**：不带下划线，避免 class 字符串中出现伪 marker（`channel_marker` 已能处理 `GFP_3`，但无下划线的命名最稳妥）。文件名匹配均为 `*_{id}_result.csv` 形式，`GFP` 与 `GFP2` 不会互相匹配。第二曝光复用主曝光的对齐偏移；融合对称（得分高者胜出，平分时主曝光胜出）。主曝光沿用各样本原设置：TSC10 为 30（长曝光），其余为短曝光（2/3/5）。
+4. YOLO 模型由 `models/train18_best_0515.pt` 改为 `models/train6_1009best.pt`：前者不在 `models/` 中。
+5. `pATHXML` 设为 null（tile position 求解后写到 `rfp_dir/xml_merging.xml`）；12t 的相对路径改为绝对路径；TSC8 路径保持 `sample8/aligned/*` 不变，等数据移到 research drive 后再改。
+
+### 验证与当前状态
+
+- 6 份配置均通过 `load_config`、`resolve_align_settings`、`expand_double_exposure_channels`、`tile_position_frame`、`resolve_stop_step` 和 QC `resolve_options` 检查。
+- `test_pipeline_steps`（2）、`test_alignment_qc_runner`（5）通过；`test_qc_alignment` 进程以 exit 127 退出，没有输出汇总。该测试不读取配置文件，与本次修改无关，尚未排查。
+- **注意**：XML 生成会以 `--force` 在每个通道目录写入 `xml_merging.xml`，会覆盖 12q（`561nm`、`730nm`）和 12t（`561nm`）中已有的 TeraStitcher `xml_merging.xml`。运行前应先备份，备份文件名不要以 `xml_merging_` 开头（以免被当作帧 XML 识别）。
+- 尚未提交 HPC 作业。
+
+**同日补充**：TSC 拼接参考帧改为 Sox9（`stitching_reference_channel: "Sox9"`）。Sox9 检测很密集，RFP/GFP 太稀疏，不适合求解 tile 位置。通道对齐参考仍为 RFP。`direct_stitching.enabled` 暂时全部改为 false。`tile_position_params.enabled` 保持 true，因为 XML 由它生成；生成的 XML 写到 `sox9_dir/xml_merging.xml`，会覆盖 12q、12t `730nm` 中已有的 TeraStitcher `xml_merging.xml`，运行前需要备份。
+
+---
+
+## 2026-10-27 模型指纹只看实际加载的 StarDist 模型；检测日志显示 tile 进度
+
+### 背景
+
+T10 在 CPU 节点续跑时报 `Raw detections were produced with different settings/model content (model_content)`。原因是 `model_fingerprints` 对 `stardist_basedir`（`models/`）整个目录做哈希，把 YOLO 权重等无关文件也算了进去；删掉一个不用的 `train18_best_0515.pt` 就让所有已有结果目录的检测复用失败。
+
+### 修改
+
+1. `src/core/provenance.py`：`stardist_basedir` 只哈希 `<basedir>/<stardist_name>/`（StarDist 实际加载的目录），文件键统一用 `/`。新增 `comparable_model_fingerprints`：比较前把 `stardist_basedir` 的记录裁剪到该子目录，兼容旧记录（旧记录哈希的是整个目录）。YOLO 仍按 `yolo_path` 单独哈希。
+2. `scripts/run_inference.py`：`validate_reused_provenance` 改用 `comparable_model_fingerprints`。**此文件被 Stage 4 共定位哈希，已完成共定位的样本会重跑一次共定位。**
+3. `src/core/worker.py`：Stage 2 检测的“确认通道推理路由”和“✅ Tile … 单通道 2D 特征提取完成”两行加上 `（k/N）`，k 为该 tile 在锚点通道全部 tile 中的序号。worker.py 不参与任何 checkpoint 哈希。
+
+### 验证
+
+- `test_provenance_pipeline`（11，含新增的指纹测试）、`test_automatic_resume`（9）、`test_checkpoint_code_lists`（2）通过。
+- 用新规则比对 ET10、ETail、T10、T4、T70 的 `runtime_config.json` 中已保存的指纹，全部一致，不会触发重新检测。
+- T10 因 `stitched_direct_4x_config_EGFR_t10` 是用旧 XML 拼的（Stage 2.9 重新求解后 ABS_D 变化）而失败；旧拼图已删除，改用 Slurm CPU 分区（`inference_cpu.slurm`）续跑。

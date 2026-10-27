@@ -165,13 +165,38 @@ def model_fingerprints(models, project_root):
         if path.is_file():
             result[name] = {"path": str(path), "sha256": file_sha256(path)}
         elif path.is_dir():
-            files = sorted(p for p in path.rglob("*") if p.is_file())
+            # StarDist loads only <basedir>/<name>; other weights may share the directory.
+            root = path / _stardist_name(models) if name == "stardist_basedir" else path
+            files = sorted(p for p in root.rglob("*") if p.is_file())
             result[name] = {
                 "path": str(path),
-                "files": {str(p.relative_to(path)): file_sha256(p) for p in files},
+                "files": {p.relative_to(path).as_posix(): file_sha256(p) for p in files},
             }
         else:
             result[name] = {"configured_value": configured, "hash_available": False}
+    return result
+
+
+def _stardist_name(models):
+    return (models or {}).get("stardist_name") or "2D_versatile_fluo"
+
+
+def comparable_model_fingerprints(fingerprints, models):
+    """Model content that decides whether raw detections can be reused.
+
+    Older records hashed the whole StarDist basedir; keep only the loaded model so
+    adding or removing unrelated weights there does not block a resume.
+    """
+    prefix = _stardist_name(models) + "/"
+    result = {}
+    for name, record in fingerprints.items():
+        kept = {key: value for key, value in record.items()
+                if key in ("sha256", "files", "configured_value")}
+        if name == "stardist_basedir" and "files" in kept:
+            kept["files"] = {rel: digest for rel, digest in
+                             ((rel.replace("\\", "/"), digest) for rel, digest in kept["files"].items())
+                             if rel.startswith(prefix)}
+        result[name] = kept
     return result
 
 
