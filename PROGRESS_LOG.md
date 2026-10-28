@@ -960,3 +960,40 @@ T10 在 CPU 节点续跑时报 `Raw detections were produced with different sett
 - `test_provenance_pipeline`（11，含新增的指纹测试）、`test_automatic_resume`（9）、`test_checkpoint_code_lists`（2）通过。
 - 用新规则比对 ET10、ETail、T10、T4、T70 的 `runtime_config.json` 中已保存的指纹，全部一致，不会触发重新检测。
 - T10 因 `stitched_direct_4x_config_EGFR_t10` 是用旧 XML 拼的（Stage 2.9 重新求解后 ABS_D 变化）而失败；旧拼图已删除，改用 Slurm CPU 分区（`inference_cpu.slurm`）续跑。
+
+---
+
+## 2026-10-27 对齐 QC 自动挑出可疑 tile
+
+### 背景
+
+可视化发现部分 tile 的通道对齐不理想。原有 alignment QC（`qc.alignment.enabled`，Stage 2.5 之后自动运行）只输出灵敏度曲线，不判断好坏。
+
+### 修改
+
+1. 新增 `src/qc/alignment_flags.py`，在 QC 结束后逐 tile×通道给出 `ok` / `bad` / `insufficient` / `error`：
+   - **Sox9 / Olig2（intensity center）**：对固定的 containment 配对，取（核亮区强度质心 − RFP 胞体亮区强度质心）残差向量，逐轴求中位数，并用 bootstrap（固定 seed）估计 SE。若某轴 |中位数| 超过 3 µm（XY）或 4 µm（Z），且不少于 3 SE，则判为 `bad`。配对少于 `sampling.min_pairs` 的判为 `insufficient`，不算 bad。
+   - **GFP 等 soma 通道（voxel IoU）**：若 IoU 最优位移超过同样的阈值且比零位移高 ≥5%，或对齐后 IoU 低于未对齐的 1.1 倍（仅当保存的偏移与参考通道不同），则判为 `bad`。
+   - 阈值可在 `qc.alignment.flagging` 中修改（`max_offset_xy_um`、`max_offset_z_um`、`min_z_score`、`bootstrap_samples`、`iou_min_gain`、`iou_min_vs_unaligned`），默认值无需改配置。
+2. `src/qc/alignment.py`：输出 `flagged_tiles.csv`（非 ok 的 tile，最差的排在前面）和 `tile_verdicts.csv`（逐通道），`qc_report.md` 增加「Flagged tiles」表；`run_details.json` 增加 `flagged`、`insufficient`。`src/qc/run_qc.py` 在 pipeline 日志中以 WARNING 逐条列出可疑 tile。
+3. QC 每个 tile 的 checkpoint 签名现在不包含 `flagging` 选项，也不再对 `alignment_flags.py`、`run_qc.py` 求 hash：之后调整阈值或判定逻辑不会触发重新计算 QC。**本次修改了 `alignment.py`，已有的 QC tile checkpoint 会失效一次。**
+4. 已有 QC 结果可离线重新判定，无需重算：`python -m src.qc.alignment_flags --qc-dir <结果目录>/qc/alignment`（读取 `run_details.json`）。
+
+### ETail（20261026）上的结果（默认阈值，只读，复制到本地运行）
+
+45 个 tile 中 8 个可疑：293300_324900（GFP x IoU 峰在 +18.9 µm）、293300_347600（Sox9 y +4.1 µm）、315900_370200（GFP z +1 层）、327200_347600（Sox9 y +3.7 µm，206 对）、349800_336300（Sox9 x +3.3 µm）、361100_324900（GFP x −3.9 / y −3.2 µm）、361100_347600（Olig2 x −3.3 µm）、372500_370200（GFP z −1 层，对齐后 IoU 不高于未对齐）。另有 8 个边缘 tile 配对/信号不足，无法判断。
+
+### 验证
+
+- 新增 `tests/test_alignment_flags.py`（6 项）通过；`test_alignment_qc_runner`（5）、`test_alignment_sampling`（8）、`test_checkpoint_code_lists`（2）通过。
+- `test_qc_alignment` 进程以 exit 127 退出的原因已查明：本机 matplotlib 绘图触发 Windows 原生异常 `0xc06d007f`（DLL 延迟加载失败），属于本机环境问题，修改前后表现相同。用脚本替换绘图后重跑其串行端到端流程，通过，并确认仅修改阈值时复用 tile checkpoint。
+
+---
+
+## 2026-10-27 ET10 对齐 QC（本机离线运行）
+
+ET10（`detection_results_20261021`，100 层对齐）的 config 中 `qc.alignment.enabled` 为 false，因此之前没有运行过 QC。本次在本机补跑全部 45 个 tile，参数与 config 相同。本机 matplotlib 会崩溃，所以绘图函数换成了写空文件，结果只有 CSV/报告，存放在会话 scratchpad 中，没有写入结果目录。
+
+- 核通道：**Sox9 有 10 个 tile 判为 bad**（282000_365900、304700_354600、304700_377200、316000_377200、327300_354600、327300_377200、327300_388500、327300_399800、338600_377200、361200_388500，残差 3.1–4.5 µm，方向不一致，各 tile 各自偏移）；Olig2 有 3 个（338600_354600、338600_377200、372500_365900）。判为 ok 的 tile，XY 残差中位数约 1.1–1.5 µm，Z 为 0。
+- GFP：2 个 tile 的 IoU 峰值偏离（282000_365900 x +4.5 µm、338600_377200 x +7.8 µm），282000_354600 z +1 层；另有 9 个 tile 因「对齐后 IoU 不比未对齐高 1.1 倍」被标记，但 IoU 只有 0.10–0.22，差别很小，可能是 GFP 太稀疏导致规则误报。
+- 8 个边缘 tile 配对不足（主要在 399800 和 388500 两列）。

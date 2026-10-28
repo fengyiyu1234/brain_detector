@@ -18,6 +18,7 @@ from src.core.provenance import file_sha256, file_stamp, output_manifest_valid, 
 from src.utils import validate_align_shifts as validation
 from src.utils.alignment_intensity_qc import image_files
 from .alignment_features import extract_features
+from .alignment_flags import resolve_flag_options, write_flags
 from .alignment_plots import curve_summary, overview, plot_curves
 from .common import mapped_path, save_json, stamps, unchanged, worker_count
 from .sampling import choose_region, cohort, prepare_tile, scan_footprint
@@ -26,7 +27,7 @@ DEFAULTS = {
     'enabled': False, 'reference_channel': None, 'soma_channels': None, 'tf_channels': None,
     'xy_range_um': 20, 'z_range_um': 40, 'workers': 4, 'fail_on_error': False,
     'output_dir': 'qc/alignment', 'formats': ['png', 'pdf'], 'path_mappings': {},
-    'previous_landmarks': None, 'roi_manifest': None,
+    'previous_landmarks': None, 'roi_manifest': None, 'flagging': {},
     'sampling': {'seed': 42, 'z_size_slices': 10, 'z_guard_slices': None,
                  'max_attempts': 50, 'min_pairs': 10},
 }
@@ -41,6 +42,7 @@ def resolve_options(options, routing, settings):
     if not isinstance(out['sampling'], dict) or set(out['sampling']) - DEFAULTS['sampling'].keys():
         raise ValueError('Unknown/invalid QC sampling options')
     out['sampling'] = {**DEFAULTS['sampling'], **out['sampling']}
+    out['flagging'] = resolve_flag_options(out['flagging'])
     types = {ch['id']: ch.get('type', 'soma') for ch in routing}
     fixed = out['reference_channel'] or settings['reference_channel']
     if types.get(fixed) != 'soma':
@@ -222,10 +224,13 @@ def input_signature(tile, params, previous=None, saved_region=None):
     paths += [Path(params['raw_dir'])/f"{tile}_{ch['id']}_inputs.json" for ch in params['routing']]
     paths += [Path(params['align_dir'])/f'{tile}_{suffix}.json' for suffix in ('offsets', 'measured_offsets')]
     paths += [Path(params['align_dir'])/'_align_settings.json']
-    code = {str(p): file_sha256(p) for p in [*Path(__file__).parent.glob('*.py'),
+    # Flag thresholds and post-processing modules do not change per-tile records.
+    report_only = {'alignment_flags.py', 'run_qc.py'}
+    code = {str(p): file_sha256(p) for p in [*(q for q in Path(__file__).parent.glob('*.py') if q.name not in report_only),
         Path(validation.__file__), Path(__file__).parents[1]/'core/point_cloud_aligner.py',
         Path(__file__).parents[1]/'core/z_linker.py', Path(__file__).parents[1]/'utils/alignment_intensity_qc.py']}
-    return dict(options=params['options'], settings=params['settings'], inputs=stamps(paths), code=code,
+    options = {k: v for k, v in params['options'].items() if k != 'flagging'}
+    return dict(options=options, settings=params['settings'], inputs=stamps(paths), code=code,
                 roots=params['channel_roots'], previous=previous, saved_region=saved_region,
                 source_index={cid: validation.tile_slice_names(cid, tile, params)
                               for cid in {params['anchor_channel'], *params['options']['tf_channels'], params['options']['reference_channel']}})
@@ -370,13 +375,16 @@ def run(sample, config_path=None, options=None, tiles=None, force=False, config=
         frame.to_csv(output/'curves.csv', index=False)
         pd.DataFrame(curve_summary(frame)).to_csv(output/'summary.csv', index=False)
         overview(frame, output/'alignment_overview', params['sample_name'], settings, options['formats'])
+    flagged, flag_lines = write_flags(output, report)
+    report['flagged'] = flagged.loc[flagged.verdict.isin(['bad', 'error'])].to_dict('records')
+    report['insufficient'] = flagged.loc[flagged.verdict.eq('insufficient'), 'tile'].tolist()
     save_json(output/'sampling.json', dict(regions=[dict(tile=r['tile'], **dict(zip(('x0','x1','y0','y1','z0','z1'), r['landmark_region']))) for r in report['completed']]))
     save_json(output/'run_details.json', report)
     lines = ['# Alignment sensitivity QC', '', f'Status: {report["status"]}; {len(report["completed"])}/{len(tiles)} tiles.', '',
              'RFP/other soma: voxel IoU. TF: bright-region median 3D distance in um.',
              'Pairs remain fixed across shifts. Pair selection uses saved alignment and can favor zero.',
              'Sparse/empty pairs are flagged in summary.csv; a completed computation is not an accuracy PASS.',
-             '', '[Summary](summary.csv) | [Curves](curves.csv) | [Run details](run_details.json)']
+             '', '[Summary](summary.csv) | [Curves](curves.csv) | [Run details](run_details.json)', '', *flag_lines]
     (output/'qc_report.md').write_text('\n'.join(lines)+'\n', encoding='utf-8')
     return report
 

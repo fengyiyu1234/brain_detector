@@ -15,6 +15,15 @@ def run_alignment_stage(config, results_dir, tiles):
         report = run(results_dir, options=options, tiles=tiles, config=config)
         if report['status'] == 'failed':
             raise RuntimeError(f"Alignment QC failed for {len(report['failures'])} tile(s)")
+        report_path = Path(results_dir)/options.get('output_dir', 'qc/alignment')/'qc_report.md'
+        if report.get('flagged'):
+            logging.warning(f"⚠️ [QC] {len(report['flagged'])}/{len(tiles)} 个 tile 对齐可疑，详见 {report_path}")
+            for row in report['flagged']:
+                logging.warning(f"    {row['tile']} [{row['bad_channels']}]: {row['reasons']}")
+        else:
+            logging.info(f"✔️ [QC] 未发现对齐可疑的 tile（{report_path}）")
+        if report.get('insufficient'):
+            logging.info(f"  [QC] 配对/信号不足、无法判断: {', '.join(report['insufficient'])}")
         return report
     except Exception as exc:
         logging.exception('Alignment QC failed')
