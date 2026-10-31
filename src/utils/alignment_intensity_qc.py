@@ -13,6 +13,7 @@ from functools import lru_cache
 import hashlib
 import json
 import multiprocessing as mp
+import os
 from pathlib import Path
 import sys
 import time
@@ -25,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from src.config.loader import load_config
+from src.utils.io import resolve_tile_dir
 
 
 def rectangle_means(integral, boxes):
@@ -96,7 +98,9 @@ def relative_shift(nuclear, soma):
 
 def image_files(root, tile):
     root = Path(root)
-    directory = next((p for p in (root / tile, root / tile.split('_')[0] / tile) if p.is_dir()), None)
+    directory = next((p for p in (Path(resolve_tile_dir(str(root), tile)),
+                                  Path(resolve_tile_dir(str(root), os.path.join(tile.split('_')[0], tile))))
+                      if p.is_dir()), None)
     if directory is None:
         raise FileNotFoundError(f'{root}: {tile}')
     return sorted(p for p in directory.iterdir() if p.suffix.lower() in ('.tif', '.tiff') and not p.name.startswith('.'))

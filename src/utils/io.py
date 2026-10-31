@@ -94,6 +94,64 @@ def compute_grid_fallback_offsets(tile_paths, tile_size, overlap_pct, xy_res_um)
         disp_mat_fin = np.zeros((1, 1, 3), dtype=int)
     return dir_dict, disp_mat_fin
 
+# 采集系统偶尔会让某个通道的 tile 目录名坐标偏一点（如 488nm 是 496700_340600，
+# 锚点通道是 496700_340700）。各坐标差 < 此值（STAGE_UNIT_UM 单位，即 100 um，
+# 远小于 tile 间距 ~11300）时视为同一个 tile。
+TILE_NAME_TOLERANCE = 1000
+
+
+def _name_coords(name):
+    try:
+        return tuple(int(p) for p in name.split('_'))
+    except ValueError:
+        return None
+
+
+def resolve_tile_dir(channel_root, rel_tile_path, tolerance=TILE_NAME_TOLERANCE):
+    """Map the anchor channel's relative tile path into another channel's directory.
+
+    Exact paths win. Otherwise each missing numeric path component ('451400' or
+    '451400_340700') is matched to the sibling directory whose coordinates all lie
+    within `tolerance`; the nearest one is used and a tie raises. Returns the exact
+    (nonexistent) path when nothing matches, so callers keep their missing-dir handling.
+    """
+    exact = os.path.join(channel_root, rel_tile_path)
+    if os.path.isdir(exact):
+        return exact
+    current = channel_root
+    for part in os.path.normpath(rel_tile_path).split(os.sep):
+        candidate = os.path.join(current, part)
+        if os.path.isdir(candidate):
+            current = candidate
+            continue
+        want = _name_coords(part)
+        if want is None or not os.path.isdir(current):
+            return exact
+        matches = []
+        for name in os.listdir(current):
+            got = _name_coords(name)
+            if got is None or len(got) != len(want) or not os.path.isdir(os.path.join(current, name)):
+                continue
+            distance = max(abs(a - b) for a, b in zip(got, want))
+            if distance < tolerance:
+                matches.append((distance, name))
+        if not matches:
+            return exact
+        matches.sort()
+        if len(matches) > 1 and matches[0][0] == matches[1][0]:
+            raise ValueError(f"Ambiguous tile directory for {part} in {current}: "
+                             f"{[name for _, name in matches]}")
+        current = os.path.join(current, matches[0][1])
+    return current
+
+
+def anchor_slice_key(stem, channel_tile, anchor_tile):
+    """Rename a slice stem '<channel_tile>_<z>' to the anchor's '<anchor_tile>_<z>'."""
+    if channel_tile != anchor_tile and stem.startswith(channel_tile + '_'):
+        return anchor_tile + stem[len(channel_tile):]
+    return stem
+
+
 def listFile(path, ext):
     filename_list, filepath_list = [], []
     for r, d, f in os.walk(path):

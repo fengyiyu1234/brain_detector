@@ -50,7 +50,7 @@ from qtpy.QtWidgets import QApplication, QMessageBox, QWidget, QGridLayout, QLab
 from src.utils.video_export import add_video_export_panel
 from src.config.loader import load_config
 from src.utils.tile_2d import SOURCES_2D, tile_2d_inputs
-from src.utils.io import listTile
+from src.utils.io import listTile, resolve_tile_dir
 from src.utils.markers import channel_marker, class_markers, split_class
 from src.core.z_linker import run_z_linker
 from src.core.detection_filter import FILTER_KEYS, filter_detection_df
@@ -1386,9 +1386,9 @@ def _make_fn_recorder(vis_cfg, paths, routing_config, anchor_dir, tile_path,
     rel     = os.path.relpath(tile_path, anchor_dir)
     ch_dirs = {}
     for ch in routing_config:
-        ch_dirs[ch['id']] = os.path.join(os.path.abspath(paths[ch['dir_key']]), rel)
+        ch_dirs[ch['id']] = resolve_tile_dir(os.path.abspath(paths[ch['dir_key']]), rel)
         if ch.get('double_exposure'):
-            ch_dirs[ch['second_intensity_id']] = os.path.join(
+            ch_dirs[ch['second_intensity_id']] = resolve_tile_dir(
                 os.path.abspath(paths[ch['second_intensity_dir_key']]), rel)
     print(f"[info] Ctrl+click  anywhere  → mark false-negative position → {ann_path}")
     if crop_dir:
@@ -1691,7 +1691,7 @@ def _load_second_intensity_image(ch, paths, anchor_dir, tile_path, z_range,
         return None
     second_id = ch['second_intensity_id']
     second_base = os.path.abspath(paths[ch['second_intensity_dir_key']])
-    tile_dir = os.path.join(second_base, os.path.relpath(tile_path, anchor_dir))
+    tile_dir = resolve_tile_dir(second_base, os.path.relpath(tile_path, anchor_dir))
     print(f"[img] Loading {second_id}  ({tile_dir})  [dual-intensity] ...")
     shift_info = (offsets.get(second_id) or offsets.get(ch['id'])) if offsets else None
     if shift_info is None:
@@ -1729,7 +1729,7 @@ def _run_2d(vis_cfg, paths, routing_config, tile_path, tile_name):
         for ch in routing_config:
             cid = ch['id']
             ch_dir = os.path.abspath(paths[ch['dir_key']])
-            tile_dir = os.path.join(ch_dir, os.path.relpath(tile_path, anchor_dir))
+            tile_dir = resolve_tile_dir(ch_dir, os.path.relpath(tile_path, anchor_dir))
             print(f"[img] Loading {cid} ({tile_dir}) ...")
             shift = tuple(int(offsets[cid][key]) for key in ('dx', 'dy', 'dz'))
             vol, climits = load_frame_volume(tile_dir, z_range, shift, contrast_pct)
@@ -1862,7 +1862,7 @@ def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
         if not _needs_raw_vol(filter_cfg, ch):
             continue
         ch_base  = os.path.abspath(paths[ch['dir_key']])
-        tile_dir = os.path.join(ch_base, os.path.relpath(tile_path, anchor_dir))
+        tile_dir = resolve_tile_dir(ch_base, os.path.relpath(tile_path, anchor_dir))
         o = offsets[cid]
         rv = load_frame_raw_volume(tile_dir, z_range, (o['dx'], o['dy'], o['dz']))
         if rv is not None:
@@ -1876,7 +1876,7 @@ def _run_post(vis_cfg, paths, routing_config, context, tile_path, tile_name):
         for ch in routing_config:
             cid      = ch['id']
             ch_base  = os.path.abspath(paths[ch['dir_key']])
-            tile_dir = os.path.join(ch_base, os.path.relpath(tile_path, anchor_dir))
+            tile_dir = resolve_tile_dir(ch_base, os.path.relpath(tile_path, anchor_dir))
             print(f"[img] Loading {cid}  ({tile_dir}) ...")
             o = offsets[cid]
             vol, climits = load_frame_volume(tile_dir, z_range, (o['dx'], o['dy'], o['dz']), contrast_pct)

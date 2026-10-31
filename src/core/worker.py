@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 import torch
 from src.utils.logger import setup_logging
-from src.utils.io import listTile
+from src.utils.io import listTile, resolve_tile_dir, anchor_slice_key
 
 logger = logging.getLogger(__name__)
 
@@ -218,11 +218,15 @@ def process_single_tile(i, pATHTEST, config):
     for ch in channels_to_run:
         ch_id = ch['id']
         ch_root = os.path.abspath(paths[ch['dir_key']])
-        target_dir = os.path.join(ch_root, rel_tile_path)
+        target_dir = resolve_tile_dir(ch_root, rel_tile_path)
+        ch_tile = os.path.basename(target_dir)
+        if ch_tile != dir_name and os.path.exists(target_dir):
+            current_logger.warning(f"⚠️ 通道 [{ch_id}] 的 tile 目录名坐标有偏移，按容差匹配: {dir_name} -> {target_dir}")
 
         if os.path.exists(target_dir):
+            # 切片名带 tile 前缀，统一换成锚点的名字才能和锚点切片对上
             files_dict = {
-                os.path.splitext(f)[0]: os.path.join(target_dir, f)
+                anchor_slice_key(os.path.splitext(f)[0], ch_tile, dir_name): os.path.join(target_dir, f)
                 for f in os.listdir(target_dir)
                 if f.lower().endswith(('.tif', '.tiff')) and not f.startswith('.')
             }

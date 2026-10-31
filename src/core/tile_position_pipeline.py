@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 
+from src.utils.io import resolve_tile_dir
 from src.core.provenance import file_sha256, file_stamp, output_manifest_valid, write_output_manifest, content_signature
 
 
@@ -116,7 +117,7 @@ def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir
         if not channel_dir or not os.path.isdir(channel_dir):
             raise FileNotFoundError(f"Original image directory missing for {ch['id']}: {channel_dir}")
         for tile in tile_names:
-            tile_dir = os.path.join(channel_dir, tile.split('_')[0], tile)
+            tile_dir = resolve_tile_dir(channel_dir, os.path.join(tile.split('_')[0], tile))
             if not os.path.isdir(tile_dir):
                 raise FileNotFoundError(f"Original image tile directory missing: {tile_dir}")
             files[tile_dir] = _stamp(tile_dir)

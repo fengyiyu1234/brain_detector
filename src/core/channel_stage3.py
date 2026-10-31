@@ -17,6 +17,7 @@ import pandas as pd
 
 from src.core import stitcher
 from src.core.stitcher import combine_predictions
+from src.core.seam_offsets import grid_names, load_offsets
 from src.core.z_linker import run_z_linker
 from src.utils.markers import channel_marker
 from src.core.provenance import (stable_id, file_stamp, file_sha256, source_sha256,
@@ -35,6 +36,11 @@ def _stitch_channel(ch_id, src_dir, geom, metadata):
     if geom['num_tiles'] > 1:
         stitched = [[np.empty((0, 8)) for _ in range(2)] for _ in range(geom['Z'])]
         row_meta, provenance_meta = {}, {}
+        seam = {}
+        if geom.get('seam_offsets_csv'):
+            seam = dict(seam_offsets=load_offsets(geom['seam_offsets_csv'], ch_id),
+                        grid_names=grid_names(geom), processed_tiles=set(),
+                        seg_layers=geom['seam_seg_layers'])
         for dir_name, pos in geom['dir_dict'].items():
             tile_name = os.path.split(dir_name)[-1]
             csv_tile = os.path.join(src_dir, f"{tile_name}_{ch_id}_result.csv")
@@ -44,7 +50,7 @@ def _stitch_channel(ch_id, src_dir, geom, metadata):
                         stitched, csv.DictReader(tile_file), None, geom['z_start'], geom['Z'],
                         pos, geom['disp_mat_fin'], (geom['H'], geom['W']),
                         metadata, tile_name, tILESIZE=geom['tile_size'], row_meta=row_meta,
-                        provenance_meta=provenance_meta, decision_meta=decisions,
+                        provenance_meta=provenance_meta, decision_meta=decisions, **seam,
                     )
         for zi, layer in enumerate(stitched):
             for ti, group in enumerate(layer):
@@ -116,7 +122,7 @@ def _stage3_input_signature(ch_id, src_dir, geom, zl_params):
         (str(key), list(np.asarray(geom['disp_mat_fin'][key]).tolist()))
         for key in sorted(geom['dir_dict'].values())
     ]
-    return {
+    signature = {
         'channel': ch_id,
         'source_files': {path: file_stamp(path, with_hash=True)
                          for path in source_files},
@@ -135,6 +141,12 @@ def _stage3_input_signature(ch_id, src_dir, geom, zl_params):
             'stitcher.py': source_sha256(stitcher, stitcher.STITCH_CODE),
         },
     }
+    if geom.get('seam_offsets_csv'):
+        # Measured seam offsets decide which overlap detections are duplicates.
+        signature['seam_offsets'] = {
+            'table': file_stamp(geom['seam_offsets_csv'], with_hash=True),
+            'seg_layers': int(geom['seam_seg_layers'])}
+    return signature
 
 
 def _global_signature(signature):

@@ -936,11 +936,179 @@ def non_max_suppression_iou(boxes, overlapThresh=0.45, sort_idx=4, containment_t
     return (boxes[pick], pick, suppressed_by) if return_trace else boxes[pick]
 
 
-def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, disp_mat, size, metadata_registry, tile_name, tILESIZE=2048, file_z0=None, row_meta=None, provenance_meta=None, decision_meta=None):
+_SEAM_IOU = 0.4      # same cell after removing the measured seam offset ...
+_SEAM_IOMIN = 0.6    # ... or one box (nearly) contains the other
+_NEIGHBOUR_STEPS = ((0, -1), (-1, 0), (-1, -1), (-1, 1), (0, 1), (1, 0), (1, -1), (1, 1))
+
+
+def _overlap_scores(box, boxes):
+    """IoU and IoMin of one box [x1, y1, x2, y2] against an (n, 4) array."""
+    ix = np.maximum(0, np.minimum(box[2], boxes[:, 2]) - np.maximum(box[0], boxes[:, 0]))
+    iy = np.maximum(0, np.minimum(box[3], boxes[:, 3]) - np.maximum(box[1], boxes[:, 1]))
+    inter = ix * iy
+    area = max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+    areas = (np.maximum(0, boxes[:, 2] - boxes[:, 0]) *
+             np.maximum(0, boxes[:, 3] - boxes[:, 1]))
+    return (inter / (area + areas - inter + 1e-6),
+            inter / (np.minimum(area, areas) + 1e-6))
+
+
+def _seam_shift(seam_offsets, grid_names, rc_from, rc_to, seg):
+    """Measured offset of tile rc_to's copy of a cell relative to rc_from's copy.
+
+    seam_offsets maps (tile_a, tile_b) of an EAST/SOUTH seam to {segment: (dx, dy, dz)},
+    b minus a. Diagonal neighbours average the two two-step paths. None if unknown.
+    """
+    def direct(a, b):
+        name_a, name_b = grid_names.get(a), grid_names.get(b)
+        if (name_a, name_b) in seam_offsets:
+            value = seam_offsets[(name_a, name_b)].get(seg)
+            return None if value is None else np.asarray(value, float)
+        if (name_b, name_a) in seam_offsets:
+            value = seam_offsets[(name_b, name_a)].get(seg)
+            return None if value is None else -np.asarray(value, float)
+        return None
+
+    if abs(rc_to[0] - rc_from[0]) + abs(rc_to[1] - rc_from[1]) == 1:
+        return direct(rc_from, rc_to)
+    paths = []
+    for mid in ((rc_from[0], rc_to[1]), (rc_to[0], rc_from[1])):
+        first, second = direct(rc_from, mid), direct(mid, rc_to)
+        if first is not None and second is not None:
+            paths.append(first + second)
+    return np.mean(paths, axis=0) if paths else None
+
+
+def _combine_predictions_seam(all_predictions, csv_reader, z_start, Z, pos, disp_mat,
+                              metadata_registry, tile_name, tILESIZE, row_meta,
+                              provenance_meta, decision_meta, seam_offsets, grid_names,
+                              processed_tiles, seg_layers):
+    """combine_predictions with duplicates matched after removing measured seam offsets.
+
+    A detection inside the overlap with an already stitched neighbour is compared with
+    that neighbour's boxes after subtracting the measured (dx, dy, dz) of the seam for
+    its z segment; a match (IoU or IoMin) is a duplicate and dropped. An unmatched
+    overlap detection is moved by the same offset into the neighbour's frame, so the
+    slices of one cell stay aligned for Z-Link whichever tile detected each slice.
+    """
+    row, col = pos
+    ABS_X, ABS_Y, ABS_Z = (int(v) for v in disp_mat[pos])
+    neighbours = []
+    for dr, dc in _NEIGHBOUR_STEPS:
+        rc = (row + dr, col + dc)
+        name = grid_names.get(rc)
+        if name is None or name not in processed_tiles:
+            continue
+        px, py, _ = (int(v) for v in disp_mat[rc])
+        rect = (max(ABS_X, px) - ABS_X, min(ABS_X, px) + tILESIZE - ABS_X,
+                max(ABS_Y, py) - ABS_Y, min(ABS_Y, py) + tILESIZE - ABS_Y)
+        if rect[1] > rect[0] and rect[3] > rect[2]:
+            neighbours.append((rc, name, rect))
+    z0 = z_start - ABS_Z
+    z1 = z0 + Z
+
+    tile_columns, prior_boxes = {}, {}
+
+    def prior(name, key):
+        if (name, key) not in prior_boxes:
+            if key not in tile_columns:
+                tile_columns[key] = np.asarray([t for t, _ in row_meta.get(key, ())], dtype=object)
+            rows = np.flatnonzero(tile_columns[key] == name)
+            boxes = all_predictions[key[0]][key[1]]
+            prior_boxes[(name, key)] = (
+                boxes[rows, :4].astype(float) if len(rows) else np.empty((0, 4)), rows)
+        return prior_boxes[(name, key)]
+
+    new_rows = {}
+    for row_number, row_data in enumerate(csv_reader):
+        if isinstance(row_data, dict):
+            slice_name = row_data["slice_name"]
+            x1, y1, x2, y2 = (row_data[key] for key in ("x1", "y1", "x2", "y2"))
+            class_name, score, mean, z = (row_data[key] for key in
+                                          ("class", "score", "mean", "z"))
+            detection_id = row_data.get("detection_id")
+        else:
+            slice_name, x1, y1, x2, y2, class_name, score, mean, z = row_data[:9]
+            detection_id = row_data[9] if len(row_data) > 9 else None
+        if not detection_id and provenance_meta is not None:
+            from src.core.provenance import stable_id
+            detection_id = stable_id("legacy2d", tile_name, row_number)
+        z = int(float(z))
+        x1 = float(x1); x2 = float(x2); y1 = float(y1); y2 = float(y2)
+        score = float(score); mean = float(mean)
+        if z - 1 not in range(z0, z1):
+            continue
+        cx_local, cy_local = (x1 + x2) / 2, (y1 + y2) / 2
+        box = np.array([x1 + ABS_X, y1 + ABS_Y, x2 + ABS_X, y2 + ABS_Y])
+        z = z - z0
+        cell_type_index = 0 if 'glia' in class_name.lower() else 1
+        hits = [(rc, name) for rc, name, (rx0, rx1, ry0, ry1) in neighbours
+                if rx0 <= cx_local < rx1 and ry0 <= cy_local < ry1]
+        duplicate, move = False, None
+        for rc, name in hits:
+            offset = _seam_shift(seam_offsets, grid_names, rc, pos, (z - 1) // seg_layers)
+            dx, dy, dz = (0.0, 0.0, 0) if offset is None else (
+                float(offset[0]), float(offset[1]), int(round(float(offset[2]))))
+            layer = z - 1 - dz
+            if not 0 <= layer < Z:
+                continue
+            boxes, rows = prior(name, (layer, cell_type_index))
+            if len(boxes):
+                iou, iomin = _overlap_scores(box - [dx, dy, dx, dy], boxes)
+                match = (iou > _SEAM_IOU) | (iomin > _SEAM_IOMIN)
+                if match.any():
+                    if decision_meta is not None:
+                        best = int(np.argmax(np.where(match, iou, -1.0)))
+                        prior_ids = provenance_meta.get((layer, cell_type_index), ()) if provenance_meta else ()
+                        other = int(rows[best])
+                        decision_meta.append({
+                            'detection_id': detection_id,
+                            'tile_name': tile_name, 'slice_name': slice_name,
+                            'z': z, 'decision': 'rejected',
+                            'reason': 'cross_tile_overlap',
+                            'other_detection_id': prior_ids[other] if other < len(prior_ids) else '',
+                            'iou': float(iou[best]),
+                        })
+                    duplicate = True
+                    break
+            if move is None:
+                move = (dx, dy, dz)
+        if duplicate:
+            continue
+        if move is not None:
+            box = box - [move[0], move[1], move[0], move[1]]
+            z = z - move[2]
+        key = (z - 1, cell_type_index)
+        new_rows.setdefault(key, []).append(
+            [box[0], box[1], box[2], box[3], score, mean, class_name, z])
+        if row_meta is not None:
+            row_meta.setdefault(key, []).append((tile_name, slice_name))
+        if provenance_meta is not None:
+            provenance_meta.setdefault(key, []).append(str(detection_id))
+        metadata_registry.append([(box[0] + box[2]) / 2, (box[1] + box[3]) / 2, z,
+                                  tile_name, slice_name])
+
+    for (zi, ti), rows in new_rows.items():
+        all_predictions[zi][ti] = np.concatenate(
+            (all_predictions[zi][ti], np.array(rows, dtype=object)))
+    processed_tiles.add(tile_name)
+    return all_predictions
+
+
+def combine_predictions(all_predictions, csv_reader, classes, z_start, Z, pos, disp_mat, size, metadata_registry, tile_name, tILESIZE=2048, file_z0=None, row_meta=None, provenance_meta=None, decision_meta=None, seam_offsets=None, grid_names=None, processed_tiles=None, seg_layers=50):
     """
     row_meta: 可选 dict，(层, 类别) → [(tile_name, slice_name), ...]，与写进
               all_predictions[层][类别] 的行一一对应、顺序相同（用于把溯源信息存进全局 2D CSV）。
+    seam_offsets: 可选，各接缝按 z 段实测的残余错位（见 src/core/seam_offsets.py）。给了就按
+              实测错位比对重叠区的重复（需要 row_meta、grid_names、processed_tiles）。
     """
+    if seam_offsets is not None:
+        if row_meta is None or grid_names is None or processed_tiles is None:
+            raise ValueError("seam_offsets requires row_meta, grid_names and processed_tiles")
+        return _combine_predictions_seam(
+            all_predictions, csv_reader, z_start, Z, pos, disp_mat, metadata_registry,
+            tile_name, tILESIZE, row_meta, provenance_meta, decision_meta,
+            seam_offsets, grid_names, processed_tiles, seg_layers)
     row, col = pos
     ABS_X, ABS_Y, ABS_Z = disp_mat[pos]
     # 重叠区判定只涉及当前 tile 自身的局部范围，用 tile 大小的局部 mask
@@ -1043,4 +1211,6 @@ FUSION_CODE = ('fuse_dual_intensity_2d', 'merge_soma_detections_2d',
                'split_class', 'src.utils.markers:clean_markers',
                '_CELL_TYPE_PRIORITY', '_DUAL_LO_TAG', '_DUAL_HI_TAG',
                '_RAW_COLS', '_BOX_COLS')
-STITCH_CODE = ('combine_predictions', 'stitchDetection', 'non_max_suppression_iou')
+STITCH_CODE = ('combine_predictions', 'stitchDetection', 'non_max_suppression_iou',
+               '_combine_predictions_seam', '_seam_shift', '_overlap_scores',
+               '_SEAM_IOU', '_SEAM_IOMIN', '_NEIGHBOUR_STEPS')

@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from src.config.loader import load_config, require_resolved_result_dir
+from src.utils.io import resolve_tile_dir
 
 TILE_RE = re.compile(r"^(\d+)_(\d+)$")
 AXES = ("x", "y", "z")
@@ -98,15 +99,23 @@ def slice_coordinates(tile_dir, tile):
 
 
 def validate_images(channel_dir, tiles):
+    """Return the shared slice coordinates and each tile's DIR_NAME in this channel.
+
+    A channel's tile directory may carry slightly shifted coordinates in its name
+    (see resolve_tile_dir); DIR_NAME must point at the directory that really exists.
+    """
     expected = None
+    dir_names = {}
     for tile in tiles:
         v, _ = tile_coordinates(tile)
-        z_values = slice_coordinates(channel_dir / str(v) / tile, tile)
+        tile_dir = Path(resolve_tile_dir(str(channel_dir), os.path.join(str(v), tile)))
+        z_values = slice_coordinates(tile_dir, tile_dir.name)
         if expected is None:
             expected = z_values
         elif z_values != expected:
-            raise ValueError(f"TIFF slice coordinates differ: {channel_dir / str(v) / tile}")
-    return expected
+            raise ValueError(f"TIFF slice coordinates differ: {tile_dir}")
+        dir_names[tile] = tile_dir.relative_to(channel_dir).as_posix()
+    return expected, dir_names
 
 
 def image_positions(rows, channels, frame):
@@ -165,7 +174,8 @@ def mechanical_step(coords):
     return statistics.median(b - a for a, b in zip(coords, coords[1:])) / 10 if len(coords) > 1 else 0
 
 
-def build_xml(channel_dir, grid, vs, hs, z_values, positions, xy_um, z_um, bytes_per_channel):
+def build_xml(channel_dir, grid, vs, hs, z_values, positions, xy_um, z_um, bytes_per_channel,
+              dir_names=None):
     root = ET.Element("TeraStitcher", volume_format="TiledXY|2Dseries", input_plugin="tiff2D")
     directory = xml_image_directory(channel_dir)
     ET.SubElement(root, "stacks_dir", value=directory)
@@ -185,7 +195,8 @@ def build_xml(channel_dir, grid, vs, hs, z_values, positions, xy_um, z_um, bytes
             "N_CHANS": "1", "N_BYTESxCHAN": str(bytes_per_channel),
             "ROW": str(row), "COL": str(col),
             "ABS_V": str(y), "ABS_H": str(x), "ABS_D": str(z),
-            "STITCHABLE": "yes", "DIR_NAME": f"{vs[row]}/{tile}",
+            "STITCHABLE": "yes",
+            "DIR_NAME": (dir_names or {}).get(tile, f"{vs[row]}/{tile}"),
             "Z_RANGES": f"[0,{len(z_values)})", "IMG_REGEX": "",
         })
         for direction, dr, dc in DIRECTIONS:
@@ -240,12 +251,12 @@ def generate(config_path, positions_path, bytes_per_channel=2, force=False):
         outputs[channel] = channel_dir / "xml_merging.xml"
         if outputs[channel].exists() and not force:
             raise FileExistsError(f"Output exists; pass --force to replace: {outputs[channel]}")
-    if len({z for _, z in images.values()}) != 1:
+    if len({z for _, (z, _) in images.values()}) != 1:
         raise ValueError("Channels have different TIFF slice coordinates")
     positions = image_positions(rows, channels, frame)
     trees = {ch: build_xml(directory, grid, vs, hs, z_values, positions[ch],
-                           xy_um, z_um, bytes_per_channel)
-             for ch, (directory, z_values) in images.items()}
+                           xy_um, z_um, bytes_per_channel, dir_names)
+             for ch, (directory, (z_values, dir_names)) in images.items()}
     for ch, tree in trees.items():
         write_xml(tree, outputs[ch])
         print(f"{ch}: {len(rows)} tiles -> {outputs[ch]}")

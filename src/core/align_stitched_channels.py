@@ -65,7 +65,11 @@ def read_geometry(raw_root: Path, marker: str, image_module) -> Geometry:
 
     names, positions = set(), []
     for stack in stacks:
-        name = Path(stack.attrib["DIR_NAME"].replace("\\", "/")).name
+        # Match channels on (ROW, COL) when present: a channel's directory name
+        # can carry slightly shifted stage coordinates.
+        name = ((int(stack.attrib["ROW"]), int(stack.attrib["COL"]))
+                if "ROW" in stack.attrib and "COL" in stack.attrib
+                else Path(stack.attrib["DIR_NAME"].replace("\\", "/")).name)
         if name in names:
             raise ValueError(f"Duplicate tile {name} in {xml}")
         names.add(name)

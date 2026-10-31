@@ -37,6 +37,13 @@ class Tile:
     y: int
     z: int
     files: tuple[Path, ...]
+    # (ROW, COL) from the XML; channels match tiles on it because a channel's
+    # directory name can carry slightly shifted stage coordinates.
+    grid: tuple[int, int] | None = None
+
+    @property
+    def key(self):
+        return self.grid or self.name
 
 
 @dataclass(frozen=True)
@@ -165,8 +172,10 @@ def read_channel(raw_dir: Path, marker: str) -> Channel:
             reference_size, reference_dtype = size, dtype
         elif size != reference_size or dtype != reference_dtype:
             raise ValueError(f"Tile size or dtype differs for {tile_name} in {raw_dir}")
+        grid = ((int(stack.attrib["ROW"]), int(stack.attrib["COL"]))
+                if "ROW" in stack.attrib and "COL" in stack.attrib else None)
         tiles.append(Tile(tile_name, int(stack.attrib["ABS_H"]),
-                          int(stack.attrib["ABS_V"]), int(stack.attrib["ABS_D"]), files))
+                          int(stack.attrib["ABS_V"]), int(stack.attrib["ABS_D"]), files, grid))
         if tile_number % 10 == 0 or tile_number == len(stacks):
             print(f"  {marker}: {tile_number}/{len(stacks)} tile directories", flush=True)
     dimensions = root.find("dimensions")
@@ -182,9 +191,9 @@ def geometry(channels: dict[str, Channel], factor: int):
     if isinstance(factor, bool) or not isinstance(factor, int) or factor < 1:
         raise ValueError("downsample_factor must be a positive integer")
     first = next(iter(channels.values()))
-    first_names = {tile.name for tile in first.tiles}
+    first_names = {tile.key for tile in first.tiles}
     for channel in channels.values():
-        if {tile.name for tile in channel.tiles} != first_names:
+        if {tile.key for tile in channel.tiles} != first_names:
             raise ValueError(f"Tile set differs for {channel.marker}")
         if (channel.tile_size != first.tile_size or
                 channel.slice_keys != first.slice_keys or

@@ -107,6 +107,21 @@ class GenerateMergingXmlTests(unittest.TestCase):
             xml_image_directory(r"Y:\Fengyi\EGFR_brain\T70\640nm"),
             "Y:/Fengyi/EGFR_brain/T70/640nm")
 
+    def test_shifted_channel_directory_name(self):
+        old = self.channels["Olig2"] / "1100" / "1100_2100"
+        new = self.channels["Olig2"] / "1100" / "1100_2090"
+        new.mkdir()
+        for z in (3000, 3010):
+            (old / f"1100_2100_{z}.tiff").unlink()
+            (new / f"1100_2090_{z}.tiff").touch()
+        old.rmdir()
+        outputs = generate(self.config, self.positions)
+        names = {s.get("DIR_NAME") for s in ET.parse(outputs["Olig2"]).getroot().find("STACKS")}
+        self.assertIn("1100/1100_2090", names)
+        self.assertNotIn("1100/1100_2100", names)
+        gfp = {s.get("DIR_NAME") for s in ET.parse(outputs["GFP"]).getroot().find("STACKS")}
+        self.assertIn("1100/1100_2100", gfp)
+
     def test_rejects_missing_tile_or_inconsistent_slices(self):
         with self.assertRaisesRegex(ValueError, "Incomplete tile grid"):
             grid_for_tiles(self.tiles[:-1])

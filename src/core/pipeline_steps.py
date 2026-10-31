@@ -6,7 +6,7 @@ STEPS = {
     'alignment': '2.5', 'alignment_qc': '2.55', 'fusion': '2.6',
     'publish_filtered': '2.75', 'histograms': '2.8',
     'tile_positions': '2.9', 'image_stitching': '2.95',
-    'z_linking': '3', 'colocalization': '3.5', 'exports': '4',
+    'seam_offsets': '2.97', 'z_linking': '3', 'colocalization': '3.5', 'exports': '4',
 }
 
 
@@ -31,6 +31,7 @@ def resolve_stop_step(config):
         'histograms': config.get('detection_params', {}).get('generate_histograms', True),
         'tile_positions': pre and config.get('tile_position_params', {}).get('enabled', False),
         'image_stitching': config.get('direct_stitching', {}).get('enabled', False),
+        'seam_offsets': (config.get('seam_dedup') or {}).get('enabled', True),
     }
     if step in enabled and not enabled[step]:
         raise ValueError(f"stop_after_step={step!r} refers to a disabled/inapplicable step; "

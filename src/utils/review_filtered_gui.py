@@ -23,7 +23,7 @@ from qtpy.QtWidgets import (
 )
 
 from src.config.loader import load_config
-from src.utils.io import listTile
+from src.utils.io import listTile, resolve_tile_dir
 from src.utils.visualize import (
     _add_labels_layer, _ch_vis, _load_tile_csv_shapes, _select_tiles,
     load_frame_volume, load_offsets,
@@ -117,7 +117,7 @@ def _open_tile_viewer(
         if channel_id not in channel_ids:
             continue
         channel_root = os.path.abspath(paths[channel["dir_key"]])
-        image_dir = os.path.join(channel_root, os.path.relpath(tile_path, anchor_dir))
+        image_dir = resolve_tile_dir(channel_root, os.path.relpath(tile_path, anchor_dir))
         offset = offsets.get(channel_id, {}) if pipeline_mode == "pre_align" else {}
         shift = (offset.get("dx", 0), offset.get("dy", 0), offset.get("dz", 0))
         volume, contrast = load_frame_volume(image_dir, z_range, shift=shift)

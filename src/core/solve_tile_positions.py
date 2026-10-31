@@ -116,7 +116,7 @@ import src.utils.compare_stitching as cs
 from src.config.loader import load_config
 from src.core.point_cloud_aligner import (apply_shift_to_csv, resolve_align_settings,
                                           containment_shift_from_arrays, _containment_score)
-from src.utils.io import STAGE_UNIT_UM
+from src.utils.io import STAGE_UNIT_UM, anchor_slice_key, resolve_tile_dir
 
 AXES = ('x', 'y', 'z')
 
@@ -785,7 +785,7 @@ def write_aligned(out_dir, tiles, shifts, det_dir, tile_dirs, routing, mark_done
         slice_names = None
         tdir = tile_dirs.get(t)
         if tdir and os.path.isdir(tdir):
-            slice_names = [os.path.splitext(f)[0] for f in sorted(
+            slice_names = [anchor_slice_key(os.path.splitext(f)[0], os.path.basename(tdir), t) for f in sorted(
                 f for f in os.listdir(tdir)
                 if f.lower().endswith(('.tif', '.tiff')) and not f.startswith('.'))]
         payload = {}
@@ -945,7 +945,8 @@ def main():
     # 对齐后的 z 用的是坐标系通道的层号，所以 slice_name 也从它的 tile 目录取
     # （T4 上四个通道的层名和层数完全一致，这里只是让语义对上）
     frame_img_dir = ch_dirs.get(frame, '')
-    tile_dirs = {t: (os.path.join(frame_img_dir, t.split('_')[0], t) if frame_img_dir else None)
+    tile_dirs = {t: (resolve_tile_dir(frame_img_dir, os.path.join(t.split('_')[0], t))
+                     if frame_img_dir else None)
                  for t in tiles}
     if args.n_slices:
         n_slices, z_src = args.n_slices, '--n-slices'

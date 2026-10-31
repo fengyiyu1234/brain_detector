@@ -14,6 +14,7 @@ import napari
 
 from src.utils.video_export import add_video_export_panel
 from src.utils.markers import class_markers
+from src.utils.io import resolve_tile_dir
 from src.utils.saved_view import (
     global_to_local_rows, read_global_boxes, read_tile_boxes,
     records_and_shapes, track_for_summary,
@@ -25,7 +26,7 @@ from src.utils.visualize import (
 
 
 def _image_tile_dir(paths, ch, anchor_dir, tile_path):
-    return os.path.join(paths[ch["dir_key"]], os.path.relpath(tile_path, anchor_dir))
+    return resolve_tile_dir(paths[ch["dir_key"]], os.path.relpath(tile_path, anchor_dir))
 
 
 def _shift_rows(rows, dx=0, dy=0, dz=0):
@@ -133,7 +134,7 @@ def _add_images(viewer, vis_cfg, paths, routing, anchor_dir, tile_path,
         layer.contrast_limits_range = (0, 65535)
         if ch.get("double_exposure"):
             second = ch["second_intensity_id"]
-            second_dir = os.path.join(
+            second_dir = resolve_tile_dir(
                 paths[ch["second_intensity_dir_key"]],
                 os.path.relpath(tile_path, anchor_dir))
             second_shift = offsets.get(second, shift)

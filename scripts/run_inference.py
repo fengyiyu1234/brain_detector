@@ -47,6 +47,7 @@ from src.core.provenance import (provenance_columns, file_sha256, file_stamp,
                                  source_sha256)
 from src.core import stitcher
 from src.core.tile_position_pipeline import run_tile_position_stage, tile_position_frame
+from src.core.seam_offsets import resolve_params as resolve_seam_params, run_seam_offset_stage
 from src.core.stitcher import (match_soma_3d_iou, merge_soma_volumes_union, soma_match_metrics,
                                annotate_soma_with_tf_containment,
                                _merge_class, suppress_cross_class_overlap)
@@ -980,6 +981,20 @@ if __name__ == '__main__':
     geom = {'dir_dict': dir_dict, 'disp_mat_fin': disp_mat_fin, 'z_start': z_start, 'Z': Z,
             'H': H, 'W': W, 'tile_size': tile_size, 'num_tiles': num_tiles,
             'xml_source': pATHxml}
+    # Stage 2.97: measure per-seam, per-z-segment residual offsets for Stage 3 dedup.
+    seam_enabled, seam_params = resolve_seam_params(config)
+    if seam_enabled and num_tiles > 1:
+        _active_ids = [ch['id'] for ch in routing_config]
+        _seam_frame = config.get('stitching_reference_channel')
+        geom['seam_offsets_csv'] = run_seam_offset_stage(
+            routing_config,
+            {cid: pATH_SRC_CSV[cid] if isinstance(pATH_SRC_CSV, dict) else pATH_SRC_CSV
+             for cid in _active_ids},
+            geom, os.path.join(derived['pATH_GLOBAL_2D'], 'seam_offsets'),
+            _seam_frame if _seam_frame in _active_ids else None, seam_params,
+            stage3_worker_count(config, len(routing_config)))
+        geom['seam_seg_layers'] = seam_params['seg_layers']
+    stop_after(config, 'seam_offsets')
     ch_results = run_stage3_channel_pool(
         routing_config, stage3_worker_count(config, len(routing_config)),
         pATH_SRC_CSV, derived['pATH_GLOBAL_2D'], derived['pATH_CHANNEL_3D'], geom, zl_params,
