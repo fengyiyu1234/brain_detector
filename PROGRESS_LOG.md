@@ -1203,3 +1203,114 @@ Stage 1 只检查 CSV 是否存在，不比较代码 hash，已完成的 tile �
 - **随 z 变化的全局 tile 位置**：XML 表达不了随 z 变化的位置，细胞坐标会与拼接图像在接缝附近错开（最多约 40 px）。2026-10-30 决定不做：全局坐标保持 XML tile 位置，本次只解决重叠区去重。
 - **检测坐标与拼接图像的一致性（2026-10-30 核对，ET10）**：检测全部在 Olig2 坐标系（Olig2 XML 位置 + Stage 2.5 逐 tile 通道偏移）。Olig2 图像用同一套位置，与检测逐像素一致。其他通道图像用各自独立解出的 `P_c` + 一个全局平移，不含逐 tile 通道偏移，与检测逐 tile 相差 |dxy| p50 14–17 px、p90 21–29 px、最大约 48 px，|dz| 最多 3–4 层。其中大部分是随行列线性变化的平滑场（色差放大率，y 方向约 4–6 px/行）；去掉平滑场后 p50 3.5–5 px、p90 8–11 px，少数 tile 仍有 40 px 以上。
 - **重叠区「离边缘较远者胜出」规则**：现在仍是先拼的 tile 胜出（各通道一致，按位置确定）。
+
+---
+
+## 2026-10-31 Stage 2.97 改为从名义重叠出发的 IoU 测量；Stage 3 跨类别去重；ET10 全片测试
+
+### 决定
+
+- 不做「每个通道各自求全局 tile 位置」。全局坐标仍为 Olig2 XML 位置 + Stage 2.5 逐 tile 通道偏移，通道对齐误差留在坐标里，可以接受。
+- 去重只依赖按通道、按接缝、按 z 段实测的错位。
+- 测量方式与 channel alignment 相同：从名义 15% 重叠、z 位移 0 出发，在重叠体积里找 IoU 最大的位移。每 50 层一块体积，不用一整块，因为错位随 z 漂移。
+- soma 通道在 Stage 3 重叠区跨类别去重，glia 优先。
+- 验收阈值先看 ET10 的 QC 再定。
+
+### 修改
+
+1. `src/core/seam_offsets.py`（测量部分重写）：
+   - 名义偏移 `nominal_offset`，名义重叠区 `nominal_band`。名义步长 = tile_size × (1 − overlap_pct/100)；`overlap_pct` 默认取 `pre_align_params.tile_overlap_pct`（15）。
+   - **粗搜**：两 tile 的框按 4 px 体素化，3D FFT 互相关，搜索 ±160 px、±10 层。同一接缝各段的强峰先取中位数作为共同中心，各段再在中心 ±50 px、±3 层内取峰。
+   - **细搜**：在粗峰 ±5 px、±1 层内按 1 px 计算框 IoU，分子是配对框交集之和，分母是两体积框面积之和减交集，再做亚像素抛物线拟合。
+   - **有效段判据**：一一配对数 ≥ 20（IoU > 0.4 或 IoMin > 0.6）；粗峰 snr ≥ 6，snr 为相关窗口中位数之上的稳健标准差倍数；与相邻 ±2 段的中位数相差 ≤ 15 px、≤ 2 层，否则标为 outlier。
+   - 回退顺序不变。输出新增 `n_b, snr, iou, outlier, nom_dx/dy/dz`，`contrast` 改为 `snr`。签名 version 2，`fft_threads` 不进签名。
+   - 本机 numpy 的 matmul（BLAS）会以 0xc06d007f 崩溃，细搜改为逐行相乘求和。matplotlib 的 imshow 同样会崩，本机出图改用 PIL。
+2. `src/core/stitcher.py`（seam 模式）：
+   - 重叠区检测同时与邻居的 glia 和 neuron 框比较。
+   - B 为 glia、匹配到的都是 neuron 时，保留先拼 tile 的框，类别改为 glia，坐标不变。决策表记 `relabelled / cross_tile_glia_priority`；被删的 B 框记 `cross_tile_overlap_other_type`。
+   - 新 helper `_is_glia` 已加入 `STITCH_CODE`。
+   - TF 通道的 class 都是 nucleus，不受影响。
+3. 测试：`tests/test_seam_offsets.py`。
+   - 合成数据从名义网格出发，恢复每段 (dx, dy, dz)，稠密核和稀疏 soma 各一例。
+   - 新增 outlier 和弱段不参与回退的测试。
+   - 新增跨类别去重两例：glia 替 neuron；neuron 被 glia 吃掉。
+   - 所有测试文件逐个运行通过（`test_qc_alignment`、`test_tile_2d_sources` 本机 Qt 崩溃，未运行）。
+4. README Stage 2.97 段落已更新。
+
+### ET10 全片测试
+
+结果只写到 `Y:/Fengyi/EGFR_brain/ET10/seam_dedup_test_20261031/`（含 README），原结果目录未动。测试脚本在会话 scratchpad，没有进仓库。
+
+- **耗时**：测量 8 分钟（4 通道并行，每通道 8 个 FFT 线程）。本机 Stage 3 2D 拼接：Sox9 48 分钟、Olig2 23 分钟、GFP/RFP 各约 3.5 分钟。
+- **测量结果**：每通道 990 段（66 条接缝 × 15 段）。没测到的段约 300 个，几乎都是 z 两端没有组织的段（n_a < 20）；配对不足 18–31 个，snr 不足 1–32 个，outlier 3 个。
+- **与旧直方图法对比**：两者都测到的段，xy 差 p50 0.1–0.5 px、p90 约 2 px。分歧段（xy > 3 px 或 dz 不同）在同一判据下比较配对数，约 85% 新位移更多，总配对多 6–16%。
+- **GFP 的大错位**：接缝 327300_365900 → 338600_365900 上，GFP 每段稳定约 (−37, +48, −3)，Olig2 约 (−6, +4, 0)。差值等于两个 tile 的 Stage 2.5 GFP 偏移之差；alignment QC 也把 327300_365900 的 GFP 判为 bad。旧方法只搜 ±40 px，够不到。
+- **去重决策**：被删的重复框，GFP/RFP 约为旧规则的 2 倍，Olig2/Sox9 约为 3.5–4 倍。GFP 跨类别删除 23823 个、改为 glia 8163 个；RFP 分别为 29690 和 9119。
+- **2D 残留**：同一层、扣除错位后的残留重复占去重前重复数的比例：GFP 0.1%，RFP 0.2%，Olig2 2.9%，Sox9 1.5%。按峰值不分 dz 统计时为 8–14%，但其中绝大部分落在相邻层（dz = ±1），是 A 漏检、由 B 补上的同一细胞的其他层，Z-link 会把它们连成一个细胞。
+- **3D 残留**：重叠区内主要来源 tile 不同、xy < 5 px（核）/ 10 px（soma）、z 范围重叠的 3D 细胞对，减去平移 30 px 的随机对照：
+
+  | 通道 | 旧规则 | 新规则 |
+  |---|---|---|
+  | GFP | 28.6% | 0.11% |
+  | RFP | 25.8% | 0.11% |
+  | Olig2 | 49.0% | 1.5% |
+  | Sox9 | 49.4% | 3.0% |
+
+  （占重叠区 A 侧 3D 细胞数）
+- **检查图**：32 张（4 通道 × 4 条接缝 × 第 175、475 层），在 `review_images/`。
+  - 图像定位验证正确：B 按实测错位移动后，与 A 的核重合。
+  - 每个被删的 B 框在 A 中同位置都有框。
+
+### 未做 / 待定
+
+- 人工检查图后再决定验收阈值。
+- Sox9 剩余约 3% 的 3D 重复，可能来自段内 z 漂移和 dz 取整；可以试 25 层一段（只改配置 `seam_dedup.seg_layers`）。
+- 去重 QC 尚未写进 pipeline，等确认后再做。
+- 各样本下次运行时，Stage 2.97、Stage 3、Stage 4 会各重跑一次，这是预期的。
+
+---
+
+## 2026-10-31（晚）去重方案经人工确认；接缝去重 QC 接入 pipeline
+
+### 确认
+
+人工检查 ET10 的 32 张检查图后确认效果良好。新版 Stage 2.97 和 Stage 3 跨类别去重保留在 pipeline 中，与上一条记录相同。
+
+### 修改
+
+1. 新增 `src/qc/stitch_dedup.py`，在 Stage 3（拼接 + Z-link）之后、共定位之前运行，只读，默认打开。
+   - **3D 残留**：XML 重叠区内，主要来源为 A 的 3D 细胞与主要来源为 B 的 3D 细胞，中心 < 5 px（核）/ 10 px（soma）且 z 范围重叠，一一配对。减去 B 平移 30 px 的随机对照，除以 A 侧细胞数。
+   - **2D 同层残留**：按 50 层一段，同一层、< 3 / 5 px 的框对，减随机对照，除以 Stage 2.97 测得的去重前重复数。
+   - **决策表计数**：rejected / relabelled 等。
+   - **标记**：A 侧细胞 ≥ `min_seam_cells`（200）且 3D 残留 > `max_seam_dup_pct`（10%）的接缝写入 `flagged_seams.csv`，并打 WARNING；默认不中断（`fail_on_error`）。
+   - **检查图**：每通道 `image_seams_per_channel`（2）张，分别是最差接缝和中位接缝。层取该接缝配对最多的 z 段中层，裁剪取沿接缝框最密的 512 px。三格：A + 移动后的 B、最终框、B 的删除 / 保留框。标注用英文，因为 Linux 上没有中文字体。
+   - **复用**：签名包含 Stage 3 输出文件的 stamp、错位表 hash、几何、计算参数和代码 hash，不含阈值和图片数。签名不变时直接读表（ET10 5 秒），已有 PNG 跳过；签名变化时重算并删除旧 PNG。
+   - **命令行**：`python -m src.qc.stitch_dedup <results> [--path-map FROM TO]`。
+2. `src/qc/run_qc.py` 新增 `run_stitch_dedup_stage`；`scripts/run_inference.py` 在 `run_stage3_channel_pool` 之后调用。
+3. 新增 `tests/test_stitch_dedup_qc.py`（3 项）；README 新增「Seam deduplication QC」一节。所有测试文件逐个运行通过（两个 Qt 测试本机不运行）。
+
+### ET10 测试（测试目录 `seam_dedup_test_20261031`，先对新 2D 结果跑了 Z-link）
+
+- **耗时**：Z-link Sox9 42 分钟、Olig2 20 分钟、GFP/RFP 各约 2.5 分钟。QC 第一次 7.5 分钟（本机，读 Y: 盘），第二次 5 秒、0 张新图。
+- **结果**：
+
+  | 通道 | 3D 残留 | 单条接缝 p50 | 单条接缝最大 |
+  |---|---|---|---|
+  | GFP | 0.21% | 0.02% | 12.5% |
+  | RFP | 0.21% | 0.06% | 10.2% |
+  | Olig2 | 1.45% | 0.43% | 13.6% |
+  | Sox9 | 2.92% | 1.92% | 11.5% |
+
+  按默认阈值标记了 1 条：Sox9 293300_388500 → 304700_388500（461 个细胞，组织边缘）。
+- 第一版检查图固定取接缝中段，组织边缘的接缝会裁到空白处，已改为取框最密的一段。
+
+### Checkpoint 影响
+
+改了 `run_inference.py`，Stage 4 本来就会因 `stitcher.py` 的改动重跑，这次不额外增加重跑。
+
+### 待定 / 后续
+
+- 四个 tile 交汇的角落区：对角邻居的错位由两条接缝平均得到，QC 目前只统计相邻两 tile，角落区没有单独统计。ET10 边缘接缝的检查图里能看到第三个 tile 的框，值得以后检查。
+- 327300_365900 的 GFP 通道对齐偏差约 50 px（alignment QC 判 bad），去重已吸收，但共定位坐标仍带这个误差。
+
+**同日补充：去掉阈值标记，检查图改为随机抽样。** 按要求删除了接缝标记功能，包括 `max_seam_dup_pct`、`min_seam_cells`、`flagged_seams.csv` 和警告。残留重复统计表和日志里的数字保留。检查图改为每通道 `images_per_channel`（默认 10）张：从本通道实测的（接缝, z 段）中随机抽取，先抽不同接缝，接缝不足时再补其他段。种子由 `image_seed`（默认 0）和通道名决定，结果不变时抽到同一批，已有 PNG 跳过。ET10 测试：首次 8 分钟，生成 40 张图（每通道 10 张，各来自不同接缝）；第二次 5 秒，0 张。测试改为 5 项，全部通过。

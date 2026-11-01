@@ -1000,6 +1000,12 @@ if __name__ == '__main__':
         pATH_SRC_CSV, derived['pATH_GLOBAL_2D'], derived['pATH_CHANNEL_3D'], geom, zl_params,
         base_res_path)
 
+    # Seam deduplication QC (read-only): residual cross-tile duplicates + a few review PNGs.
+    from src.qc.run_qc import run_stitch_dedup_stage
+    run_stitch_dedup_stage(config, base_res_path, geom, routing_config,
+                           {ch['id']: pATH_SRC_CSV[ch['id']] if isinstance(pATH_SRC_CSV, dict) else pATH_SRC_CSV
+                            for ch in routing_config},
+                           derived, stage3_worker_count(config, len(routing_config)))
 
     stop_after(config, 'z_linking')
 

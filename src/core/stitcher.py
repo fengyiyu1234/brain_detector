@@ -953,6 +953,10 @@ def _overlap_scores(box, boxes):
             inter / (np.minimum(area, areas) + 1e-6))
 
 
+def _is_glia(class_name):
+    return 'glia' in str(class_name).lower()
+
+
 def _seam_shift(seam_offsets, grid_names, rc_from, rc_to, seg):
     """Measured offset of tile rc_to's copy of a cell relative to rc_from's copy.
 
@@ -986,10 +990,13 @@ def _combine_predictions_seam(all_predictions, csv_reader, z_start, Z, pos, disp
     """combine_predictions with duplicates matched after removing measured seam offsets.
 
     A detection inside the overlap with an already stitched neighbour is compared with
-    that neighbour's boxes after subtracting the measured (dx, dy, dz) of the seam for
-    its z segment; a match (IoU or IoMin) is a duplicate and dropped. An unmatched
-    overlap detection is moved by the same offset into the neighbour's frame, so the
-    slices of one cell stay aligned for Z-Link whichever tile detected each slice.
+    all of that neighbour's boxes on the layer, of either cell type, after subtracting
+    the measured (dx, dy, dz) of the seam for its z segment; a match (IoU or IoMin) is
+    a duplicate and dropped. When the dropped box is glia and every box it matched is
+    neuron, the best-matching kept box is relabelled with the glia class (glia
+    priority); its coordinates stay those of the earlier tile. An unmatched overlap
+    detection is moved by the same offset into the neighbour's frame, so the slices of
+    one cell stay aligned for Z-Link whichever tile detected each slice.
     """
     row, col = pos
     ABS_X, ABS_Y, ABS_Z = (int(v) for v in disp_mat[pos])
@@ -1052,25 +1059,47 @@ def _combine_predictions_seam(all_predictions, csv_reader, z_start, Z, pos, disp
             layer = z - 1 - dz
             if not 0 <= layer < Z:
                 continue
-            boxes, rows = prior(name, (layer, cell_type_index))
-            if len(boxes):
+            # Compare with both cell types: one soma can be glia in one tile, neuron in the other.
+            matches = []
+            for ti in (0, 1):
+                boxes, rows = prior(name, (layer, ti))
+                if not len(boxes):
+                    continue
                 iou, iomin = _overlap_scores(box - [dx, dy, dx, dy], boxes)
-                match = (iou > _SEAM_IOU) | (iomin > _SEAM_IOMIN)
-                if match.any():
-                    if decision_meta is not None:
-                        best = int(np.argmax(np.where(match, iou, -1.0)))
-                        prior_ids = provenance_meta.get((layer, cell_type_index), ()) if provenance_meta else ()
-                        other = int(rows[best])
+                for k in np.flatnonzero((iou > _SEAM_IOU) | (iomin > _SEAM_IOMIN)):
+                    matches.append((float(iou[k]), ti, int(rows[k])))
+            if matches:
+                best_iou, best_ti, best_row = max(matches)
+                best_glia = _is_glia(all_predictions[layer][best_ti][best_row, 6])
+                relabel = (cell_type_index == 0 and not any(
+                    _is_glia(all_predictions[layer][ti][r, 6]) for _, ti, r in matches))
+                if relabel:
+                    all_predictions[layer][best_ti][best_row, 6] = class_name
+                if decision_meta is not None:
+                    prior_ids = provenance_meta.get((layer, best_ti), ()) if provenance_meta else ()
+                    other = prior_ids[best_row] if best_row < len(prior_ids) else ''
+                    decision_meta.append({
+                        'detection_id': detection_id,
+                        'tile_name': tile_name, 'slice_name': slice_name,
+                        'z': z, 'decision': 'rejected',
+                        'reason': ('cross_tile_overlap' if best_glia == (cell_type_index == 0)
+                                   else 'cross_tile_overlap_other_type'),
+                        'other_detection_id': other,
+                        'iou': best_iou,
+                    })
+                    if relabel:
+                        source = row_meta.get((layer, best_ti), ())
                         decision_meta.append({
-                            'detection_id': detection_id,
-                            'tile_name': tile_name, 'slice_name': slice_name,
-                            'z': z, 'decision': 'rejected',
-                            'reason': 'cross_tile_overlap',
-                            'other_detection_id': prior_ids[other] if other < len(prior_ids) else '',
-                            'iou': float(iou[best]),
+                            'detection_id': other,
+                            'tile_name': source[best_row][0] if best_row < len(source) else '',
+                            'slice_name': source[best_row][1] if best_row < len(source) else '',
+                            'z': layer + 1, 'decision': 'relabelled',
+                            'reason': 'cross_tile_glia_priority',
+                            'other_detection_id': detection_id,
+                            'iou': best_iou,
                         })
-                    duplicate = True
-                    break
+                duplicate = True
+                break
             if move is None:
                 move = (dx, dy, dz)
         if duplicate:
@@ -1213,4 +1242,4 @@ FUSION_CODE = ('fuse_dual_intensity_2d', 'merge_soma_detections_2d',
                '_RAW_COLS', '_BOX_COLS')
 STITCH_CODE = ('combine_predictions', 'stitchDetection', 'non_max_suppression_iou',
                '_combine_predictions_seam', '_seam_shift', '_overlap_scores',
-               '_SEAM_IOU', '_SEAM_IOMIN', '_NEIGHBOUR_STEPS')
+               '_SEAM_IOU', '_SEAM_IOMIN', '_NEIGHBOUR_STEPS', '_is_glia')

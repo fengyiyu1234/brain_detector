@@ -5,7 +5,8 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from src.core.seam_offsets import DEFAULT_PARAMS, measure_seam, resolve_offsets
+from src.core.seam_offsets import (DEFAULT_PARAMS, measure_seam, nominal_band,
+                                   nominal_offset, resolve_offsets)
 from src.core.stitcher import _seam_shift, combine_predictions
 
 
@@ -16,33 +17,62 @@ def _boxes(centres, layers, size=10.0):
 
 
 class MeasureSeamTest(unittest.TestCase):
-    def test_recovers_offset_per_segment_including_dz(self):
+    """Two east-west tiles; XML puts b at x=1715, the nominal 15 % grid at x=1740.8."""
+
+    PARAMS = dict(DEFAULT_PARAMS, overlap_pct=15.0)
+    GEOM = {'tile_size': 2048, 'z_start': 3, 'Z': 100,
+            'disp_mat_fin': np.array([[[0, 30, 0], [1715, 4, 3]]], dtype=object),
+            'dir_dict': {'r/a': (0, 0), 'r/b': (0, 1)}}
+
+    def _measure(self, size, n, noise_frac=0.3):
         rng = np.random.default_rng(0)
-        n = 4000
-        centres = np.column_stack([rng.uniform(0, 300, n), rng.uniform(0, 2000, n)])
+        cx, cy = rng.uniform(1600, 2100, n), rng.uniform(30, 2080, n)
         layers = rng.integers(0, 100, n).astype(float)
-        a = _boxes(centres, layers)
-        shift = np.where(layers[:, None] < 50, [6.0, -4.0], [-3.0, 2.0])
-        dz = np.where(layers < 50, 0, 1)
-        keep = rng.random(n) < 0.7          # tile b misses some cells
-        b = _boxes(centres[keep] + shift[keep], layers[keep] + dz[keep])
-        noise = _boxes(np.column_stack([rng.uniform(0, 300, 1500), rng.uniform(0, 2000, 1500)]),
-                       rng.integers(0, 101, 1500).astype(float))
+        # b copy minus a copy (XML placement): differs per 50-layer segment, incl. dz
+        true = np.where(layers[:, None] < 50, [-8.0, 5.0, 1.0], [-3.0, 12.0, 2.0])
+        a = _boxes(np.column_stack([cx, cy]), layers, size)
+        a = a[(cx < 2048) & (rng.random(n) < 0.7)]          # each tile misses some cells
+        b = _boxes(np.column_stack([cx, cy]) + true[:, :2], layers + true[:, 2], size)
+        b = b[(cx + true[:, 0] >= 1715) & (rng.random(n) < 0.7)]
+        k = int(len(b) * noise_frac)
+        noise = b[rng.integers(0, len(b), k)].copy()
+        noise[:, :4] += rng.uniform(-80, 80, (k, 1))
+        noise[:, 4] = rng.integers(0, 100, k)
         b = np.vstack([b, noise])
-        rows = {r['seg']: r for r in measure_seam(a, b, (0, 300, 0, 2000), 3.0, DEFAULT_PARAMS)}
-        self.assertAlmostEqual(rows[0]['meas_dx'], 6.0, delta=0.5)
-        self.assertAlmostEqual(rows[0]['meas_dy'], -4.0, delta=0.5)
-        self.assertEqual(rows[0]['meas_dz'], 0)
-        self.assertAlmostEqual(rows[1]['meas_dx'], -3.0, delta=0.5)
-        self.assertAlmostEqual(rows[1]['meas_dy'], 2.0, delta=0.5)
-        self.assertEqual(rows[1]['meas_dz'], 1)
+        geom, params = self.GEOM, self.PARAMS
+        band = nominal_band(geom, (0, 0), (0, 1), params)
+        r0 = nominal_offset(geom, (0, 0), (0, 1), params)
+        np.testing.assert_allclose(r0, [1715 - 1740.8, -26, 3])
+        rows = measure_seam(a, b, band, (1715, 1715 + 2048, 4, 4 + 2048), r0, 2, params)
+        return {r['seg']: r for r in rows}
+
+    def _check(self, rows):
+        for seg, (dx, dy, dz) in ((0, (-8, 5, 1)), (1, (-3, 12, 2))):
+            self.assertAlmostEqual(rows[seg]['meas_dx'], dx, delta=0.5)
+            self.assertAlmostEqual(rows[seg]['meas_dy'], dy, delta=0.5)
+            self.assertEqual(rows[seg]['meas_dz'], dz)
+            self.assertFalse(rows[seg]['outlier'])
+            self.assertGreaterEqual(rows[seg]['snr'], DEFAULT_PARAMS['min_snr'])
+        # shift from the nominal guess = measured offset minus the nominal offset
+        self.assertAlmostEqual(rows[0]['nom_dx'], -8 + 25.8, delta=0.5)
+        self.assertEqual(rows[0]['nom_dz'], 1 - 3)
+
+    def test_recovers_offset_from_nominal_guess_dense_nuclei(self):
+        rows = self._measure(12.0, 120000)
+        self._check(rows)
+        self.assertGreater(rows[0]['n_dup'], 10000)
+
+    def test_recovers_offset_from_nominal_guess_sparse_soma(self):
+        rows = self._measure(40.0, 15000)
+        self._check(rows)
         self.assertGreater(rows[0]['n_dup'], 1000)
 
 
 class ResolveOffsetsTest(unittest.TestCase):
-    def _row(self, ch, seg, dx, n_dup=100, contrast=50.0):
+    def _row(self, ch, seg, dx, n_dup=100, snr=50.0, outlier=False):
         return dict(channel=ch, tile='a', nb_tile='b', direction='EAST', seg=seg, n_a=500,
-                    n_dup=n_dup, contrast=contrast, meas_dx=dx, meas_dy=0.0, meas_dz=0)
+                    n_b=500, n_dup=n_dup, snr=snr, iou=0.5, outlier=outlier,
+                    nom_dx=dx, nom_dy=0.0, nom_dz=0, meas_dx=dx, meas_dy=0.0, meas_dz=0)
 
     def test_fallback_order(self):
         measured = pd.DataFrame([
@@ -66,6 +96,15 @@ class ResolveOffsetsTest(unittest.TestCase):
         out = resolve_offsets(measured, 'Olig2', 2, DEFAULT_PARAMS).set_index(['channel', 'seg'])
         self.assertEqual(out.loc[('GFP', 0), 'source'], 'frame')
         self.assertEqual(out.loc[('GFP', 1), 'source'], 'frame_nearest')
+
+    def test_outlier_and_weak_segments_are_not_used(self):
+        measured = pd.DataFrame([
+            self._row('Olig2', 0, 10.0), self._row('Olig2', 1, 60.0, outlier=True),
+            self._row('Olig2', 2, 11.0, snr=1.0)])
+        out = resolve_offsets(measured, 'Olig2', 3, DEFAULT_PARAMS).set_index(['channel', 'seg'])
+        self.assertEqual(out.loc[('Olig2', 1), 'source'], 'own_nearest')
+        self.assertAlmostEqual(out.loc[('Olig2', 1), 'dx'], 10.0)
+        self.assertEqual(out.loc[('Olig2', 2), 'source'], 'own_nearest')
 
 
 class SeamShiftTest(unittest.TestCase):
@@ -126,6 +165,27 @@ class SeamDedupTest(unittest.TestCase):
         self.assertEqual(len(new[0][0]), 2)
         moved = new[0][0][1]
         self.assertEqual([float(v) for v in moved[:4]], [77.0, 12.0, 87.0, 22.0])
+
+    def test_cross_type_duplicate_keeps_earlier_box_with_glia_class(self):
+        left = [self._row("left_neuron", 85, 40, 95, 50, cls="neuron")]
+        right = [self._row("right_glia", 13, 40, 23, 50, cls="glia")]
+        seams = {('tile_0', 'tile_1'): {0: (8.0, 0.0, 0)}}
+        new, trace, decisions = self._stitch(left, right, seams)
+        self.assertEqual(sum(len(v) for v in trace.values()), 1)
+        kept = new[0][1][0]
+        self.assertEqual(kept[6], "glia")
+        self.assertEqual([float(v) for v in kept[:4]], [85.0, 40.0, 95.0, 50.0])
+        self.assertEqual({d['decision'] for d in decisions}, {'rejected', 'relabelled'})
+        self.assertEqual(decisions[0]['reason'], 'cross_tile_overlap_other_type')
+
+    def test_cross_type_duplicate_neuron_dropped_glia_kept(self):
+        left = [self._row("left_glia", 85, 40, 95, 50, cls="glia")]
+        right = [self._row("right_neuron", 13, 40, 23, 50, cls="neuron")]
+        seams = {('tile_0', 'tile_1'): {0: (8.0, 0.0, 0)}}
+        new, trace, decisions = self._stitch(left, right, seams)
+        self.assertEqual(trace, {(0, 0): [("tile_0", "left_glia")]})
+        self.assertEqual(new[0][0][0][6], "glia")
+        self.assertEqual([d['decision'] for d in decisions], ['rejected'])
 
     def test_detection_outside_overlap_is_untouched(self):
         right = [self._row("right_inner", 50, 10, 60, 20)]
