@@ -6,18 +6,21 @@ translations are the only operations performed by this module.
 
 from __future__ import annotations
 
+import json
 import os
 import pickle
 
 import numpy as np
 import napari
+import pandas as pd
 
 from src.utils.video_export import add_video_export_panel
 from src.utils.markers import class_markers
 from src.utils.io import resolve_tile_dir
 from src.utils.saved_view import (
-    global_to_local_rows, read_global_boxes, read_tile_boxes,
-    records_and_shapes, track_for_summary,
+    TileFrame, global_to_local_rows, neighbour_tiles, read_global_boxes,
+    read_tile_boxes, records_and_shapes, s3_rows_in_tile_frame, s4_rows_in_tile_frame,
+    s4_source_tracks, stage3_geometry, track_for_summary,
 )
 from src.utils.visualize import (
     _canvas_shape_from_tile, _ch_vis, _list_tiffs, _make_fn_recorder,
@@ -192,9 +195,192 @@ def _add_tile_2d(viewer, result_dir, tile_name, routing, offsets,
                     channel=cid, source=directory)
 
 
+def _stage3_seam_inputs(result_dir, cid, context):
+    """(geometry, seam_offsets, seg_layers) as Stage 3 used them for one channel.
+
+    geometry is None when the frame XML no longer matches the Stage 3 manifest, or
+    when Stage 3 used a seam table that is missing or changed; neighbour rows then
+    keep their global (XML) placement.
+    """
+    from src.core.provenance import file_sha256
+    from src.core.seam_offsets import load_offsets
+    folder = os.path.join(result_dir, "5_2d_global")
+    try:
+        with open(os.path.join(folder, f"{cid}_global_manifest.json"),
+                  encoding="utf-8") as handle:
+            signature = json.load(handle)["input_signature"]
+    except (OSError, ValueError, KeyError):
+        signature = {}
+    geometry = stage3_geometry(context.frame_xml, context.tile_size)
+    saved = signature.get("geometry") or {}
+    if geometry and saved.get("positions") is not None:
+        z_start = int(saved["z_start"])
+        expected = {key: [int(v) for v in value] for key, value in saved["positions"]}
+        actual = {str(rc): [ax, ay, z_start - z0]
+                  for rc, ax, ay, z0 in geometry.values()}
+        if actual != expected:
+            print(f"[saved s3] {cid}: frame XML differs from the Stage 3 manifest; "
+                  "neighbour rows keep their XML placement")
+            geometry = None
+    seam = signature.get("seam_offsets")
+    if not seam:
+        return geometry, None, 50
+    seg_layers = int(seam.get("seg_layers", 50))
+    path = os.path.join(folder, "seam_offsets", "seam_offsets.csv")
+    if (not os.path.isfile(path) or
+            file_sha256(path) != (seam.get("table") or {}).get("sha256")):
+        print(f"[saved s3] {cid}: seam table used by Stage 3 is missing or changed "
+              f"({path}); neighbour rows keep their XML placement")
+        return None, None, seg_layers
+    return geometry, load_offsets(path, cid), seg_layers
+
+
+def _tile_table(result_dir, ch, tile, cache):
+    """One Stage 3 input CSV (detection_id, slice_name, box, z), read once per view."""
+    key = (ch["id"], tile)
+    if key not in cache:
+        from src.core.resume import saved_channel_directory
+        folder = cache.setdefault(("folder", ch["id"]),
+                                  saved_channel_directory(result_dir, ch))
+        path = os.path.join(folder, f"{tile}_{ch['id']}_result.csv")
+        cache[key] = (pd.read_csv(path, usecols=lambda c: c in (
+            "detection_id", "slice_name", "x1", "y1", "x2", "y2", "z"))
+            if os.path.isfile(path) else None)
+    return cache[key]
+
+
+def _stage3_sources(result_dir, ch, tile_names, wanted, cache=None):
+    """{detection_id: (tile, x1, y1, x2, y2, z)} from the CSVs Stage 3 stitched."""
+    cache = {} if cache is None else cache
+    wanted = set(wanted)
+    sources = {}
+    for name in tile_names:
+        if not wanted:
+            break
+        table = _tile_table(result_dir, ch, name, cache)
+        if table is None or "detection_id" not in table.columns:
+            continue
+        id_series = table["detection_id"].astype(str)
+        ids = id_series.to_numpy()
+        hit = np.flatnonzero(id_series.isin(wanted).to_numpy())  # hash lookup
+        x1, y1, x2, y2, z = (table[c].to_numpy() for c in ("x1", "y1", "x2", "y2", "z"))
+        for k in hit:
+            sources[ids[k]] = (name, float(x1[k]), float(y1[k]), float(x2[k]),
+                               float(y2[k]), int(z[k]))
+        wanted -= set(ids[hit])
+    return sources
+
+
+def _s3_local_rows(rows, result_dir, ch, tile_name, position, context, cache=None):
+    """Stage 3 summary rows drawn on this tile's own image (see s3_rows_in_tile_frame)."""
+    if rows.empty or "best_detection_id" not in rows.columns or context is None:
+        return s3_rows_in_tile_frame(rows, tile_name, position, {})
+    cache = {} if cache is None else cache
+    geometry, seam_offsets, seg_layers = _seam_inputs_cached(
+        result_dir, ch["id"], context, cache)
+    tiles = [tile_name] + neighbour_tiles(geometry, tile_name)
+    sources = _stage3_sources(
+        result_dir, ch, tiles, rows["best_detection_id"].astype(str), cache)
+    local = s3_rows_in_tile_frame(rows, tile_name, position, sources,
+                                  geometry, seam_offsets, seg_layers)
+    counts = local["frame"].value_counts().to_dict()
+    print(f"[saved s3] {ch['id']} tile frame: own={counts.get('own', 0)}, "
+          f"neighbour+seam={counts.get('seam', 0)}, xml-only={counts.get('xml', 0)}")
+    return local
+
+
+def _seam_inputs_cached(result_dir, cid, context, cache):
+    key = ("seam", cid)
+    if key not in cache:
+        cache[key] = _stage3_seam_inputs(result_dir, cid, context)
+    return cache[key]
+
+
+def _s4_center_sources(result_dir, routing, rows, cache=None, tracks_by_row=None):
+    """{coloc_id: source} of the primary member each rep-z row shows exactly.
+
+    coloc_result names that member's tile and slice; a pure translation keeps the box
+    width and height, so the member is the unique same-size box on that slice.
+    tracks_by_row: s4_source_tracks of each row, if already parsed.
+    """
+    cache = {} if cache is None else cache
+    by_channel = {ch["id"]: ch for ch in routing}
+    records = rows.to_dict("records")
+    if tracks_by_row is None:
+        tracks_by_row = [s4_source_tracks(row) for row in records]
+    wanted = {}
+    for row, tracks in zip(records, tracks_by_row):
+        if (row.get("bounds_method") == "cross_channel_bbox_union" or
+                not str(row.get("source_trace_status", "")).startswith(
+                    "exact_primary_center_member")):
+            continue
+        if not tracks or tracks[0][0] not in by_channel:
+            continue
+        wanted.setdefault((tracks[0][0], str(row["tile_name"])), []).append(row)
+
+    def size_key(slice_name, w, h):
+        return (str(slice_name), round(float(w), 3), round(float(h), 3))
+
+    found = {}
+    for (channel, tile), members in wanted.items():
+        table = _tile_table(result_dir, by_channel[channel], tile, cache)
+        if table is None or "slice_name" not in table.columns:
+            continue
+        names = table["slice_name"].astype(str)
+        table = table.loc[names.isin({str(row["slice_name"]) for row in members})]
+        x1, y1, x2, y2, z = (table[c].to_numpy() for c in ("x1", "y1", "x2", "y2", "z"))
+        index = {}
+        for k, name in enumerate(table["slice_name"].astype(str).to_numpy()):
+            index.setdefault(size_key(name, x2[k] - x1[k], y2[k] - y1[k]), []).append(k)
+        for row in members:
+            hits = index.get(size_key(row["slice_name"], row["x2"] - row["x1"],
+                                      row["y2"] - row["y1"]), [])
+            if len(hits) == 1:
+                k = hits[0]
+                found[row["coloc_id"]] = (tile, float(x1[k]), float(y1[k]),
+                                          float(x2[k]), float(y2[k]), int(z[k]))
+    return found
+
+
+def _s4_local_rows(rows, result_dir, routing, tile_name, position, context, cache=None):
+    """Stage 4 rows drawn on this tile's own image (see s4_rows_in_tile_frame)."""
+    if rows.empty or "source_3d" not in rows.columns or context is None:
+        return s4_rows_in_tile_frame(rows, position, {}, {}, (), {})
+    cache = {} if cache is None else cache
+    soma_channels = [ch["id"] for ch in routing if ch.get("type", "soma") == "soma"]
+    records = rows.to_dict("records")
+    tracks_by_row = [s4_source_tracks(row) for row in records]
+    wanted = {}
+    for row, tracks in zip(records, tracks_by_row):
+        union = row.get("bounds_method") == "cross_channel_bbox_union"
+        for index, (channel, record) in enumerate(tracks):
+            if index == 0 or (union and channel in soma_channels):
+                wanted.setdefault(channel, set()).add(str(record.get("best_detection_id")))
+    frames, sources = {}, {}
+    for ch in routing:
+        if ch["id"] not in wanted:
+            continue
+        geometry, seam_offsets, seg_layers = _seam_inputs_cached(
+            result_dir, ch["id"], context, cache)
+        frames[ch["id"]] = TileFrame(tile_name, geometry, seam_offsets, seg_layers)
+        tiles = [tile_name] + neighbour_tiles(geometry, tile_name)
+        sources[ch["id"]] = _stage3_sources(
+            result_dir, ch, tiles, wanted[ch["id"]], cache)
+    local = s4_rows_in_tile_frame(
+        rows, position, frames, sources, soma_channels,
+        _s4_center_sources(result_dir, routing, rows, cache, tracks_by_row),
+        tracks_by_row)
+    counts = local["frame"].value_counts().to_dict()
+    print(f"[saved s4] tile frame: own={counts.get('own', 0)}, "
+          f"neighbour+seam={counts.get('seam', 0)}, xml-only={counts.get('xml', 0)}")
+    return local
+
+
 def _add_global_results(viewer, result_dir, routing, xy_bounds,
                         global_z_range, tile_bounds, position, global_view,
-                        registry, width, show_coloc, show_zlinked, show_spheres):
+                        registry, width, show_coloc, show_zlinked, show_spheres,
+                        tile_name=None, context=None):
+    cache = {}  # Stage 3 input CSVs and seam tables shared by the s3 and s4 layers.
     for ch in routing:
         cid = ch["id"]
         for directory, filename, label in (
@@ -204,9 +390,14 @@ def _add_global_results(viewer, result_dir, routing, xy_bounds,
             saved_path = os.path.join(result_dir, directory, filename)
             if not os.path.isfile(saved_path):
                 print(f"[saved] Stage unavailable: {saved_path}")
-            rows = read_global_boxes(saved_path, xy_bounds, global_z_range)
+            # A Stage 3 summary's x/y belong to its representative box's layer.
+            rows = read_global_boxes(saved_path, xy_bounds, global_z_range,
+                                     z_column="best_box_z" if label == "s3" else "z")
             rows = _intersects_any(rows, tile_bounds)
-            if not global_view:
+            if not global_view and label == "s3":
+                rows = _s3_local_rows(rows, result_dir, ch, tile_name, position, context,
+                                      cache)
+            elif not global_view:
                 rows = global_to_local_rows(rows, position)
             layer_label = ("[s3 saved summary]" if label == "s3"
                            else "[global saved]")
@@ -231,7 +422,8 @@ def _add_global_results(viewer, result_dir, routing, xy_bounds,
         rows = read_global_boxes(path, xy_bounds, global_z_range)
         rows = _intersects_any(rows, tile_bounds)
         if not global_view:
-            rows = global_to_local_rows(rows, position)
+            rows = _s4_local_rows(rows, result_dir, routing, tile_name, position, context,
+                                  cache)
         _add_s4_layers(viewer, rows, registry, width)
         if not os.path.isfile(path):
             print(f"[saved] Stage 4 unavailable: {path}")
@@ -306,10 +498,11 @@ def _attach_clicks(viewer, registry, result_dir, context, tile_contexts,
         if not global_view:
             tile_name = next(iter(tile_contexts))
             position = tile_contexts[tile_name][3]
-            summary["x1"] += position.x
-            summary["x2"] += position.x
-            summary["y1"] += position.y
-            summary["y2"] += position.y
+            # Local s3 rows may be redrawn in the tile's own frame; match the saved row.
+            for key, shift in (("x1", position.x), ("x2", position.x),
+                               ("y1", position.y), ("y2", position.y)):
+                summary[key] = (summary[f"stage3_{key}"] if f"stage3_{key}" in summary
+                                else summary[key] + shift)
         track = track_for_summary(summary, track_cache[cid])
         if track is None:
             v.status = "No unique saved PKL track matches this Stage 3 row"
@@ -401,7 +594,8 @@ def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles, progres
                     viewer, result_dir, routing, bounds, global_range,
                     [bounds], pos, False, registry, width, show_coloc,
                     bool(vis_cfg.get("show_zlinked", False)),
-                    bool(vis_cfg.get("spheres", False)))
+                    bool(vis_cfg.get("spheres", False)),
+                    tile_name=tile_name, context=context)
             else:
                 print("[saved] Final-frame XML not available; showing tile 2D only")
             _attach_clicks(

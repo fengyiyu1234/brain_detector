@@ -1452,3 +1452,32 @@ post-alignment 流程已不再使用，可视化只保留 `prealign` 和 `2d` �
 - `config_example/visualization_config.example.json`：删除已无人读取的 `z_linker`、`stage`、`filter`、各类 opacity、`sphere_colors`、`marker_colors`；补充 `aligned_filtered` 在 layout v2 下退回 `3_2d_aligned` 的说明。本地 `config/vis_config.json` 中的这些键会被忽略，不影响运行。
 - 测试：删除只覆盖 post 模式 helper 的 `tests/test_visualization_tile_selection.py`；`test_saved_pre_gui.py` 的 z-link patch 目标改为 `src.core.z_linker.run_z_linker`。`test_saved_pre_gui`（17）通过；`test_tile_2d_sources`（4）在先创建 QApplication 时全部通过。直接运行时，`_run_2d` 那一项会让进程以 127 退出，HEAD 上也一样，是已有问题。
 - 不影响任何 pipeline checkpoint（`visualize.py` 不在 Stage 2.6/3/4 的哈希范围内）。
+
+---
+
+## 2026-11-05 Saved local 视图：s3 3D 框画回本 tile 自己的坐标系
+
+现象：ET10 prealign local 视图里，接缝重叠区的 s3 3D 框偏离细胞，tile-local 2D 框是准的。
+
+- **原因 1（重叠区，主要）**：Stage 3 在重叠区保留先拼接的那个 tile 的框；后拼接 tile 没配上的框会按 seam offset 移进前者的坐标系。全局 3D 框（= track 代表框的全局坐标）因此对上的是邻居 tile 的图像。GUI 只减本 tile 的 XML 位置，差一个 seam offset。316000_388500 GFP：约 40% 的 s3 框来自邻居 tile，左缝偏约 dx +16、dy −6 px，z 也错 0–2 层。RFP 统计相同。
+- **原因 2（全 tile）**：s3 行的 xy 来自代表框所在层（`best_box_z`），但 `z` 列是 track 的中位层，约 34% 差 1–2 层。
+- GUI 的 x/y/z 换算本身没问题（`max(ABS_D) − ABS_D` 与 Stage 3 的 z0 一致）。
+- **修改**（只改 viewer，不碰任何 checkpoint）：
+  - `saved_view.read_global_boxes` 加 `z_column`；s3 层按 `best_box_z` 选层、画框（老文件没有这一列时退回 `z`）。local 和 global 视图都生效。
+  - local 视图新增 `s3_rows_in_tile_frame`，按 `best_detection_id` 找 Stage 3 输入 CSV 里的源框：本 tile 检测的直接用 tile-local 框和层；邻居检测的用邻居 tile-local 框 + XML 位置差 + seam offset（与 Stage 3 的 `_seam_shift` 相同，按本 tile 层所在段取值）；找不到源框时仍按 XML 放置。
+  - seam 表和 seg_layers 取自 `5_2d_global/{ch}_global_manifest.json`：manifest 里的 seam 表 sha256 对不上、或 frame XML 与 manifest 几何不一致时，邻居框退回 XML 放置并打印提示。
+  - 每行保留 `stage3_x1..y2`（点击查 PKL track 用）和 `source_tile`。
+  - global 视图仍按 XML 放置（各 tile 图像本来就按 XML 叠加）。
+  - `[global saved]` 2D 层和 Shift+click 的 track span 没改，重叠区仍按 XML 放置。
+  - **s4 层**（local 视图，同一天追加）：换算逻辑抽成 `saved_view.TileFrame`，s3 和 s4 共用。
+    - rep-z 行：按 `coloc_result` 的 `tile_name`/`slice_name` 找到主 track 在中位层的成员框（同一切片上宽高完全相同的唯一框；平移不改变宽高），按它换算；找不到时按主 track 代表框的位移平移。
+    - union 行：每个 soma 通道的 3D 框（`source_3d` 里的 `x1_3d..`、`z_min/z_max`）按各自代表框的位移换算后重新取并集，画在 `round((z_min+z_max)/2)` 层，与 Stage 4 相同。已保存的 union 不等于这些 soma track 的并集时保持 XML 放置。TF track 不参与并集。
+    - s3 和 s4 在同一次打开中共用 tile CSV 和 seam 表的读取缓存。
+- **ET10 验证**（316000_388500，与本 tile 自己的检测比较，IoU>0.5 的比例）：
+  - 本 tile 来源：1.00。
+  - 邻居来源，同层：GFP 0.04（XML 放置、best_box_z）/ 0.10（改前）→ 0.42；±1 层内 0.64；±3 层内仍有约 22% 附近没有本 tile 的检测（本 tile 没检出）。
+  - 剩余的主要是 ±1 层误差：seam dz 是每 50 层一个整数。
+  - 每个邻居方向都比 XML 放置好，没有符号错误。
+  - 处理一个 tile 约 4 秒。
+  - s4（同一 tile，35362 行）：rep-z 本 tile 来源 0.94 → 1.00；邻居来源 0.04 → 0.39（±1 层内 0.57）。union 行 11098 个，只有 83 个本 tile 来源的框有变化（本 tile 检测在 Stage 3 被 seam offset 移过）。s4 换算单独运行约 13 秒；viewer 里与 s3 共用 CSV 读取，实际多出约 8–9 秒（读 `coloc_result.csv` 本身约 34 秒）。
+- 测试：新增 `tests/test_saved_s3_tile_frame.py`（6 项，含 s4）；`test_saved_pre_gui`（17）、`test_checkpoint_code_lists`（2）通过。
