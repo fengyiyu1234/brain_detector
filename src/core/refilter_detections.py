@@ -23,6 +23,7 @@ from src.core.detection_filter import (
     FILTER_SCHEMA_VERSION, filter_detection_df, resolve_filter_params,
     source_dir_for_channel,
 )
+from src.core.local_contrast import resolve_contrast_filter
 
 
 def _derived_paths(config: dict) -> dict[str, str]:
@@ -70,6 +71,10 @@ def main() -> int:
     if unknown:
         raise ValueError(f"Unknown or inactive --channels value(s): {unknown}")
     selected = [by_id[channel_id] for channel_id in selected_ids]
+    contrast = set(resolve_contrast_filter(config)) & set(selected_ids)
+    if contrast:
+        raise ValueError(f"contrast_filter (SNR) channel(s) {sorted(contrast)} need the full pipeline "
+                         "(Stage 2.2/2.25); this tool does not apply the SNR filter.")
     derived = _derived_paths(config)
     pipeline_mode = config.get("pipeline_mode", "post_align")
     output_dir = os.path.abspath(args.output_dir or derived["pATH_DET_FILTERED"])

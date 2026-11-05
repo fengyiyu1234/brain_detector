@@ -1314,3 +1314,125 @@ Stage 1 只检查 CSV 是否存在，不比较代码 hash，已完成的 tile �
 - 327300_365900 的 GFP 通道对齐偏差约 50 px（alignment QC 判 bad），去重已吸收，但共定位坐标仍带这个误差。
 
 **同日补充：去掉阈值标记，检查图改为随机抽样。** 按要求删除了接缝标记功能，包括 `max_seam_dup_pct`、`min_seam_cells`、`flagged_seams.csv` 和警告。残留重复统计表和日志里的数字保留。检查图改为每通道 `images_per_channel`（默认 10）张：从本通道实测的（接缝, z 段）中随机抽取，先抽不同接缝，接缝不足时再补其他段。种子由 `image_seed`（默认 0）和通道名决定，结果不变时抽到同一批，已有 PNG 跳过。ET10 测试：首次 8 分钟，生成 40 张图（每通道 10 张，各来自不同接缝）；第二次 5 秒，0 张。测试改为 5 项，全部通过。
+
+---
+
+## 2026-11-02 EGFR 样本复跑准备：统一到 bbox_max=100 和 Stage 2.97 拼接
+
+### 核查结果（只读 manifest）
+
+- 9 个 EGFR 样本的 filter manifest 都是 schema 6，代码 hash 与当前 `detection_filter.py` 一致，glia 优先的 containment NMS 都已生效。
+- 与当前 config 唯一的差别：T10、T4、T70、ETail、ET1、ERH 旧结果的 `detection_params.yolo.bbox_max` 为 null，当前为 100。
+- 只有 ET10 用了 Stage 2.97 新拼接，Stage 3/4 代码 hash 与当前一致，不用重跑。
+- batch4 sample4/5：过滤、对齐为最新；10-30 Stage 3 Sox9 被 OOM kill（128G，4 通道同跑），Sox9（sample5 还有 Olig2）没有 3D 结果，Stage 4 未完成。
+
+### 处理
+
+1. batch4 sample4/5：`stage3_n_workers` null → 2；slurm `--mem` 128G → 240G。直接重新提交即可从 Stage 2.97 续跑。
+2. T70 / ETail：`pATHRESULT` 的 `{date}` 改成已有目录（`detection_results3`、`detection_results_20261026`），避免新建目录重跑检测。
+3. 6 个 bbox_max 样本：把 `3_2d_aligned`、`5_2d_global`、`6_3d_global`、`7_colocalization`、`qc/alignment`（ERH 另有 `3_2d_aligned_fusion`、`4_2d_filtered`）移到结果目录下的 `old_results_bboxNone/`（附 README）。否则 Stage 2.25 会报 `Filtered checkpoint conflicts with saved alignment`。
+   - 模拟 checkpoint 判断：GFP/RFP（ERH 还有 GFPhi）重新过滤，Sox9/Olig2 复用；raw 检测复用（`bbox_max` 不在 raw 签名里）。
+   - 重新提交后：过滤 → 对齐（参考通道是 soma，所有通道偏移会变）→ 融合（ERH）→ tile positions/XML → 2.97 → Stage 3 → 去重 QC → Stage 4。
+
+### 未做
+
+- 没有提交 HPC 作业。
+
+---
+
+## 2026-11-02 Alignment QC 兼容通道间 tile 命名微小偏差
+
+- 问题：batch4 sample4（job 1645672）对齐 QC 有 4 个 tile 报 `Missing source image for one-based slice N`：451400/474100/496700/508000 的 `_340700`。原因是 488nm（Olig2）这 4 个 tile 的目录名和文件名是 `_340600`，其他通道是 `_340700`。主流程用 `resolve_tile_dir` + `anchor_slice_key` 能对上，QC 读图只按原始文件名匹配，所以找不到。检测/对齐/拼接/共定位结果不受影响。
+- 修改：
+  - `src/qc/alignment.py` `extract_pairs`：切片按 `anchor_slice_key` 换成锚点 tile 名再匹配。
+  - `src/utils/validate_align_shifts.py` `tile_slice_names`：精确路径找不到时用 `resolve_tile_dir`（容差 1000）找目录，切片名同样换成锚点名。
+  - 新增测试 `test_legacy_support_tolerates_drifted_channel_tile_name`。
+- 真实数据验证：451400_340700 的 Olig2 1013 张切片全部对上锚点名。
+- 影响：QC 代码 hash 变化，下次运行全部 81 个 tile 的对齐 QC 重跑一次；不影响 Stage 2.6/3/4 checkpoint。
+- 已知：本地 Windows 上 `test_qc_alignment.py` 的 end-to-end 测试在改动前后都以 exit 127 退出（子进程环境问题），与本次改动无关。
+
+---
+
+## 2026-11-02 ~ 03 Sox9 假阳性：局部 SNR 与分类器离线测试（未改 pipeline）
+
+ET10 共定位中 Sox9 假阳性多，主要来自淡的背景核状结构。StarDist score 区分不开（假阳性也有 0.73）。
+
+- **特征**：每个框计算 mask 外 2–8 px 环形背景（排除所有检测 mask）的中位数和 MAD，SNR = (mean − ring_bg) / ring_MAD。每层计算约 1 秒；主要耗时在读原图和 CSV。
+- **亮度绝对值不可用**：不同层的背景相差约 10 倍。环形背景的噪声与背景亮度成正比（MAD/bg ≈ 0.15），说明噪声来自组织纹理。人工选的每层 SNR 阈值（3–15）与背景亮度无关。
+- **人工阈值**：9 个 EGFR 样本共 44 层，结果在 `Y:\Fengyi\EGFR_brain\ET10\sox9_contrast_test_20261102\`（每层有 SNR 2–16 的扫描图和标签）。
+- **分类器**：输入为 SNR + 层级上下文，对 SNR 单调递增，深度 2。留一组交叉验证的平均平衡准确率：现有过滤 0.681，全局 SNR ≥ 5 0.899，分类器 0.899（最差一层 0.69，全局阈值为 0.62）。用全部特征的模型反而更差（0.883）。
+- **验证**：ET10 6 层（训练没用过的 tile）+ TSC FF8/FF9/FW2/FW6 各 3 层。分类器在每层的等效阈值为 SNR 4–8，大多是 5。现有过滤在 TSC 上比分类器多保留 10–30% 的框。结果在 `Y:\Fengyi\EGFR_brain\test\sox9_classifier_20261103\report.html`。
+- **待定**：人工检查验证图后，决定是用全局 SNR ≥ 5 还是用分类器。接入时在 Stage 2.25 之前新增特征阶段（读 Sox9 原图，结果缓存），再在 Stage 2.25 按概率或 SNR 过滤；Sox9 参与对齐，所以过滤和对齐以下都要重跑。
+
+---
+
+## 2026-11-03 Stage 4 共定位问题排查：同一细胞被拆成多个结果、TF 标签被抢（未改代码）
+
+在 viewer 里人工检查 ET10（`ET10/detection_results_20261021`，tile 316000_377200 / 316000_388500，z 约 393–412）的 s4 结果，发现 5 个例子，归为 3 类。
+
+### 1. 同一细胞在某个通道断成多段 track，共定位后成了重复细胞（3 例，主要问题）
+
+- **截断原因 A**：`max_cell_z_span`（soma 5、TF 3）。track 从 `first_z` 起满 N 层就强制结束，下一层另起新 track（`z_linker.py:188`）。这批细胞在 z 上常跨 6–7 层。
+  - 例：GFP 406–410 + 411。
+  - 例：GFP/RFP 都是 393–397，RFP 在 398 另起；Sox9 394–396 + 397–398，正好顶到上限。
+- **截断原因 B**：相邻层的框大小突变，IoU 低于 z-link `iou_thresh`，track 断开。
+  - 例：RFP 在 z402 的框约 74 px，z403 缩到约 42 px，IoU ≤ 0.32。
+  - 第一例 RFP 在 407/408 断开可能也是这个原因。
+- **共定位是一对一贪心匹配**（`match_soma_3d_iou`，按 IoU 从高到低，每条 track 只用一次）。一个 GFP 碎片配上一个 RFP 碎片后，剩下的碎片要么互相配成第二个 GFP+RFP 细胞，要么作为单通道细胞追加进结果。
+  - 例：GFP_A–RFP_A IoU 0.194 先配上；GFP_A–RFP_B IoU 0.168 因 GFP_A 已被占用而跳过；GFP_B–RFP_B 靠 IoMin = 1.0 配上。
+- **匹配之后没有去重**：结果细胞 XY 几乎重合、z 区间重叠或相接，也不会合并（`run_inference.py:1086` 直接追加 unmatched）。
+- **TF 标签被抢**：同一 TF 只标给中心最近的 soma（`stitcher.py:850`）。
+  - 例：Sox9 `track3d:a562c7b9…` 与 GFP+RFP 细胞 `coloc:bc9cb290…` 完美重合，中心距离约 3.5 px，包含判断全部通过。但它被标给了同一位置的单 RFP 碎片 `coloc:b58df551…`（RFP z401–402，框约 74 px，中心距离 1.08 px），这个碎片成了 RFP+Sox9+Olig2。可用 `coloc_match_evidence.csv` 的 tf_containment 行查。
+
+### 2. 合并后的框超过 bbox_max = 100（1 例）
+
+- `bbox_max` 只作用于每个通道的 2D 框（`detection_filter.py:155`）。`merge_soma_volumes_union` 取的跨通道并集不会再检查尺寸；Stage 4 只有 TF 有 `bbox_max_w/h`。
+  - 例：GFP 89×85 和 RFP 75×47 中心错开约 30 px，并集宽 112 px。
+
+### 3. 单层、低分的 soma 拼成多阳性假阳性（2 例）
+
+- 每个通道各一个单层、低分的框，按 IoU/IoMin 拼成多阳性细胞。在原图上看不到 GFP/RFP 细胞。
+  - 例：GFP 0.20 + RFP 0.19，四阳性，mean 26078。
+  - 例：GFP 被判为 neuron（0.69，2 层）+ RFP 0.155 单层，合并后类别是 glia。
+- 共定位只看几何（IoU/IoMin），不看 score、`member_count`，也不看两边类别是否一致。soma 的 1 成员 track 也会保留。
+
+### 拟修改（待定）
+
+1. **优先**：Phase B 之后加共定位后去重。XY IoMin 高、z 区间重叠或相接的结果细胞合并为一个，soma 和 TF 标签取并集。能解决第 1 类的全部 3 例。
+2. 并集之后加 soma 尺寸检查，或拒绝源框中心距离过大的配对。
+3. 对单层、低分的 soma track 加更严格的跨通道匹配门槛，或拒绝 neuron/glia 跨类别配对。要放在第 1 步之后，否则会把真实细胞的 z 碎片删掉。
+4. 调大 `max_cell_z_span` 前，先统计各通道 `member_count` 分布，看在上限处有没有尖峰。
+
+以上改 `run_inference.py` 和 `stitcher.py`，Stage 4 要重跑；如果改了 `combine_predictions` 调用到的函数，还要同步更新 `STITCH_CODE`。
+
+---
+
+## 2026-11-03 Sox9 局部 SNR 过滤接入 pipeline（Stage 2.2），ET10 待重跑
+
+选用全局 SNR ≥ 5（分类器平均效果相同，不值得多维护一个模型）。
+
+- **新模块** `src/core/local_contrast.py`：
+  - 计算方法与离线测试完全一致：环形背景 2–8 px，排除所有实例 mask；SNR = (mean − 环形中位数) / (1.4826 × MAD)。
+  - 在 ET10 304700_365900 z150 上复算 4138 个框，与离线结果的最大差 7e-15。
+  - 速度：约 230 µs/框。ET10 约 3200 万个 Sox9 框，约 2 CPU 小时。
+- **配置**：顶层 `"contrast_filter": {"Sox9": {"snr_min": 5}}`，只支持单曝光 StarDist 通道（要用 instances.csv 的多边形）。不写这一节时，所有 checkpoint 签名和对齐设置都不变，其他样本不受影响。
+- **Stage 2.2**（检测之后）：
+  - 每个 tile×通道写 `1_2d_raw/contrast/{tile}_{ch}_contrast.csv`（detection_id, ring_bg, ring_mad, ring_n, snr）和 manifest。
+  - 签名包括：raw CSV 的 hash、instances CSV 的大小、环参数、模块代码 hash。
+  - 按 tile 多进程并行，进程数 = SLURM CPU 数。
+- **Stage 2.25 / 2.75**：
+  - 先跑原有过滤，再去掉 SNR < snr_min 的框。rejected 中的原因记为 `snr_min`，输出 CSV 多一列 `snr`。
+  - 环形像素少于 10 个、无法计算 SNR 的框保留。
+  - 只有配置了 contrast_filter 的通道，过滤签名里才加入 SNR 表 hash 和阈值；配置后，对齐设置里也会加入 `contrast_filter`。
+- `detection_filter.py` 没改，所以其他样本已有的过滤和对齐 checkpoint 仍然有效。`run_inference.py` 改了，按惯例其他样本下次运行时会重跑 Stage 4。
+- `refilter_align` / `refilter_detections` 遇到 contrast_filter 通道时直接报错：它们不算 SNR，不能静默跳过。
+- **测试**：新增 `tests/test_local_contrast.py`（6 项），相关模块的测试全部通过。
+
+### ET10
+- config 已加上 `contrast_filter: {"Sox9": {"snr_min": 5}}`。
+- 旧结果已移到 `detection_results_20261021/old_results_sox9_no_snr/`（附 README），包括 3_2d_aligned、5_2d_global、6_3d_global、7_colocalization、qc/stitch_dedup，以及旧的 Sox9 过滤 CSV。
+- 重新提交 `scripts/egfr/inference_ET10.slurm` 后的流程：
+  - Stage 2.2 计算 45 个 tile 的 SNR
+  - 只重新过滤 Sox9
+  - 对齐 → tile positions → 2.97 → 3 → 4
+- 离线估计 Sox9 每层保留约 51%，现有过滤约 73%。

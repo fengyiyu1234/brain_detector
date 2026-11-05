@@ -17,6 +17,7 @@ from src.config.loader import load_config
 from src.core.provenance import file_sha256, file_stamp, output_manifest_valid, write_output_manifest
 from src.utils import validate_align_shifts as validation
 from src.utils.alignment_intensity_qc import image_files
+from src.utils.io import anchor_slice_key
 from .alignment_features import extract_features
 from .alignment_flags import resolve_flag_options, write_flags
 from .alignment_plots import curve_summary, overview, plot_curves
@@ -151,7 +152,8 @@ def extract_pairs(tile, params, region, cells, offsets, fit, guard):
         if not targets:
             break
         files = image_files(params['channel_roots'][cid], tile)
-        by_name = {p.stem: p for p in files}
+        # A channel's tile name may drift slightly (488nm 451400_340600); key slices by the anchor's name.
+        by_name = {anchor_slice_key(p.stem, p.parent.name, tile): p for p in files}
         def make_reader(paths):
             @lru_cache(maxsize=24)
             def read(z):

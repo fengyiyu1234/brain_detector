@@ -44,6 +44,7 @@ from tqdm import tqdm
 
 from src.config.loader import load_config
 from src.core.z_linker import run_z_linker
+from src.utils.io import anchor_slice_key, resolve_tile_dir
 from src.core.point_cloud_aligner import (
     ALIGN_SETTINGS_FILE, resolve_align_settings, _voxelize_to_grid, _effective_z_extent,
     _cell_arrays, _prepare_soma_containment_index, _containment_score,
@@ -773,7 +774,10 @@ def tile_slice_names(cid, tile, params):
         return []
     root = Path(root_value)
     # The acquisition uses root/<row>/<row>_<column>; flat layouts also work.
-    guesses = [root / tile, root / tile.split("_")[0] / tile]
+    # resolve_tile_dir also accepts small per-channel name drift (488nm 496700_340600 vs 496700_340700).
+    guesses = [root / tile, root / tile.split("_")[0] / tile,
+               Path(resolve_tile_dir(str(root), tile)),
+               Path(resolve_tile_dir(str(root), os.path.join(tile.split("_")[0], tile)))]
     directory = next((p for p in guesses if p.is_dir()), None)
     if directory is None:
         # Locate alternative layouts without opening known tile directories.
@@ -789,7 +793,8 @@ def tile_slice_names(cid, tile, params):
         directory = matches[0] if matches else None
     if directory is None:
         return []
-    names = sorted(p.stem for p in directory.iterdir()
+    # Slice names carry the tile prefix; rename to the anchor's tile name like worker.py does.
+    names = sorted(anchor_slice_key(p.stem, directory.name, tile) for p in directory.iterdir()
                    if p.suffix.lower() in (".tif", ".tiff") and not p.name.startswith("."))
     cache[key] = names
     return names

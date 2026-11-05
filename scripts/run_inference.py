@@ -34,6 +34,10 @@ from src.core.worker import run_tile_process
 from src.core.detection_filter import (
     FILTER_SCHEMA_VERSION, atomic_write_csv, filter_detection_df, resolve_filter_params, source_dir_for_channel,
 )
+from src.core.local_contrast import (
+    CONTRAST_SUBDIR, apply_snr_filter, contrast_filter_signature, contrast_paths, contrast_ready,
+    contrast_settings, resolve_contrast_filter, run_contrast_tile,
+)
 from src.core.stitcher import fuse_dual_intensity_2d
 from src.core.channel_stage3 import stitch_and_link_channel
 from src.core.coloc_sources import (cell_id, coloc_display_box, colocalization_status,
@@ -173,9 +177,54 @@ def filter_input_signature(source, settings):
     return {'source': file_stamp(source, with_hash=True), 'settings': settings}
 
 
+def run_contrast_stage(tile_names, contrast_filter, raw_dir):
+    """Stage 2.2: per-detection ring SNR for contrast-filtered channels, one tile per CPU task."""
+    contrast_dir = os.path.join(raw_dir, CONTRAST_SUBDIR)
+    settings = contrast_settings()
+    missing = [os.path.join(raw_dir, f"{tile}_{cid}_{kind}.csv")
+               for cid in contrast_filter for tile in tile_names for kind in ('result', 'instances')
+               if not os.path.isfile(os.path.join(raw_dir, f"{tile}_{cid}_{kind}.csv"))]
+    if missing:
+        raise FileNotFoundError(f"Stage 2.2 needs {len(missing)} raw/instance CSV(s); first: {missing[0]}")
+    todo = [(tile, cid) for cid in contrast_filter for tile in tile_names
+            if not contrast_ready(tile, cid, raw_dir, contrast_dir, settings)]
+    if not todo:
+        logging.info("✔️ Checkpoint 2.2 达成: SNR 表已是最新 (%s)。", ', '.join(contrast_filter))
+        return
+    os.makedirs(contrast_dir, exist_ok=True)
+    n_workers = max(1, min(len(todo), int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))))
+    logging.info("阶段 2.2: 计算 %s 个 tile×通道的局部 SNR，%s 个 CPU 进程并行", len(todo), n_workers)
+    with _single_threaded_children(), ProcessPoolExecutor(
+            max_workers=n_workers, mp_context=mp.get_context('spawn')) as pool:
+        futs = {pool.submit(run_contrast_tile, tile, cid, raw_dir, contrast_dir, settings): (tile, cid)
+                for tile, cid in todo}
+        for fut in tqdm(as_completed(futs), total=len(futs), desc="Contrast SNR"):
+            tile, cid = futs[fut]
+            try:
+                _, n_boxes, n_snr = fut.result()
+            except Exception:
+                logging.error(f"❌ [2.2] Tile {tile} {cid} SNR 计算失败，终止作业。已完成的 tile 保留。")
+                for f in futs:
+                    f.cancel()
+                raise
+            logging.info("[2.2][%s][%s] %s boxes, %s with SNR", tile, cid, n_boxes, n_snr)
+
+
+def contrast_step(contrast_filter, raw_dir, tile, channel_id):
+    """Signature part and filter callback for a contrast-filtered channel, else (None, None)."""
+    if channel_id not in contrast_filter:
+        return None, None
+    contrast_csv, _ = contrast_paths(os.path.join(raw_dir, CONTRAST_SUBDIR), tile, channel_id)
+    params = contrast_filter[channel_id]
+    signature = contrast_filter_signature(contrast_csv, params, contrast_settings())
+    return signature, lambda kept, rejected, stats: apply_snr_filter(
+        kept, rejected, stats, contrast_csv, params['snr_min'])
+
+
 def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filtered_dir):
     """Filter raw tile detections before estimating pre-align channel shifts."""
     os.makedirs(filtered_dir, exist_ok=True)
+    contrast_filter = resolve_contrast_filter(config)
     logical_channels = {ch['id']: ch for ch in config['channels_routing']}
     for ch in config['channels_routing']:
         if ch.get('double_exposure'):
@@ -206,10 +255,13 @@ def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filter
         source = os.path.join(raw_dir, name)
         manifest_path = os.path.join(
             filtered_dir, f"{tile}_{ch['id']}_filter_manifest.json")
-        signature = filter_input_signature(
-            source, {'stage': 'pre_align_filter',
-                     'params': params_by_channel[ch['id']],
-                     'filter_settings': filter_signature})
+        contrast_signature, snr_filter = contrast_step(contrast_filter, raw_dir, tile, ch['id'])
+        settings = {'stage': 'pre_align_filter',
+                    'params': params_by_channel[ch['id']],
+                    'filter_settings': filter_signature}
+        if contrast_signature is not None:
+            settings['contrast_filter'] = contrast_signature
+        signature = filter_input_signature(source, settings)
         if output_manifest_valid(manifest_path, signature):
             continue
         if os.path.isfile(target) and any((Path(filtered_dir).parent / '3_2d_aligned').glob(f'{tile}_*_result.csv')):
@@ -219,6 +271,8 @@ def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filter
         raw = provenance_columns(pd.read_csv(source), tile, ch['id'])
         filtered, stats, rejected = filter_detection_df(
             raw, params, return_stats=True, return_rejected=True, context=source)
+        if snr_filter is not None:
+            filtered, rejected, stats = snr_filter(filtered, rejected, stats)
         atomic_write_csv(filtered, target)
         atomic_write_csv(rejected, rejected_path)
         write_output_manifest(manifest_path, [target, rejected_path], signature)
@@ -227,7 +281,8 @@ def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filter
 
     part = settings_file + ".part"
     with open(part, "w", encoding="utf-8") as handle:
-        json.dump(filter_signature, handle, indent=2)
+        json.dump({**filter_signature, **({'contrast_filter': contrast_filter} if contrast_filter else {})},
+                  handle, indent=2)
     os.replace(part, settings_file)
 
 
@@ -476,12 +531,15 @@ if __name__ == '__main__':
     # Resolve and validate pre-align settings before detection to catch configuration
     # errors or conflicts with existing alignment results early.
     align_settings = None
+    contrast_filter = resolve_contrast_filter(config)
     if pipeline_mode == 'pre_align':
         align_settings = resolve_align_settings(config, routing_config)
         align_settings['input_stage'] = 'filtered_2d_v1'
         align_settings['filter_params'] = {
             ch['id']: resolve_filter_params(config, ch) for ch in routing_config
         }
+        if contrast_filter:
+            align_settings['contrast_filter'] = contrast_filter
         validate_measurement_source(derived['pATH_ALIGN_OFFSETS'], align_settings)
         check_align_settings(derived['pATH_ALIGN_OFFSETS'], align_settings)
         validate_stitching_xml_frame(paths.get('pATHXML'), align_settings['stitching_reference_channel'])
@@ -572,6 +630,12 @@ if __name__ == '__main__':
             f"{len(_missing_raw)} raw detection CSV(s) missing; first: {_missing_raw[0]}")
 
     stop_after(config, 'detection')
+    # ==========================================
+    # Stage 2.2: local-contrast SNR for channels listed in contrast_filter (read by the filters).
+    # ==========================================
+    if contrast_filter:
+        run_contrast_stage([os.path.basename(p) for p in pATHTILE_all], contrast_filter,
+                           derived['pATH_DET_RES'])
     # ==========================================
     # Stage 2.5: align channel point clouds in pre-align mode.
     # ==========================================
@@ -757,16 +821,22 @@ if __name__ == '__main__':
             f"missing {len(_missing_sources)} file(s):\n  {preview}"
         )
 
+    def _final_filter_signature(source, tile, ch_id):
+        settings = {'stage': 'final_filter', 'channel': ch_id,
+                    'params': _filter_params_by_channel[ch_id],
+                    'filter_settings': _filter_signature}
+        contrast_signature, _ = contrast_step(contrast_filter, derived['pATH_DET_RES'], tile, ch_id)
+        if contrast_signature is not None:
+            settings['contrast_filter'] = contrast_signature
+        return filter_input_signature(source, settings)
+
     def _filtered_checkpoint_ready(tile, channel, source_dir):
         ch_id = channel['id']
         target = os.path.join(_filter_dst, f"{tile}_{ch_id}_result.csv")
         rejected = os.path.join(_filter_dst, f"{tile}_{ch_id}_rejected.csv")
         source = os.path.join(source_dir, f"{tile}_{ch_id}_result.csv")
         manifest = os.path.join(_filter_dst, f"{tile}_{ch_id}_filter_manifest.json")
-        signature = filter_input_signature(
-            source, {'stage': 'final_filter', 'channel': ch_id,
-                     'params': _filter_params_by_channel[ch_id],
-                     'filter_settings': _filter_signature})
+        signature = _final_filter_signature(source, tile, ch_id)
         return (os.path.isfile(target) and os.path.isfile(rejected)
                 and output_manifest_valid(manifest, signature))
 
@@ -787,10 +857,7 @@ if __name__ == '__main__':
                 _filter_dst, f"{_tn}_{_ch_id}_rejected.csv")
             _manifest_path = os.path.join(
                 _filter_dst, f"{_tn}_{_ch_id}_filter_manifest.json")
-            _signature = filter_input_signature(
-                _in_csv, {'stage': 'final_filter', 'channel': _ch_id,
-                          'params': _filter_params_by_channel[_ch_id],
-                          'filter_settings': _filter_signature})
+            _signature = _final_filter_signature(_in_csv, _tn, _ch_id)
             if _filtered_checkpoint_ready(_tn, _ch, _src):
                 continue
             _params = _filter_params_by_channel[_ch_id]
@@ -800,6 +867,9 @@ if __name__ == '__main__':
                 _input_df, _params, return_stats=True, return_rejected=True,
                 context=f"{_in_csv} ({_ch_id})",
             )
+            _, _snr_filter = contrast_step(contrast_filter, derived['pATH_DET_RES'], _tn, _ch_id)
+            if _snr_filter is not None:
+                _filtered_df, _rejected_df, _stats = _snr_filter(_filtered_df, _rejected_df, _stats)
             atomic_write_csv(_filtered_df, _out_csv)
             atomic_write_csv(_rejected_df, _rejected_path)
             write_output_manifest(

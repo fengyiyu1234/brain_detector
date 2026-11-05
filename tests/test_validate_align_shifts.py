@@ -111,6 +111,24 @@ class AlignmentValidationTests(unittest.TestCase):
             self.assertEqual(params["_slice_cache"][("GFP", "100_200")],
                              ["s001", "s002", "s003"])
 
+    def test_legacy_support_tolerates_drifted_channel_tile_name(self):
+        # 488nm saved 451400_340600 while the anchor is 451400_340700.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            roots = {}
+            for cid, tile in (("RFP", "451400_340700"), ("Olig2", "451400_340600")):
+                directory = root / cid / "451400" / tile
+                directory.mkdir(parents=True)
+                for z in ("250700", "250780"):
+                    (directory / f"{tile}_{z}.tiff").touch()
+                roots[cid] = str(root / cid)
+            params = {"raw_dir": str(root / "1_2d_raw"), "channel_roots": roots,
+                      "anchor_channel": "RFP", "candidate_tiles": ["451400_340700"]}
+            support, _ = validation.load_slice_support("451400_340700", "Olig2", params)
+            self.assertEqual(support, {1, 2})
+            self.assertEqual(validation.tile_slice_names("Olig2", "451400_340700", params),
+                             ["451400_340700_250700", "451400_340700_250780"])
+
     def test_sweep_is_symmetric_even_when_step_does_not_divide_radius(self):
         values = [d for a, d in validation._sweep_deltas(((5, 2), (0, 1), (1, 1))) if a == "x"]
         self.assertEqual(values, [-5, -4, -2, 0, 2, 4, 5])

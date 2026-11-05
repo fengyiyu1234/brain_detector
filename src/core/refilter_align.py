@@ -24,6 +24,7 @@ from src.config.loader import load_config, require_resolved_result_dir
 from src.core.detection_filter import (
     FILTER_SCHEMA_VERSION, filter_detection_df, resolve_filter_params,
 )
+from src.core.local_contrast import resolve_contrast_filter
 from src.core.point_cloud_aligner import (
     align_tile, alignment_sample_window, check_align_settings,
     resolve_align_settings, save_align_settings, tile_alignment_done,
@@ -184,6 +185,8 @@ def main(argv=None):
     if any(ch.get('double_exposure') for ch in routing):
         raise ValueError('Dual-exposure fusion requires the full pipeline')
     channels = {ch['id']: ch for ch in routing}
+    if resolve_contrast_filter(config):
+        raise ValueError('contrast_filter (SNR) needs the full pipeline (Stage 2.2/2.25)')
     if set(args.filter_channels) - channels.keys():
         raise ValueError('Unknown --filter-channels')
     base = Path(config['paths']['pATHRESULT'])
