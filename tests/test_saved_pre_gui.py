@@ -451,7 +451,7 @@ class SavedPrealignTests(unittest.TestCase):
                 super().__init__(title)
                 self.layers = Layers()
         with patch("src.utils.saved_gui.napari.Viewer", Viewer), \
-             patch("src.utils.visualize.run_z_linker",
+             patch("src.core.z_linker.run_z_linker",
                    side_effect=AssertionError("GUI recalculated Z-link")):
             self.vis["view_space"] = "local"
             run_saved_prealign(

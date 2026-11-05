@@ -8,7 +8,8 @@
     "view_space": "local",
     "global_z_start": null,
     // 2d_source: raw=1_2d_raw, filtered=2_2d_filtered (unshifted images).
-    // aligned=3_2d_aligned, aligned_filtered=4_2d_filtered (shifted images).
+    // aligned=3_2d_aligned, aligned_filtered=4_2d_filtered (shifted images; runs without
+    // 4_2d_filtered, e.g. downstream layout v2, fall back to 3_2d_aligned).
     "2d_source": "filtered",
     // Set a CSV path to save false-negative annotations.
     "fn_ann_path": null,
@@ -65,27 +66,6 @@
             ]
         }
     },
-    // Preview Z-linking and colocalization thresholds.
-    "z_linker": {
-        "soma": {
-            "iou_thresh": 0.35,
-            "min_z_layers": 1,
-            "max_cell_z_span": 5,
-            "max_z_gap": 0,
-            "iou_thresh_3d": 0.15,
-            "z_pad_3d": 1,
-            "cross_class_iou_thresh": 0.5
-        },
-        "tf": {
-            "iou_thresh": 0.25,
-            "min_z_layers": 1,
-            "max_cell_z_span": 3,
-            "max_z_gap": 0,
-            "gmm_p_thresh": 0.5,
-            "max_center_dist_ratio": 0.35,
-            "containment_z_pad": 1
-        }
-    },
     // Null prompts for a tile index; a name or list also works.
     "tile": null,
     "no_images": false,
@@ -99,56 +79,5 @@
     "show_coloc": false,
     "show_filtered_2d": false,
     "spheres": false,
-    // Saved-result stage selection for post mode.
-    "stage": "all",
-    "outline_width": 4,
-    "aligned_opacity": 0.8,
-    "raw_opacity": 0.6,
-    "zlinked_opacity": 0.7,
-    "coloc_opacity": 0.9,
-    "sphere_opacity": 0.6,
-    "sphere_raw_opacity": 0.3,
-    "sphere_colors": {
-        "RFP": [
-            1.0,
-            0.25,
-            0.25,
-            0.85
-        ],
-        "GFP": [
-            0.25,
-            1.0,
-            0.25,
-            0.85
-        ],
-        "Sox9": [
-            0.0,
-            0.85,
-            1.0,
-            0.85
-        ],
-        "Olig2": [
-            1.0,
-            0.2,
-            1.0,
-            0.85
-        ]
-    },
-    "marker_colors": {},
-    // Visualization-only filters; these never change saved CSV files.
-    "filter": {
-        "soma": {
-            "bbox_min": null,
-            "bbox_max": null,
-            "bbox_area_pct_min": null,
-            "bbox_mean_pct_min": null
-        },
-        "tf": {
-            "bbox_min": 8,
-            "bbox_max": 17,
-            "bbox_area_pct_min": null,
-            "bbox_mean_pct_min": null
-        },
-        "Olig2": {}
-    }
+    "outline_width": 4
 }

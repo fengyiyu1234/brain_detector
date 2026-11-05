@@ -1436,3 +1436,19 @@ ET10 共定位中 Sox9 假阳性多，主要来自淡的背景核状结构。Sta
   - 只重新过滤 Sox9
   - 对齐 → tile positions → 2.97 → 3 → 4
 - 离线估计 Sox9 每层保留约 51%，现有过滤约 73%。
+
+---
+
+## 2026-11-05 可视化工具：删除 post 模式
+
+post-alignment 流程已不再使用，可视化只保留 `prealign` 和 `2d` 两种模式。
+
+- `src/utils/visualize.py`（2294 → 916 行）：
+  - 删除 `_run_post`，以及只有它用到的 helper：tile 重叠边距遮罩、可视化端 size/intensity 预览过滤、全局 CSV → tile shapes、s4 共定位层、Shift+click 共定位 trace、s3 span 调试、pkl 读取、GUI 内 z-link 和共定位重算等。
+  - 去掉相应 import（`run_z_linker`、`stitcher` 函数、`detection_filter`）。
+  - `_load_tile_csv_shapes` 只负责读框：去掉 `raw_vol`/`filt`/边距参数（已无调用方传入，原 `filt` 分支实为死代码），直接返回 `(shapes, colors, meta)`；`_run_2d` 和 `review_filtered_gui.py` 已同步。
+  - `--mode post` 或 config 里 `mode: "post"` 会报错退出，并提示该模式已删除。
+- `visualize_gui.py`：Mode 下拉框去掉 post，删除只对 post 生效的 "Result stage" 控件。
+- `config_example/visualization_config.example.json`：删除已无人读取的 `z_linker`、`stage`、`filter`、各类 opacity、`sphere_colors`、`marker_colors`；补充 `aligned_filtered` 在 layout v2 下退回 `3_2d_aligned` 的说明。本地 `config/vis_config.json` 中的这些键会被忽略，不影响运行。
+- 测试：删除只覆盖 post 模式 helper 的 `tests/test_visualization_tile_selection.py`；`test_saved_pre_gui.py` 的 z-link patch 目标改为 `src.core.z_linker.run_z_linker`。`test_saved_pre_gui`（17）通过；`test_tile_2d_sources`（4）在先创建 QApplication 时全部通过。直接运行时，`_run_2d` 那一项会让进程以 127 退出，HEAD 上也一样，是已有问题。
+- 不影响任何 pipeline checkpoint（`visualize.py` 不在 Stage 2.6/3/4 的哈希范围内）。

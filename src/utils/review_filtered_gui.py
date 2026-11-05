@@ -133,7 +133,7 @@ def _open_tile_viewer(
         from src.core.resume import saved_channel_directory
         source_dir = filtered_dir or saved_channel_directory(paths['pATHRESULT'], channel)
         csv_path = os.path.join(source_dir, f"{tile_name}_{channel_id}_result.csv")
-        (shapes, colors, _), _ = _load_tile_csv_shapes(csv_path, z_range, filt=None)
+        shapes, colors, _ = _load_tile_csv_shapes(csv_path, z_range)
         if shapes:
             _add_labels_layer(
                 viewer, shapes, colors, canvas_shape,

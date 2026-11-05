@@ -292,7 +292,7 @@ class VisualizeLauncher(QMainWindow):
         form.setSpacing(11)
         basic_layout.addLayout(form)
         self.mode = QComboBox()
-        self.mode.addItems(['prealign', '2d', 'post'])
+        self.mode.addItems(['prealign', '2d'])
         form.addRow('Mode', self.mode)
         self.view_space = QComboBox()
         self.view_space.addItems(['local', 'global'])
@@ -302,9 +302,6 @@ class VisualizeLauncher(QMainWindow):
             directory, label, _ = SOURCES_2D[key]
             self.source_2d.addItem(f'{label} ? {directory}', key)
         form.addRow('2D source', self.source_2d)
-        self.stage = QComboBox()
-        self.stage.addItems(['all', 's1', 's3', 's4'])
-        form.addRow('Result stage', self.stage)
         self.z_start = _line()
         self.z_start.setPlaceholderText('Blank = 0')
         self.z_start.setValidator(QIntValidator(0, 2147483647))
@@ -396,7 +393,6 @@ class VisualizeLauncher(QMainWindow):
             (self.view_space, mode == 'prealign'),
             (self.global_z_start,
              mode == 'prealign' and self.view_space.currentText() == 'global'),
-            (self.stage, mode == 'post'),
         ):
             label = self.settings_form.labelForField(widget)
             if label is not None:
@@ -479,7 +475,6 @@ class VisualizeLauncher(QMainWindow):
             for widget, key, default in [
                 (self.mode, 'mode', 'prealign'),
                 (self.view_space, 'view_space', 'local'),
-                (self.stage, 'stage', 'all'),
             ]:
                 value = str(self.config.get(key, default))
                 if widget.findText(value) >= 0:
@@ -700,7 +695,6 @@ class VisualizeLauncher(QMainWindow):
         self.config['mode'] = self.mode.currentText()
         self.config['view_space'] = self.view_space.currentText()
         self.config['2d_source'] = self.source_2d.currentData()
-        self.config['stage'] = self.stage.currentText()
         self.config['z_start'] = _nullable_int(self.z_start, 'z_start')
         self.config['z_count'] = _nullable_int(self.z_count, 'z_count')
         self.config['global_z_start'] = _nullable_int(self.global_z_start, 'global_z_start')
