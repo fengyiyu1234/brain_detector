@@ -1586,3 +1586,12 @@ post-alignment 流程已不再使用，可视化只保留 `prealign` 和 `2d` �
   - 每通道随机抽 16 个看图：绝大多数是同一细胞被 patch 边切下的一块；覆盖率 0.55–0.57 的个别例子像是相邻两个细胞。阈值 0.6 会漏掉本例的 z=424。
 - **对已有样本生效**：在 config 的 `detection_params.yolo` 加 `"patch_fragment_iomin": 0.5`，把 `3_2d_aligned` 及之后的结果（5_2d_global、6_3d_global、7_colocalization）挪走，从 Stage 2.25 重跑（2.25 已有对齐结果时会报错，这是原有的保护）。YOLO 不重跑。
 - 测试：新增 `tests/test_patch_fragments.py`（8 项）；`test_checkpoint_code_lists`（4）通过。`test_pipeline_filter_inputs`、`test_automatic_resume` 本机缺 torch 无法导入（已有问题）。
+
+## 2026-11-07 同通道 neuron/glia 去重：加包含判据（cross_class_contain_thresh）
+
+现象：s3 after class dedup 仍有 GFP neuron（z396，31×31）完全落在 GFP glia（z397，64×62）框内（seam tile 316000_377200，`track3d:73937e…` / `track3d:63a612…`）。
+
+- **原因**：`suppress_cross_class_overlap` 只看 3D IoU > 0.5。小框套在大框里，IoU 只有 ≈0.24（IoMin = 1.0）。两框在相邻层，2D containment NMS 也看不到。
+- **修改**：`suppress_cross_class_overlap` / `suppress_cross_class_per_channel` 新参数 `contain_thresh`（None = 关）：neuron 体积 ≤ glia 且 IoMin ≥ 阈值时也删 neuron；反过来（大 neuron 包小 glia）不删。decision 行 `reason = inside_glia`，metric 为 IoMin。`run_inference.py` 读 `z_linker.soma.cross_class_contain_thresh`（默认 0.8），Phase A 前后两次去重都用。
+- `run_inference.py`、`stitcher.py` 改了：下次运行所有样本重跑 Stage 4（colocalization）。
+- 测试：`test_cross_class_per_channel` 新增 2 项（本例被删；大 neuron 包小 glia 保留），共 5 项通过；`test_checkpoint_code_lists`、`test_detection_filter` 通过。

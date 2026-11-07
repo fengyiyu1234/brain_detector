@@ -1169,12 +1169,14 @@ if __name__ == '__main__':
         iomin_thresh_3d = zl_soma.get('iomin_thresh_3d', 0.5)
         z_pad_3d        = zl_soma.get('z_pad_3d', 2)
         cross_iou       = zl_soma.get('cross_class_iou_thresh', 0.5)
+        # A small neuron box inside a large glia box has low IoU; drop it by containment.
+        cross_contain   = zl_soma.get('cross_class_contain_thresh', 0.8)
         decision_rows = []
         # Same-channel neuron/glia duplicates first: once a neuron track merges with
         # another channel, the dedup after Phase A can no longer see the pair.
         suppress_cross_class_per_channel(
             soma_vol_by_ch, soma_ch_ids, iou_thresh=cross_iou, z_pad=z_pad_3d,
-            decision_rows=decision_rows)
+            decision_rows=decision_rows, contain_thresh=cross_contain)
 
         merged_soma_vols = list(soma_vol_by_ch.get(soma_ch_ids[0], [])) if soma_ch_ids else []
         for cid_b in soma_ch_ids[1:]:
@@ -1201,7 +1203,7 @@ if __name__ == '__main__':
         filtered_tf_objects = set()
         merged_soma_vols = suppress_cross_class_overlap(
             merged_soma_vols, iou_thresh=cross_iou, z_pad=z_pad_3d,
-            decision_rows=decision_rows
+            decision_rows=decision_rows, contain_thresh=cross_contain
         )
         n_multi  = sum(1 for c in merged_soma_vols if len(class_markers(c['class'])) > 1)
         n_single = len(merged_soma_vols) - n_multi

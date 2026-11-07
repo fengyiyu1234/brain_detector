@@ -61,6 +61,27 @@ class CrossClassPerChannelTest(unittest.TestCase):
         self.assertEqual(len(final), 1)
         self.assertTrue(final[0]['class'].startswith('glia'))
 
+    def test_containment_removes_small_neuron_inside_glia(self):
+        # Seam tile 316000_377200: GFP neuron z=396 inside a GFP glia z=397, IoU ~0.24.
+        def make():
+            return {'GFP': [cell('n', 'neuron_GFP', (5389.5, 5982.9, 5420.1, 6013.9), (396, 396)),
+                            cell('g', 'glia_GFP', (5377.5, 5969.4, 5441.3, 6031.8), (397, 397))]}
+        vols = make()
+        suppress_cross_class_per_channel(vols, ['GFP'], iou_thresh=0.5, z_pad=1)
+        self.assertEqual(len(vols['GFP']), 2)
+        vols, rows = make(), []
+        suppress_cross_class_per_channel(vols, ['GFP'], iou_thresh=0.5, z_pad=1,
+                                         decision_rows=rows, contain_thresh=0.8)
+        self.assertEqual([c['track_id'] for c in vols['GFP']], ['g'])
+        self.assertEqual(rows[0]['reason'], 'inside_glia')
+
+    def test_containment_keeps_large_neuron_around_small_glia(self):
+        vols = {'GFP': [cell('n', 'neuron_GFP', (0, 0, 64, 64), (5, 5)),
+                        cell('g', 'glia_GFP', (16, 16, 46, 46), (5, 5))]}
+        suppress_cross_class_per_channel(vols, ['GFP'], iou_thresh=0.5, z_pad=1,
+                                         contain_thresh=0.8)
+        self.assertEqual(len(vols['GFP']), 2)
+
 
 if __name__ == '__main__':
     unittest.main()

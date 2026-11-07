@@ -664,11 +664,16 @@ def match_soma_3d_iou(cells_a, cells_b, iou_thresh=0.15, iomin_thresh=0.5, z_pad
     return matched_pairs, unmatched_a, unmatched_b
 
 
-def suppress_cross_class_overlap(cells, iou_thresh=0.5, z_pad=2, decision_rows=None):
+def suppress_cross_class_overlap(cells, iou_thresh=0.5, z_pad=2, decision_rows=None,
+                                 contain_thresh=None):
     """
     For any (neuron, glia) pair with 3D IoU > iou_thresh, drop the neuron.
     Glia takes priority.  Runs inside each soma channel before Phase-A merging
     (suppress_cross_class_per_channel) and again after it, before TF annotation.
+
+    contain_thresh (None = off): also drop a neuron no larger than the glia when
+    IoMin (= share of the neuron's volume inside the glia) >= contain_thresh. A small
+    neuron box inside a large glia box has low IoU, so IoU alone keeps it.
     """
     neurons = [c for c in cells if str(c['class']).split('_')[0] == 'neuron']
     glias   = [c for c in cells if str(c['class']).split('_')[0] == 'glia']
@@ -694,32 +699,41 @@ def suppress_cross_class_overlap(cells, iou_thresh=0.5, z_pad=2, decision_rows=N
         i_arr, j_arr = i_arr[sphere_ok], j_arr[sphere_ok]
 
         if len(i_arr) > 0:
-            iou_vals, _ = _iou_3d_batch(x1n, y1n, x2n, y2n, z1n, z2n,
-                                         x1g, y1g, x2g, y2g, z1g, z2g,
-                                         i_arr, j_arr, z_pad)
-            suppressed = set(i_arr[iou_vals > iou_thresh].tolist())
+            iou_vals, iomin_vals = _iou_3d_batch(x1n, y1n, x2n, y2n, z1n, z2n,
+                                                 x1g, y1g, x2g, y2g, z1g, z2g,
+                                                 i_arr, j_arr, z_pad)
+            by_iou = iou_vals > iou_thresh
+            by_contain = np.zeros_like(by_iou)
+            if contain_thresh is not None:
+                vol_n = (x2n - x1n) * (y2n - y1n) * (z2n - z1n + 1)
+                vol_g = (x2g - x1g) * (y2g - y1g) * (z2g - z1g + 1)
+                by_contain = ((iomin_vals >= contain_thresh)
+                              & (vol_n[i_arr] <= vol_g[j_arr]) & ~by_iou)
+            hit = by_iou | by_contain
+            suppressed = set(i_arr[hit].tolist())
             if decision_rows is not None:
-                for i, j, iou in zip(i_arr, j_arr, iou_vals):
-                    if iou > iou_thresh:
-                        decision_rows.append({
-                            'stage': 'cross_class_suppression',
-                            'channel': '',
-                            'track_id': neurons[int(i)].get('track_id', ''),
-                            'other_track_id': glias[int(j)].get('track_id', ''),
-                            'decision': 'rejected_neuron',
-                            'reason': 'overlaps_glia',
-                            'metric': float(iou),
-                            'threshold': iou_thresh,
-                        })
+                for k in np.flatnonzero(hit):
+                    contained = bool(by_contain[k])
+                    decision_rows.append({
+                        'stage': 'cross_class_suppression',
+                        'channel': '',
+                        'track_id': neurons[int(i_arr[k])].get('track_id', ''),
+                        'other_track_id': glias[int(j_arr[k])].get('track_id', ''),
+                        'decision': 'rejected_neuron',
+                        'reason': 'inside_glia' if contained else 'overlaps_glia',
+                        'metric': float(iomin_vals[k] if contained else iou_vals[k]),
+                        'threshold': contain_thresh if contained else iou_thresh,
+                    })
 
     surviving = [nn for i, nn in enumerate(neurons) if i not in suppressed]
     logging.info(f"Cross-class dedup: suppressed {len(suppressed)} neuron(s) "
-                 f"overlapping glia (iou_thresh={iou_thresh})")
+                 f"overlapping glia (iou_thresh={iou_thresh}, "
+                 f"contain_thresh={contain_thresh})")
     return surviving + glias + others
 
 
 def suppress_cross_class_per_channel(vols_by_ch, channel_ids, iou_thresh=0.5, z_pad=2,
-                                     decision_rows=None):
+                                     decision_rows=None, contain_thresh=None):
     """Drop same-channel neuron tracks that overlap a glia track of that channel.
 
     Runs suppress_cross_class_overlap inside each soma channel before Phase-A merging.
@@ -736,7 +750,8 @@ def suppress_cross_class_per_channel(vols_by_ch, channel_ids, iou_thresh=0.5, z_
             continue
         rows = []
         kept = {id(c) for c in suppress_cross_class_overlap(
-            cells, iou_thresh=iou_thresh, z_pad=z_pad, decision_rows=rows)}
+            cells, iou_thresh=iou_thresh, z_pad=z_pad, decision_rows=rows,
+            contain_thresh=contain_thresh)}
         vols_by_ch[cid] = [c for c in cells if id(c) in kept]
         logging.info(f"[{cid}] same-channel cross-class dedup: "
                      f"{len(cells) - len(vols_by_ch[cid])} neuron track(s) removed")

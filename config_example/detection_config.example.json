@@ -158,7 +158,8 @@
             "max_z_gap": 0,
             "iou_thresh_3d": 0.15,
             "z_pad_3d": 1,
-            "cross_class_iou_thresh": 0.5
+            "cross_class_iou_thresh": 0.5,
+            "cross_class_contain_thresh": 0.8
         },
         "tf": {
             "iou_thresh": 0.25,
