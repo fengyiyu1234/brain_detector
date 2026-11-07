@@ -138,5 +138,90 @@ class TilePositionPipelineTests(unittest.TestCase):
                     call()
                 self.assertEqual(len(calls), 4)
 
+    def _solver_fixture(self, tmp):
+        root = Path(tmp)
+        det, align, report = (root / x for x in
+                              ('2_2d_filtered', '3_2d_aligned', '5_2d_global/tile_positions'))
+        channels = [{'id': 'GFP', 'type': 'soma', 'dir_key': 'gfp'},
+                    {'id': 'Olig2', 'type': 'tf', 'dir_key': 'olig2'}]
+        paths = {}
+        for ch in channels:
+            (root / ch['id'] / 't0' / 't0').mkdir(parents=True)
+            paths[ch['dir_key']] = str(root / ch['id'])
+        det.mkdir()
+        align.mkdir(parents=True)
+        for ch in channels:
+            (det / f"t0_{ch['id']}_result.csv").write_text('z,x\n1,2\n')
+        (align / 't0_offsets.json').write_text('{}')
+        script = root / 'solve_tile_positions.py'
+        script.write_bytes(b'def main():\n    pass\n')
+        xml_script = root / 'generator.py'
+        xml_script.write_text('pass')
+        (root / 'config.json').write_text('{}')
+        config = {'paths': paths, 'stitching_reference_channel': 'Olig2',
+                  'pre_align_params': {'reference_channel': 'GFP'},
+                  'tile_position_params': {'enabled': True}}
+        solver_runs = []
+
+        def fake_run(command, check):
+            report.mkdir(parents=True, exist_ok=True)
+            if command[1] == str(script):
+                solver_runs.append(command)
+                (report / 'tile_positions.csv').write_text('tile\n t0\n')
+                (report / 'solution.json').write_text('{}')
+            else:
+                for ch in channels:
+                    (Path(paths[ch['dir_key']]) / 'xml_merging.xml').write_text('<root/>')
+
+        def call(solver_code=None):
+            with patch('src.core.tile_position_pipeline.subprocess.run', side_effect=fake_run):
+                return run_tile_position_stage(
+                    config, str(root / 'config.json'), str(root), str(det), str(align),
+                    str(report), ['t0'], channels, str(script), str(xml_script),
+                    solver_code=solver_code)
+
+        def add_global_outputs():
+            (root / '5_2d_global' / 'GFP_2d_global.csv').write_text('global')
+
+        return script, solver_runs, call, add_global_outputs
+
+    def test_solver_code_hash_replaces_whole_file_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script, solver_runs, call, add_global_outputs = self._solver_fixture(tmp)
+            call('code-a')
+            self.assertEqual(len(solver_runs), 1)
+            add_global_outputs()
+            # Comments, formatting or log edits leave the code hash unchanged.
+            script.write_bytes(b'def main():\r\n    # comment\r\n    pass\r\n')
+            call('code-a')
+            self.assertEqual(len(solver_runs), 1)
+            with self.assertRaisesRegex(RuntimeError, 'global checkpoints'):
+                call('code-b')
+            self.assertEqual(len(solver_runs), 1)
+
+    def test_whole_file_manifest_migrates_when_file_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script, solver_runs, call, add_global_outputs = self._solver_fixture(tmp)
+            call()  # older pipeline: whole-file hash
+            add_global_outputs()
+            # Same code, CRLF line endings, as after the .gitattributes renormalization.
+            script.write_bytes(b'def main():\r\n    pass\r\n')
+            call('code-a')
+            self.assertEqual(len(solver_runs), 1)
+            # Upgraded: later edits only matter through the code hash.
+            script.write_bytes(b'def main():\n    # note\n    pass\n')
+            call('code-a')
+            self.assertEqual(len(solver_runs), 1)
+
+    def test_whole_file_manifest_rejected_when_file_changed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script, solver_runs, call, add_global_outputs = self._solver_fixture(tmp)
+            call()
+            add_global_outputs()
+            script.write_bytes(b'def main():\n    return 1\n')
+            with self.assertRaisesRegex(RuntimeError, 'global checkpoints'):
+                call('code-a')
+            self.assertEqual(len(solver_runs), 1)
+
 if __name__ == '__main__':
     unittest.main()

@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
+import io
 import json
 import os
+import textwrap
+import tokenize
 from pathlib import Path
 
 
@@ -37,6 +42,70 @@ def source_sha256(module, names):
         owner, _, attr = name.rpartition(':')
         obj = getattr(importlib.import_module(owner) if owner else module, attr)
         text = inspect.getsource(obj) if callable(obj) else repr(obj)
+        digest.update(f"{name}\0{text}\0".encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _droppable(stmt, drop_calls):
+    """Docstrings and bare `name(...)` statements for logging-only names."""
+    if not isinstance(stmt, ast.Expr):
+        return False
+    value = stmt.value
+    if isinstance(value, ast.Constant):
+        return isinstance(value.value, str)
+    return (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+            and value.func.id in drop_calls)
+
+
+def _statement_lists(tree):
+    for node in list(ast.walk(tree)):
+        for field in ('body', 'orelse', 'finalbody'):
+            block = getattr(node, field, None)
+            if isinstance(block, list) and block and isinstance(block[0], ast.stmt):
+                yield node, field, block
+
+
+def code_tree(obj, drop_calls=()):
+    """Parsed source of obj without docstrings or `drop_calls(...)` statements."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(obj)))
+    for node, field, block in _statement_lists(tree):
+        kept = [stmt for stmt in block if not _droppable(stmt, drop_calls)]
+        setattr(node, field, kept or [ast.Pass()])
+    return tree
+
+
+def code_text(obj, drop_calls=()):
+    """Source of obj ignoring line endings, comments, blank lines, docstrings and
+    statements that only call `drop_calls` (logging). Built from source lines, not
+    ast.dump, so the same code gives the same text on every Python version."""
+    source = textwrap.dedent(inspect.getsource(obj))
+    lines = source.splitlines()
+    # Remove comments by token position (a '#' inside a string is not a comment).
+    for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+        if tok.type == tokenize.COMMENT:
+            row, col = tok.start
+            lines[row - 1] = lines[row - 1][:col]
+    drop = set()
+    for _, _, block in _statement_lists(ast.parse(source)):
+        for stmt in block:
+            # Only whole-line statements; `if x: say(...)` keeps its line.
+            if (_droppable(stmt, drop_calls)
+                    # AST offsets count UTF-8 bytes.
+                    and not lines[stmt.lineno - 1].encode()[:stmt.col_offset].strip()
+                    and not lines[stmt.end_lineno - 1].encode()[stmt.end_col_offset:].strip()):
+                drop.update(range(stmt.lineno, stmt.end_lineno + 1))
+    return '\n'.join(line.rstrip() for number, line in enumerate(lines, 1)
+                     if number not in drop and line.strip())
+
+
+def code_sha256(module, names, drop_calls=()):
+    """Like source_sha256, but insensitive to formatting, comments and log calls."""
+    import importlib
+    digest = hashlib.sha256()
+    for name in names:
+        owner, _, attr = name.rpartition(':')
+        obj = getattr(importlib.import_module(owner) if owner else module, attr)
+        text = code_text(obj, drop_calls) if callable(obj) else repr(obj)
         digest.update(f"{name}\0{text}\0".encode("utf-8"))
     return digest.hexdigest()
 

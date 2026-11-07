@@ -187,6 +187,9 @@ def main(argv=None):
     channels = {ch['id']: ch for ch in routing}
     if resolve_contrast_filter(config):
         raise ValueError('contrast_filter (SNR) needs the full pipeline (Stage 2.2/2.25)')
+    if any((config.get('detection_params', {}).get(str(ch.get('model', '')).lower()) or {})
+           .get('patch_fragment_iomin') is not None for ch in config.get('channels_routing', [])):
+        raise ValueError('patch_fragment_iomin needs the full pipeline (Stage 2.25)')
     if set(args.filter_channels) - channels.keys():
         raise ValueError('Unknown --filter-channels')
     base = Path(config['paths']['pATHRESULT'])

@@ -71,6 +71,10 @@ def main() -> int:
     if unknown:
         raise ValueError(f"Unknown or inactive --channels value(s): {unknown}")
     selected = [by_id[channel_id] for channel_id in selected_ids]
+    if any((config.get('detection_params', {}).get(str(ch.get('model', '')).lower()) or {})
+           .get('patch_fragment_iomin') is not None
+           for ch in config.get('channels_routing', []) if ch.get('id') in selected_ids):
+        raise ValueError("patch_fragment_iomin needs the full pipeline (Stage 2.25/2.75)")
     contrast = set(resolve_contrast_filter(config)) & set(selected_ids)
     if contrast:
         raise ValueError(f"contrast_filter (SNR) channel(s) {sorted(contrast)} need the full pipeline "

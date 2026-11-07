@@ -198,7 +198,11 @@
             "bbox_area_pct_max": 95,
             "bbox_mean_pct_min": null,
             "bbox_mean_min": 0,
-            "nms_containment_thresh": 0.98
+            "nms_containment_thresh": 0.98,
+            // Stage 2.25: drop a box clipped by an inner YOLO patch edge when a box at least as
+            // large on the same slice covers more than this fraction of it (null = off).
+            // Turning it on refilters Stage 2.25; archive 3_2d_aligned and later stages first.
+            "patch_fragment_iomin": 0.5
         },
         "stardist": {
             "score_min": null,

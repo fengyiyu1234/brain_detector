@@ -1227,8 +1227,13 @@ def tile_alignment_done(tile_name, det_dir, align_dir, routing):
         with open(manifest_path, encoding='utf-8') as handle:
             saved = json.load(handle)
         old_signature = dict(saved['input_signature'])
-        # This release changes only checkpoint validation, not alignment math.
-        compatible = {'6d196d39d7575663d876da188ab9e1708bfb4d88bf5eade84c38c7f96668364d'}
+        # Aligner fingerprints with the same alignment math as this file:
+        # - 6d196d39…: before the checkpoint-validation-only release.
+        # - 0f042f60…: commit 2239e80 saved with CRLF line endings (before .gitattributes
+        #   eol=lf in cd135d9 renormalized the tree); 0d250537…: the same file with LF.
+        compatible = {'6d196d39d7575663d876da188ab9e1708bfb4d88bf5eade84c38c7f96668364d',
+                      '0f042f60f7c8cd09e7a32f3c5137fc4ea82cc6c09a636b5354d17471b88d9383',
+                      '0d250537a1cbeda8cbcdf7536aa3fee83c8bc522110082d159a6bfe29e803a27'}
         if old_signature.get('aligner_sha256') in compatible:
             old_signature['aligner_sha256'] = signature['aligner_sha256']
         if any(not manifest_output_path(manifest_path, name).is_file()

@@ -39,6 +39,9 @@ from src.core.local_contrast import (
     contrast_settings, resolve_contrast_filter, run_contrast_tile,
 )
 from src.core.stitcher import fuse_dual_intensity_2d
+from src.core.patch_fragments import (
+    candidate_paths as fragment_candidate_paths, resolve_patch_fragment,
+    signature as fragment_signature, suppress_patch_fragments)
 from src.core.channel_stage3 import stitch_and_link_channel
 from src.core.coloc_sources import (cell_id, coloc_display_box, colocalization_status,
                                     primary_source_trace, source_3d_json,
@@ -50,11 +53,12 @@ from src.core.provenance import (provenance_columns, file_sha256, file_stamp,
                                  output_manifest_valid, write_output_manifest,
                                  source_sha256)
 from src.core import stitcher
-from src.core.tile_position_pipeline import run_tile_position_stage, tile_position_frame
+from src.core.tile_position_pipeline import run_tile_position_stage, solver_code_sha256, tile_position_frame
 from src.core.seam_offsets import resolve_params as resolve_seam_params, run_seam_offset_stage
 from src.core.stitcher import (match_soma_3d_iou, merge_soma_volumes_union, soma_match_metrics,
                                annotate_soma_with_tf_containment,
-                               _merge_class, suppress_cross_class_overlap)
+                               _merge_class, suppress_cross_class_overlap,
+                               suppress_cross_class_per_channel)
 from src.core.point_cloud_aligner import (
     align_tile, tile_alignment_done,
     resolve_align_settings, check_align_settings, save_align_settings,
@@ -234,6 +238,10 @@ def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filter
         ch['id']: resolve_filter_params(config, logical_channels[ch['id']])
         for ch in detect_routing
     }
+    fragment_by_channel = {
+        ch['id']: resolve_patch_fragment(config, logical_channels[ch['id']])
+        for ch in detect_routing
+    }
     filter_signature = {
         "schema_version": FILTER_SCHEMA_VERSION, "params": params_by_channel,
         "filter_code_sha256": file_sha256(os.path.join(
@@ -261,6 +269,10 @@ def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filter
                     'filter_settings': filter_signature}
         if contrast_signature is not None:
             settings['contrast_filter'] = contrast_signature
+        fragment = fragment_by_channel[ch['id']]
+        if fragment is not None:
+            fragment_paths = fragment_candidate_paths(raw_dir, tile, [ch['id']])
+            settings['patch_fragment'] = fragment_signature(fragment, fragment_paths)
         signature = filter_input_signature(source, settings)
         if output_manifest_valid(manifest_path, signature):
             continue
@@ -271,6 +283,9 @@ def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filter
         raw = provenance_columns(pd.read_csv(source), tile, ch['id'])
         filtered, stats, rejected = filter_detection_df(
             raw, params, return_stats=True, return_rejected=True, context=source)
+        if fragment is not None:
+            filtered, rejected, stats = suppress_patch_fragments(
+                filtered, rejected, stats, fragment_paths, fragment)
         if snr_filter is not None:
             filtered, rejected, stats = snr_filter(filtered, rejected, stats)
         atomic_write_csv(filtered, target)
@@ -821,6 +836,20 @@ if __name__ == '__main__':
             f"missing {len(_missing_sources)} file(s):\n  {preview}"
         )
 
+    # Pre-align: each exposure already went through the patch-fragment rule at Stage 2.25,
+    # and aligned boxes no longer sit on their patch edges.
+    _fragment_by_channel = {
+        ch['id']: (resolve_patch_fragment(config, ch) if pipeline_mode != 'pre_align' else None)
+        for ch in routing_config
+    }
+
+    _routing_by_id = {ch['id']: ch for ch in routing_config}
+
+    def _fragment_paths(tile, channel):
+        ids = [channel['id']] + ([channel['second_intensity_id']]
+                                 if channel.get('double_exposure') else [])
+        return fragment_candidate_paths(derived['pATH_DET_RES'], tile, ids)
+
     def _final_filter_signature(source, tile, ch_id):
         settings = {'stage': 'final_filter', 'channel': ch_id,
                     'params': _filter_params_by_channel[ch_id],
@@ -828,6 +857,9 @@ if __name__ == '__main__':
         contrast_signature, _ = contrast_step(contrast_filter, derived['pATH_DET_RES'], tile, ch_id)
         if contrast_signature is not None:
             settings['contrast_filter'] = contrast_signature
+        if _fragment_by_channel[ch_id] is not None:
+            settings['patch_fragment'] = fragment_signature(
+                _fragment_by_channel[ch_id], _fragment_paths(tile, _routing_by_id[ch_id]))
         return filter_input_signature(source, settings)
 
     def _filtered_checkpoint_ready(tile, channel, source_dir):
@@ -867,6 +899,10 @@ if __name__ == '__main__':
                 _input_df, _params, return_stats=True, return_rejected=True,
                 context=f"{_in_csv} ({_ch_id})",
             )
+            if _fragment_by_channel[_ch_id] is not None:
+                _filtered_df, _rejected_df, _stats = suppress_patch_fragments(
+                    _filtered_df, _rejected_df, _stats, _fragment_paths(_tn, _ch),
+                    _fragment_by_channel[_ch_id])
             _, _snr_filter = contrast_step(contrast_filter, derived['pATH_DET_RES'], _tn, _ch_id)
             if _snr_filter is not None:
                 _filtered_df, _rejected_df, _stats = _snr_filter(_filtered_df, _rejected_df, _stats)
@@ -950,7 +986,8 @@ if __name__ == '__main__':
             config, os.path.abspath(args.config), base_res_path,
             derived['pATH_DET_PREALIGN_FILTERED'], derived['pATH_ALIGN_OFFSETS'],
             report_dir, [os.path.basename(p) for p in pATHTILE_all],
-            routing_config, solver_script, xml_script)
+            routing_config, solver_script, xml_script,
+            solver_code=solver_code_sha256())
         paths['pATHXML'] = frame_xml
         logging.info("Stage 2.9 tile positions %s: %s",
                      "computed" if recomputed else "reused", frame_xml)
@@ -1131,6 +1168,13 @@ if __name__ == '__main__':
         iou_thresh_3d   = zl_soma.get('iou_thresh_3d', 0.15)
         iomin_thresh_3d = zl_soma.get('iomin_thresh_3d', 0.5)
         z_pad_3d        = zl_soma.get('z_pad_3d', 2)
+        cross_iou       = zl_soma.get('cross_class_iou_thresh', 0.5)
+        decision_rows = []
+        # Same-channel neuron/glia duplicates first: once a neuron track merges with
+        # another channel, the dedup after Phase A can no longer see the pair.
+        suppress_cross_class_per_channel(
+            soma_vol_by_ch, soma_ch_ids, iou_thresh=cross_iou, z_pad=z_pad_3d,
+            decision_rows=decision_rows)
 
         merged_soma_vols = list(soma_vol_by_ch.get(soma_ch_ids[0], [])) if soma_ch_ids else []
         for cid_b in soma_ch_ids[1:]:
@@ -1154,8 +1198,6 @@ if __name__ == '__main__':
                 a_cell['source_tracks'].extend(b_cell['source_tracks'])
                 a_cell['class'] = _merge_class(a_cell['class'], b_cell['class'])
             merged_soma_vols = merged_soma_vols + unmatched_b
-        cross_iou = zl_soma.get('cross_class_iou_thresh', 0.5)
-        decision_rows = []
         filtered_tf_objects = set()
         merged_soma_vols = suppress_cross_class_overlap(
             merged_soma_vols, iou_thresh=cross_iou, z_pad=z_pad_3d,

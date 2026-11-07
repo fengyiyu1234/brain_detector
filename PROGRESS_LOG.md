@@ -1481,3 +1481,108 @@ post-alignment 流程已不再使用，可视化只保留 `prealign` 和 `2d` �
   - 处理一个 tile 约 4 秒。
   - s4（同一 tile，35362 行）：rep-z 本 tile 来源 0.94 → 1.00；邻居来源 0.04 → 0.39（±1 层内 0.57）。union 行 11098 个，只有 83 个本 tile 来源的框有变化（本 tile 检测在 Stage 3 被 seam offset 移过）。s4 换算单独运行约 13 秒；viewer 里与 s3 共用 CSV 读取，实际多出约 8–9 秒（读 `coloc_result.csv` 本身约 34 秒）。
 - 测试：新增 `tests/test_saved_s3_tile_frame.py`（6 项，含 s4）；`test_saved_pre_gui`（17）、`test_checkpoint_code_lists`（2）通过。
+
+---
+
+## 2026-11-05 Stage 4：跨通道合并前，先在每个 soma 通道内做 neuron/glia 去重
+
+现象：ET10 GFP 同一个细胞在 s3 和最终结果里都是两个（同层一个 neuron_GFP、一个 glia_GFP，IoU 0.59）。
+
+- **原因**：
+  - Stage 4 的跨类别去重原来只在 Phase A（跨通道合并）之后跑一次。
+  - GFP neuron track 先和 RFP glia track 合并，合并后的细胞框变大、类别变成 glia。去重时这一对已不再是 neuron/glia，于是两个都保留。
+  - 另一种情况：glia 先和别的通道合并，框变大后 IoU 掉到 0.5 以下。
+  - ET10 全脑最终结果里，同通道 neuron/glia 3D IoU > 0.5、两个都保留的：GFP 5,646 对，RFP 4,876 对。
+- **修改**：
+  - `stitcher.suppress_cross_class_per_channel`：对每个 soma 通道各自跑一次 `suppress_cross_class_overlap`，参数相同（`cross_class_iou_thresh`、`z_pad_3d`），保留原顺序。
+  - `run_inference.py` Stage 4 在 Phase A 之前调用它，Phase A 之后原有的去重不变。
+  - 去掉的 track 写进 `coloc_decisions.csv`，`stage = channel_cross_class_suppression`，`channel` 为所在通道。
+- **离线验证**（`X:/Fengyi/test_xclass`，ET10、batch4/sample4、TSC FF8、TSC FW2，各取一个 tile 中央 1200×1200 px × 50 层）：
+  - 对“现在”的模拟与已保存的 `coloc_source_3d.csv` 完全一致。
+  - 细胞数减少 0.7–1.5%；去掉的 292 对全部是两条单层 track（同层或相邻层）。
+  - 抽样看图基本都是同一个细胞，多层 neuron track 不受影响。
+  - 用 pipeline 里的函数重跑 ET10、FW2，结果与离线测试相同。
+- **另查**：Stage 2.25 的 `nms_containment_thresh` 调低（`X:/Fengyi/test_nms`，7 个样本）解决不了这个问题。3D neuron/glia 重复约 98% 是相邻层类别不同，同层的只占约 2%；调低后 3D 重复数反而略增。所以没有改。
+- **影响**：
+  - Stage 4 哈希整个 `stitcher.py` 和 `run_inference.py`，下次运行会重跑共定位。
+  - 新函数不在 `STITCH_CODE` / `FUSION_CODE` 里，Stage 2.6 和 Stage 3 checkpoint 不受影响。
+- **待查**：batch4/sample4 的 tile `451400_340700` 2D 各步都正常，但不在 Stage 3 结果里。
+- 测试：新增 `tests/test_cross_class_per_channel.py`（3 项，含 ET10 例子）；`test_checkpoint_code_lists`（2）、`test_coloc_sources`（7）、`test_stitcher_overlap`（3）通过。
+
+---
+
+## 2026-11-05 对齐 checkpoint 误报冲突：换行符（CRLF→LF）改变了代码 hash
+
+现象：ET10 重跑 Stage 4（job 1719130）时，Stage 2.5 报 `Existing alignment checkpoint conflicts with inputs or outputs`（282000_354600）。
+
+- **原因**：
+  - 输入 CSV 的 hash 与 manifest 一致，只有 `aligner_sha256` 不同。
+  - 保存的 `0f042f60…` = 2239e80 版 `point_cloud_aligner.py` 的 CRLF 字节；现在是同一内容的 LF 版（`0d250537…`）。
+  - cd135d9 新增 `.gitattributes`（`* text=auto eol=lf`），工作区被转成 LF。代码本身没改。
+- **修改**：`tile_alignment_done` 的 `compatible` 集合加入这两个 hash（LF 版也加，之后再改这个文件时，11/4 之后用 LF 跑的样本也不会报错）。
+- **验证**：ET10 45 个 tile 的对齐 checkpoint 全部通过，没有报错。本机 env 没装 torch，`test_pipeline_filter_inputs` 无法导入，没跑。
+- **ET10 其他 checkpoint**（同样按整个 .py 文件算 hash）：
+  - Stage 2.2：`local_contrast.py` 保存的是 LF hash，仍有效。
+  - Stage 2.97：`seam_offsets.py` 是 CRLF hash，会重算。
+  - Stage 3：`channel_stage3.py`、`provenance.py` 是 CRLF hash，会重算。
+  - 这几步只会重算、不会报错，代码没变，结果应相同。上次 2.97+3 约 35 分钟。
+- 其他在 11/4 之前跑的样本，下次运行时情况相同。
+- **续（同日）**：再次提交（job 1719932）后，对齐已通过，但 Stage 2.9 报 `Tile positions or their inputs changed while global checkpoints exist`。原因相同：`solve_tile_positions.py`、`generate_merging_xml.py` 的 hash 是 CRLF 版。
+  - 新增 `local_scripts/migrate_crlf_code_hashes.py`：对每个当前 .py 文件，算出同一内容 CRLF 版的 hash；结果目录里 checkpoint manifest 中出现这个 hash 的，替换成现在的 LF hash。默认只预览，`--apply` 才写入，并在原处保留 `.bak_crlf` 备份。跳过 `run_configs/`、`runtime_config.json`、`old_results*`。
+  - ET10 预览：8 个 manifest（tile_positions 2 个、seam_offsets 1 个、`6_3d_global/*_stage3_manifest.json` 4 个、stitch_dedup QC 1 个）。应用后 2.9 / 2.97 / 3 都不用重算，只重跑 Stage 4。
+  - 后续阶段只有 Stage 4 的签名包含 stage3 manifest 的 hash，Stage 4 本来就要重跑。
+
+---
+
+## 2026-11-06 Stage 2.9：求解器只哈希影响几何的代码
+
+现象：ET10（job 1720756）手动迁移 checkpoint 后，Stage 2.9 仍报 `Tile positions or their inputs changed while global checkpoints exist`。
+
+- **原因**：`migrate_crlf_code_hashes.py` 只替换了 hash 文本。`_solver_manifest.json` 里 `solve_tile_positions.py` 的 `size` 仍是 CRLF 版（80592，LF 版 79163，正好差 1429 行）。manifest 按 sha256 + size 比较，所以判为输入变了。其余 225 个输入（filtered CSV、offsets JSON）都一致。
+  - 已手动把 ET10 的 size 改为 79163（备份 `_solver_manifest.json.bak_size`）。其余 7 个迁移过的 manifest 没有 size 字段问题。
+  - `migrate_crlf_code_hashes.py` 现在同时更新 `size`。
+- **修改**：
+  - `tile_position_pipeline.SOLVE_CODE`：`solve_tile_positions.main()` 用到的函数/常数（含 compare_stitching、point_cloud_aligner、z_linker、io、markers、config.loader 里的 helper）。`SOLVE_CODE_SKIP`：流程不会跑的 XML / `--write-aligned` 写出函数。
+  - `provenance.code_sha256`：按源码行算 hash，忽略注释、空行、docstring、换行符，以及 `say`/`print`/`say_scores` 这类日志语句。不用 `ast.dump`，因为它在不同 Python 版本输出不同。
+  - `run_tile_position_stage(..., solver_code=)`：给了就用它代替整个 `solve_tile_positions.py` 的文件 hash。
+  - 旧 manifest（整文件 hash）：如果当前文件与记录的 hash 一致（LF 或 CRLF 都算），自动升级，不重算。文件真改了的仍会报错。
+  - 列表放在 `tile_position_pipeline.py` 而不是求解器里：这样 `solve_tile_positions.py` 一个字节都没变，旧样本才能自动升级。旧样本第一次用新代码跑之前，不要改 `solve_tile_positions.py`，否则还是会报错。
+  - 影响：现在 point_cloud_aligner / z_linker / compare_stitching 里求解器用到的函数改了，也会让 Stage 2.9 失效（以前没覆盖）。
+- 测试：`test_checkpoint_code_lists`（4，新增 SOLVE_CODE 闭包检查、hash 归一化）、`test_tile_position_pipeline`（6，新增 3 项）通过。
+
+---
+
+## 2026-11-06 可视化：s3 层显示同通道细胞类别去重之后的结果
+
+现象：`6_3d_global/{cid}_3d_tracked.csv` 是 Stage 3 写出的，同通道 neuron/glia 去重（`suppress_cross_class_per_channel`）在 Stage 4 才做，所以 GUI 的 s3 层是去重前的结果，无法检查单通道 3D 去重效果。
+
+- **修改**（`src/utils/saved_gui.py`，只影响 GUI，不影响 checkpoint）：读 `7_colocalization/coloc_decisions.csv` 中 `stage=channel_cross_class_suppression` 的 track_id，从 s3 中去掉这些 track，层名改为 `[s3 after class dedup] {cid}`（球体层也用去重后的行）。被删的 track 不单独建层，免得加载太多。
+  - 没有 Stage 4 结果时照旧显示 `[s3 saved summary]`；`3d_tracked.csv` 比 decisions 新时打印提示（需重跑 Stage 4）。
+- **验证**：ET10 GFP 10716 / RFP 10439 条删除记录全部能在 s3 中找到，且都是 neuron。`test_saved_pre_gui`（17）通过。
+
+---
+
+## 2026-11-07 Stage 2.25：去掉被 YOLO patch 边切断的重复框（patch_fragment_iomin）
+
+现象：ET10 RFP 同一个 glia 细胞在 s3 里是两条 track（`track3d:2b1d98…` z416–419、`track3d:d878ee…` z414–417），两条都是 glia_RFP，与类别去重无关。
+
+- **原因**（tile 316000_365900，全部 8 个成员框都来自这个 tile）：
+  - 细胞位于 4 个 YOLO patch 的交界处（512 px patch，步长 384，交界在 x≈1920、y≈1280）。
+  - raw z=423：patch (1536,1152) 看到完整细胞（a445，0.325）；patch (1920,1152) 的框被 patch 左边 x=1920 切断（bec6，0.338）；patch (1536,768) 的框被 patch 下边 y=1280 切断（e7d5，0.293）。
+  - tile 内 NMS（`stitchDetection`，只看 IoU>0.4）保留分数最高的 bec6，压掉了完整框 a445；e7d5 与 bec6 IoU 0.37（IoMin 0.81），也留了下来。z=424 情况相同。
+  - 同一层有两个框，z-linker 一对一匹配，只能分成两条 track。
+  - ET10 全样本：保留框中被 patch 内边切断的 GFP 12.4%、RFP 15.0%；同层同类 IoMin>0.6 的保留框对里，含切断框的 GFP 48%（71k/147k）、RFP 77%（56k/74k），所以 RFP 更明显。
+- **修改**（不重跑 YOLO）：
+  - 新模块 `src/core/patch_fragments.py`：每层（不分类别）按面积从小到大，框的某条边落在自己 patch 的内边上（±2 px，tile 外边不算），且同层另一个不小于它的保留框盖住它面积的 > `patch_fragment_iomin`，就删掉。patch 位置取自 `1_2d_raw/{tile}_{ch}_candidates.csv`（fused 行用 `winner_detection_id`）。删掉的行写进 rejected CSV，`rejection_reason = patch_fragment`，带 `suppressed_by_detection_id`、`suppression_iomin`。
+  - 开关：`detection_params.yolo.patch_fragment_iomin`（null/缺省 = 关）。只对 YOLO；设在 stardist 上报错。
+  - Stage 2.25：在共享 filter 之后、SNR 之前执行。Stage 2.75：只在 post_align 时执行（pre_align 的 fused 框已对齐、坐标不在 patch 边上，每个曝光已在 2.25 处理过）。
+  - 开启时 filter manifest 的 settings 多一项 `patch_fragment`（参数、本模块 hash、candidates CSV 的 sha256）；关闭时签名不变。**没有改 `detection_filter.py`**，所以其他样本的 2.25 checkpoint 不受影响。
+  - `resume.raw_detection_settings` 忽略这个键（不算 raw 检测设置的变化）。
+  - `refilter_align` / `refilter_detections` 遇到开启的通道直接报错（与 contrast_filter 相同）。
+  - `run_inference.py` 改了，按惯例其他样本下次运行会重跑 Stage 4。
+- **ET10 验证**（tile 316000_365900，阈值 0.5，用 runtime_config 的 filter 参数）：
+  - 例子里两个切断框（e7d5 z423、1063 z424，覆盖率 0.81 / 0.59）都被删。
+  - 删框 GFP 671（0.62%）、RFP 1021（1.08%）；按 Stage 2.5 的 z_linker 参数单 tile 连 3D，track 数 GFP −0.8%、RFP −1.4%。
+  - 每通道随机抽 16 个看图：绝大多数是同一细胞被 patch 边切下的一块；覆盖率 0.55–0.57 的个别例子像是相邻两个细胞。阈值 0.6 会漏掉本例的 z=424。
+- **对已有样本生效**：在 config 的 `detection_params.yolo` 加 `"patch_fragment_iomin": 0.5`，把 `3_2d_aligned` 及之后的结果（5_2d_global、6_3d_global、7_colocalization）挪走，从 Stage 2.25 重跑（2.25 已有对齐结果时会报错，这是原有的保护）。YOLO 不重跑。
+- 测试：新增 `tests/test_patch_fragments.py`（8 项）；`test_checkpoint_code_lists`（4）通过。`test_pipeline_filter_inputs`、`test_automatic_resume` 本机缺 torch 无法导入（已有问题）。

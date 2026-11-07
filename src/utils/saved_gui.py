@@ -376,6 +376,33 @@ def _s4_local_rows(rows, result_dir, routing, tile_name, position, context, cach
     return local
 
 
+def _class_dedup_removed(result_dir, cid, cache):
+    """Neuron track_ids Stage 4 dropped inside channel cid for overlapping a glia track.
+
+    Stage 3 writes 6_3d_global/{cid}_3d_tracked.csv before this same-channel
+    neuron/glia dedup, which runs in Stage 4 and logs each removal to
+    7_colocalization/coloc_decisions.csv. Returns None when that file is missing.
+    """
+    path = os.path.join(result_dir, "7_colocalization", "coloc_decisions.csv")
+    if "class_dedup" not in cache:
+        if not os.path.isfile(path):
+            print(f"[saved s3] {path} missing; s3 shows tracks before class dedup")
+            cache["class_dedup"] = None
+        else:
+            df = pd.read_csv(path, usecols=["stage", "channel", "track_id"],
+                             dtype=str, keep_default_na=False)
+            df = df.loc[df["stage"] == "channel_cross_class_suppression"]
+            cache["class_dedup"] = df.groupby("channel")["track_id"].apply(set).to_dict()
+    removed = cache["class_dedup"]
+    if removed is None:
+        return None
+    tracked = os.path.join(result_dir, "6_3d_global", f"{cid}_3d_tracked.csv")
+    if os.path.isfile(tracked) and os.path.getmtime(tracked) > os.path.getmtime(path):
+        print(f"[saved s3] {cid}: {os.path.basename(tracked)} is newer than "
+              "coloc_decisions.csv; rerun Stage 4 for current class-dedup results")
+    return removed.get(cid, set())
+
+
 def _add_global_results(viewer, result_dir, routing, xy_bounds,
                         global_z_range, tile_bounds, position, global_view,
                         registry, width, show_coloc, show_zlinked, show_spheres,
@@ -401,6 +428,12 @@ def _add_global_results(viewer, result_dir, routing, xy_bounds,
                 rows = global_to_local_rows(rows, position)
             layer_label = ("[s3 saved summary]" if label == "s3"
                            else "[global saved]")
+            removed = (_class_dedup_removed(result_dir, cid, cache)
+                       if label == "s3" else None)
+            if removed is not None and not rows.empty:
+                rows = rows.loc[~rows["track_id"].astype(str).isin(removed)
+                                ].reset_index(drop=True)
+                layer_label = "[s3 after class dedup]"
             _add_box_layer(
                 viewer, rows, f"{layer_label} {cid}",
                 visible=(label == "s3" and show_zlinked),

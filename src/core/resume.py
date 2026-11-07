@@ -70,6 +70,6 @@ def raw_detection_settings(config):
         dp.pop(key, None)
     for value in dp.values():
         if isinstance(value, dict):
-            for key in (*FILTER_KEYS, 'nucleus_mean_min'):
+            for key in (*FILTER_KEYS, 'nucleus_mean_min', 'patch_fragment_iomin'):
                 value.pop(key, None)
     return dp

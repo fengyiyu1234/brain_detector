@@ -1,11 +1,63 @@
 """Checkpointed, template-free tile geometry and merging XML generation."""
+import hashlib
 import json
 import os
 import subprocess
 import sys
 
 from src.utils.io import resolve_tile_dir
-from src.core.provenance import file_sha256, file_stamp, output_manifest_valid, write_output_manifest, content_signature
+from src.core.provenance import (file_sha256, file_stamp, output_manifest_valid,
+                                  write_output_manifest, content_signature,
+                                  manifest_outputs_valid, PROVENANCE_SCHEMA_VERSION,
+                                  code_sha256)
+
+
+# The Stage 2.9 checkpoint hashes only this code of src/core/solve_tile_positions.py
+# (short names) and its helpers ('package.module:name'), via provenance.code_sha256:
+# comments, formatting, line endings and statements calling SOLVE_LOG_CALLS are
+# ignored. Add any new helper that main() reaches. SOLVE_CODE_SKIP holds solver code
+# the pipeline never runs (it does not pass --write-xml, --write-aligned or
+# --xml-into-channel-dirs); move a name into SOLVE_CODE if that changes.
+# Kept here, not in the solver, so adding it left solve_tile_positions.py byte-identical
+# and older whole-file manifests still migrate. Guarded by tests/test_checkpoint_code_lists.py.
+SOLVE_LOG_CALLS = ('say', 'print', 'say_scores')
+SOLVE_CODE_SKIP = ('write_channel_xml', 'channel_xml_positions', 'source_xml_template',
+                   'publish_channel_xml', 'write_aligned')
+SOLVE_CODE = (
+    'main', 'parse_args', 'AXES', 'CELL_COLS', '_irls', '_refine_job', '_soma_index',
+    '_tf_arrays', 'add_measured', 'build_jobs', 'channel_image_dirs', 'const_from_offsets',
+    'containment_count', 'count_slices', 'discover_tiles', 'estimate_constants_pooled',
+    'json_scores', 'load_old_offsets', 'measure_seams', 'nominal_grid', 'parse_const',
+    'pool_cells', 'refine_per_tile', 'score_placements', 'seam_support', 'seam_weights',
+    'shift_arrays', 'solve_axis', 'stack_cloud', 'tile_cell_arrays',
+    'src.config.loader:_strip_comments', 'src.config.loader:load_config',
+    'src.core.point_cloud_aligner:_coarse_from_peaks',
+    'src.core.point_cloud_aligner:_containment_score',
+    'src.core.point_cloud_aligner:_displacement_peaks',
+    'src.core.point_cloud_aligner:_fine_containment',
+    'src.core.point_cloud_aligner:containment_shift_from_arrays',
+    'src.core.point_cloud_aligner:resolve_align_settings',
+    'src.core.z_linker:_IOU_BLOCK', 'src.core.z_linker:_candidate_pairs',
+    'src.core.z_linker:_iou_matrix', 'src.core.z_linker:_match_dense',
+    'src.core.z_linker:_match_sparse', 'src.core.z_linker:_median',
+    'src.core.z_linker:_parse_cached', 'src.core.z_linker:parse_class_string',
+    'src.core.z_linker:run_z_linker',
+    'src.utils.compare_stitching:BOX_COLS', 'src.utils.compare_stitching:DIRECTIONS',
+    'src.utils.compare_stitching:_hist_peak', 'src.utils.compare_stitching:_link_cells',
+    'src.utils.compare_stitching:_mutual_nn', 'src.utils.compare_stitching:_read_dets',
+    'src.utils.compare_stitching:_tile_cells_in_overlap',
+    'src.utils.compare_stitching:estimate_seam_error',
+    'src.utils.compare_stitching:resolve_results_dir',
+    'src.utils.compare_stitching:run_seam_job',
+    'src.utils.io:TILE_NAME_TOLERANCE', 'src.utils.io:_name_coords',
+    'src.utils.io:resolve_tile_dir',
+    'src.utils.markers:clean_markers', 'src.utils.markers:split_class',
+)
+
+
+def solver_code_sha256():
+    import src.core.solve_tile_positions as solver
+    return code_sha256(solver, SOLVE_CODE, SOLVE_LOG_CALLS)
 
 
 def _file_hashes(paths):
@@ -52,6 +104,39 @@ def _solver_signature(signature, xml_script):
     return value
 
 
+def _same_file_bytes(path, digest):
+    """Whole-file hash recorded by older manifests, with either line ending."""
+    if not os.path.isfile(path):
+        return False
+    with open(path, 'rb') as handle:
+        data = handle.read().replace(b'\r\n', b'\n')
+    return digest in (hashlib.sha256(data).hexdigest(),
+                      hashlib.sha256(data.replace(b'\n', b'\r\n')).hexdigest())
+
+
+def _legacy_solver_manifest_valid(path, solver_signature, script):
+    """Accept a manifest that hashed the whole solver file, if that file is unchanged.
+
+    Earlier versions hashed solve_tile_positions.py byte for byte. When the file
+    still has those bytes (up to line endings), the code is identical, so the
+    existing positions are adopted instead of being treated as stale.
+    """
+    try:
+        with open(path, encoding='utf-8') as handle:
+            payload = json.load(handle)
+        old = dict(payload['input_signature'])
+        inputs = dict(old['inputs'])
+        entry = inputs.pop(os.path.basename(script))
+        old['inputs'] = inputs
+        old['solver_code'] = solver_signature['solver_code']
+        return (payload.get('schema_version') == PROVENANCE_SCHEMA_VERSION
+                and _same_file_bytes(script, entry['sha256'])
+                and content_signature(old) == content_signature(solver_signature)
+                and manifest_outputs_valid(path, payload))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def solver_command(script, config_path, results_dir, det_dir, ref, frame, workers, options):
     command = [sys.executable, script, '--sample', results_dir, '--config', config_path,
                '--det-dir', det_dir, '--alignment-from', 'old-offsets',
@@ -82,8 +167,14 @@ def tile_position_frame(config):
 
 
 def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir,
-                            report_dir, tile_names, routing, script, xml_script):
-    """Solve positions, generate every channel XML, then reuse identical outputs."""
+                            report_dir, tile_names, routing, script, xml_script,
+                            solver_code=None):
+    """Solve positions, generate every channel XML, then reuse identical outputs.
+
+    solver_code: hash of the code that determines geometry (see
+    solve_tile_positions.SOLVE_CODE). When given, it replaces the whole-file hash
+    of `script`, so comment, formatting or logging edits do not invalidate positions.
+    """
     params = config.get('tile_position_params', {})
     frame = tile_position_frame(config)
     ref = config.get('pre_align_params', {}).get('reference_channel') or next(
@@ -121,13 +212,15 @@ def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir
             if not os.path.isdir(tile_dir):
                 raise FileNotFoundError(f"Original image tile directory missing: {tile_dir}")
             files[tile_dir] = _stamp(tile_dir)
-    files[script] = _stamp(script)
+    if solver_code is None:
+        files[script] = _stamp(script)
     files[xml_script] = _stamp(xml_script)
     outputs = [position_csv, os.path.join(report_dir, 'solution.json')]
     outputs.extend(os.path.join(config['paths'][ch['dir_key']], 'xml_merging.xml')
                    for ch in routing)
     signature = {'version': 4, 'reference_channel': ref, 'frame_channel': frame,
                  'solver_command': command, 'xml_command': xml_command, 'inputs': files,
+                 'solver_code': solver_code,
                  'geometry_config': {
                      'detection_params': {key: config.get('detection_params', {}).get(key)
                                           for key in ('xy_resolution_um', 'z_resolution_um', 'tILESIZE')},
@@ -183,10 +276,14 @@ def run_tile_position_stage(config, config_path, results_dir, det_dir, align_dir
                    for path in files if os.path.isfile(path) and path != xml_script},
         'image_tiles': {ch['id']: list(tile_names) for ch in routing},
     }
+    if solver_code is not None:
+        solver_signature['solver_code'] = solver_code
     positions_reusable = bool(previous) and solver_hashes_match and all(
         os.path.isfile(path) and previous.get('hashes', {}).get('outputs', {}).get(path) == file_sha256(path)
         for path in outputs[:2])
     solver_unchanged = output_manifest_valid(solver_manifest, solver_signature) or (
+        solver_code is not None and
+        _legacy_solver_manifest_valid(solver_manifest, solver_signature, script)) or (
         positions_reusable and isinstance(previous.get('signature'), dict) and
         _solver_signature(previous['signature'], xml_script) == _solver_signature(signature, xml_script))
     if solver_unchanged:

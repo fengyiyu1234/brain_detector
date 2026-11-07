@@ -667,7 +667,8 @@ def match_soma_3d_iou(cells_a, cells_b, iou_thresh=0.15, iomin_thresh=0.5, z_pad
 def suppress_cross_class_overlap(cells, iou_thresh=0.5, z_pad=2, decision_rows=None):
     """
     For any (neuron, glia) pair with 3D IoU > iou_thresh, drop the neuron.
-    Glia takes priority.  Runs after Phase-A soma merging, before TF annotation.
+    Glia takes priority.  Runs inside each soma channel before Phase-A merging
+    (suppress_cross_class_per_channel) and again after it, before TF annotation.
     """
     neurons = [c for c in cells if str(c['class']).split('_')[0] == 'neuron']
     glias   = [c for c in cells if str(c['class']).split('_')[0] == 'glia']
@@ -715,6 +716,35 @@ def suppress_cross_class_overlap(cells, iou_thresh=0.5, z_pad=2, decision_rows=N
     logging.info(f"Cross-class dedup: suppressed {len(suppressed)} neuron(s) "
                  f"overlapping glia (iou_thresh={iou_thresh})")
     return surviving + glias + others
+
+
+def suppress_cross_class_per_channel(vols_by_ch, channel_ids, iou_thresh=0.5, z_pad=2,
+                                     decision_rows=None):
+    """Drop same-channel neuron tracks that overlap a glia track of that channel.
+
+    Runs suppress_cross_class_overlap inside each soma channel before Phase-A merging.
+    Without it, a neuron track can merge with another channel's track first; the merged
+    cell may then be relabelled glia or grow past the IoU threshold, so the later
+    cross-class dedup misses the pair and one soma is counted twice. Replaces each
+    channel's list in vols_by_ch with its survivors in their original order; channels
+    missing from vols_by_ch are skipped. Removals are logged to decision_rows with
+    stage 'channel_cross_class_suppression'.
+    """
+    for cid in channel_ids:
+        cells = vols_by_ch.get(cid)
+        if not cells:
+            continue
+        rows = []
+        kept = {id(c) for c in suppress_cross_class_overlap(
+            cells, iou_thresh=iou_thresh, z_pad=z_pad, decision_rows=rows)}
+        vols_by_ch[cid] = [c for c in cells if id(c) in kept]
+        logging.info(f"[{cid}] same-channel cross-class dedup: "
+                     f"{len(cells) - len(vols_by_ch[cid])} neuron track(s) removed")
+        if decision_rows is not None:
+            for row in rows:
+                row.update(stage='channel_cross_class_suppression', channel=cid)
+            decision_rows.extend(rows)
+    return vols_by_ch
 
 
 def annotate_soma_with_tf_gmm(soma_vol_list, tf_vol_list, p_thresh=0.5):
