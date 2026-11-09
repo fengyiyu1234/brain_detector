@@ -1606,3 +1606,20 @@ post-alignment 流程已不再使用，可视化只保留 `prealign` 和 `2d` �
 - `match_evidence.csv` 新增 `tf_gates` 列（JSON，列出每个 soma 通道的中心距和比值）。`center_distance*` 两列改记比值最大的那个 gate。
 - `run_inference.py`、`stitcher.py`、`coloc_sources.py` 改了：所有样本下次运行会重跑 Stage 4。Sox9+/Olig2+ 的计数预计会下降（只影响多通道 soma）。
 - 测试：`test_coloc_sources` 新增 2 项（本例在 all 下不再是 Sox9+、union 下仍是；Olig2 在中心仍匹配；无 soma 通道 source 时回退），共 9 项通过；`test_checkpoint_code_lists` 通过。其余测试文件逐个跑通过；`test_qc_alignment`、`test_tile_2d_sources` 在本机原生崩溃，原代码上也一样（与本次无关）。
+
+## 2026-11-08 TF 共定位 all 规则：z 改回按合并 soma 判定
+
+现象：ET10 tile 327300_388500 的 GFP+RFP glia（`coloc:3844a55f…`），Sox9 核（`track3d:e4981edb…`，z425–427）在两个框的中心，却是 `unmatched_tf / no_accepted_soma`。
+
+- **原因**：上一条改动把 z 包含也改成了逐通道判断。GFP track 只有一层（z427，member_count=1），ET10 的 `containment_z_pad = 1`，要求 Sox9 zmin ≥ 426，实际 425，不过；RFP（z425–428）能过。旧 union 规则下能匹配，这是 all 规则带来的假阴性。
+- **修改**（`annotate_soma_with_tf_containment`）：xy 包含和中心距仍逐个 soma 通道判；z 包含改用该 soma 自身（合并后）的 z_min/z_max。上一条的 Sox9 误配例子是被 GFP 框的 xy 条件拒掉的，不受影响。
+- `stitcher.py` 改了：所有样本下次运行重跑 Stage 4。
+- 测试：`test_coloc_sources` 新增本例回归测试，共 10 项通过；`test_checkpoint_code_lists`（4）、`test_cross_class_per_channel`（5）通过。
+
+## 2026-11-09 tsc11 在 gpu18 上 StarDist 加载失败（节点问题，未改代码）
+
+现象：tsc11（job 1773560，gpu18）阶段 2 一开始就退出，StarDist 报 `CUDA_ERROR_DEVICE_UNAVAILABLE`（device ordinal 1）。TSC10（gpu43）同样的配置正常。
+
+- 最初怀疑 GPU 是 Exclusive_Process 模式（双卡时每个 worker 的 TF 放在另一块卡上，每块卡有两个进程）。在 gpu18 上用 `srun` 查到 compute_mode 为 `Default`，排除了这个原因，为它加的 worker 改动已撤回。
+- 目前判断是 gpu18 的某块卡本身不可用（被占用或状态异常）。处理方式：提交时加 `--exclude=gpu18`。
+- `inference_tsc11.slurm` 的 GPU 检查改为同时输出 compute_mode，以后能直接从 .out 里看到。

@@ -160,6 +160,28 @@ class ColocSourcesTest(unittest.TestCase):
         self.assertEqual([g["soma_channel"] for g in gates], ["GFP", "RFP"])
         self.assertEqual(gates[0]["soma_track_id"], "gfp-track")
 
+    def test_all_rule_checks_z_on_merged_soma_range(self):
+        # Real case (ET10 tile 327300_388500, coloc:3844a55f...): the GFP track was seen on
+        # z427 only, RFP on z425-428; the Sox9 nucleus (z425-427) sits in the centre of
+        # both boxes. Gating z on the one-layer GFP track rejected it; z must use the
+        # merged soma range (425-428) while xy/center stay per channel.
+        gfp = volume("glia_GFP", 6013.402, 7362.380, 427,
+                     (5995.167, 7344.182, 6031.637, 7380.577), {427: (0, 0, 1, 1)})
+        rfp = volume("glia_RFP", 6014.724, 7362.138, 426,
+                     (5979.329, 7322.743, 6050.119, 7401.534), {426: (0, 0, 1, 1)})
+        rfp["z_min"], rfp["z_max"] = 425, 428
+        sox9 = volume("nucleus_Sox9", 6013.0, 7360.5, 426,
+                      (6006.0, 7353.0, 6020.0, 7368.0), {426: (0, 0, 1, 1)})
+        sox9["z_min"], sox9["z_max"] = 425, 427
+        soma = merge_soma_volumes_union(copy.deepcopy(gfp), copy.deepcopy(rfp))
+        soma["class"] = "glia_GFP_RFP"
+        soma["source_tracks"] = [("GFP", gfp), ("RFP", rfp)]
+        self.assertEqual((soma["z_min"], soma["z_max"]), (425, 428))
+        annotate_soma_with_tf_containment(
+            [soma], [sox9], z_pad=1, max_center_dist_ratio=0.35,
+            source_channel="Sox9", soma_channels={"GFP", "RFP"})
+        self.assertEqual(soma["class"], "glia_GFP_RFP_Sox9")
+
     def test_all_rule_without_soma_sources_uses_own_box(self):
         soma = volume("neuron_GFP", 20, 15, 10, (0, 0, 40, 30), {10: (0, 0, 40, 30)})
         soma["source_tracks"] = [("Olig2", {})]   # no soma-channel track saved

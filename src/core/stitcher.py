@@ -854,6 +854,8 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
     tracks in source_tracks are each a separate gate; the TF must pass every one of the
     soma's gates (rule 'all'). This keeps an oversized box from one channel from
     capturing a neighbouring nucleus that lies outside the other channel's soma.
+    Each gate checks xy containment and center distance against its channel's box;
+    z containment is always checked against the soma's own (merged) z range.
     When multiple somas accept the same TF, the one whose farthest gate center is
     closest wins (ties: lower soma index).
     """
@@ -881,8 +883,11 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
     tree = cKDTree(soma_arr)
     s_box = np.array([[s['x1_3d'], s['y1_3d'], s['x2_3d'], s['y2_3d']] for s in gate_cells],
                      dtype=float)
-    s_zmin = np.array([s['z_min'] for s in gate_cells])
-    s_zmax = np.array([s['z_max'] for s in gate_cells])
+    # z containment uses the owning soma's (merged) z range, not the gate's own track:
+    # a channel detected on fewer layers would otherwise reject a correctly placed TF.
+    # Only xy containment and the center distance are checked per soma channel.
+    s_zmin = np.array([soma_vol_list[i]['z_min'] for i in gate_owner])
+    s_zmax = np.array([soma_vol_list[i]['z_max'] for i in gate_owner])
     # 质心距离硬门限要求 dist <= ratio * soma_radius <= ratio * max_radius，
     # 所以查询半径取 ratio * max_radius 不会漏掉任何能通过门限的配对；
     # 旧的 2 * max_radius 在有个别超大 soma 框时会让候选数膨胀约 80 倍（ERH: 650px vs 114px）。
