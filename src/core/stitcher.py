@@ -1,3 +1,4 @@
+import json
 import logging
 import numpy as np
 import pandas as pd
@@ -824,31 +825,64 @@ def annotate_soma_with_tf_gmm(soma_vol_list, tf_vol_list, p_thresh=0.5):
 _TF_CHUNK = 100_000   # 3B 每块处理的 TF 数；候选对数组的内存随块大小线性增长
 
 
+def _tf_gate_volumes(soma, soma_channels):
+    """The (channel, box) gates a TF must pass to be assigned to this soma.
+
+    soma_channels None: the soma's own (possibly cross-channel union) box.
+    Otherwise: the original track of every soma channel saved in source_tracks, so a
+    merged GFP+RFP cell needs the TF inside both the GFP and the RFP box. A soma
+    without saved soma-channel tracks falls back to its own box.
+    """
+    if soma_channels is not None:
+        gates = [(channel, track) for channel, track in soma.get('source_tracks', ())
+                 if channel in soma_channels]
+        if gates:
+            return gates
+    return [(None, soma)]
+
+
 def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_margin=0,
-                                       max_center_dist_ratio=0.5, source_channel=None):
+                                       max_center_dist_ratio=0.5, source_channel=None,
+                                       soma_channels=None):
     """
     Annotate soma cells with TF markers using strict 3D bbox containment.
     A TF is colocalized only if its 3D bounding box is fully enclosed within
     a soma's 3D bounding box (with optional xy_margin and z_pad tolerance),
     AND its centroid is within max_center_dist_ratio * soma_radius of the soma center.
-    When multiple somas contain the same TF, the closest one wins.
+
+    soma_channels (None = gate on the soma's own box): soma channel ids whose original
+    tracks in source_tracks are each a separate gate; the TF must pass every one of the
+    soma's gates (rule 'all'). This keeps an oversized box from one channel from
+    capturing a neighbouring nucleus that lies outside the other channel's soma.
+    When multiple somas accept the same TF, the one whose farthest gate center is
+    closest wins (ties: lower soma index).
     """
     if not soma_vol_list or not tf_vol_list:
         return soma_vol_list
 
-    soma_arr = np.array([[s['cx'], s['cy'], s['cz']] for s in soma_vol_list], dtype=float)
+    gate_owner, gate_channel, gate_cells, n_gates = [], [], [], []
+    for idx, soma in enumerate(soma_vol_list):
+        gates = _tf_gate_volumes(soma, soma_channels)
+        n_gates.append(len(gates))
+        for channel, cell in gates:
+            gate_owner.append(idx)
+            gate_channel.append(channel)
+            gate_cells.append(cell)
+    gate_owner = np.array(gate_owner, dtype=np.int64)
+
+    soma_arr = np.array([[s['cx'], s['cy'], s['cz']] for s in gate_cells], dtype=float)
     soma_radii = np.array([
         np.sqrt((s['x2_3d'] - s['x1_3d']) ** 2 + (s['y2_3d'] - s['y1_3d']) ** 2) / 2
-        for s in soma_vol_list
+        for s in gate_cells
     ], dtype=float)
     soma_radii = np.maximum(soma_radii, 1.0)
     max_radius = float(soma_radii.max())
 
     tree = cKDTree(soma_arr)
-    s_box = np.array([[s['x1_3d'], s['y1_3d'], s['x2_3d'], s['y2_3d']] for s in soma_vol_list],
+    s_box = np.array([[s['x1_3d'], s['y1_3d'], s['x2_3d'], s['y2_3d']] for s in gate_cells],
                      dtype=float)
-    s_zmin = np.array([s['z_min'] for s in soma_vol_list])
-    s_zmax = np.array([s['z_max'] for s in soma_vol_list])
+    s_zmin = np.array([s['z_min'] for s in gate_cells])
+    s_zmax = np.array([s['z_max'] for s in gate_cells])
     # 质心距离硬门限要求 dist <= ratio * soma_radius <= ratio * max_radius，
     # 所以查询半径取 ratio * max_radius 不会漏掉任何能通过门限的配对；
     # 旧的 2 * max_radius 在有个别超大 soma 框时会让候选数膨胀约 80 倍（ERH: 650px vs 114px）。
@@ -885,34 +919,48 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
                        ((zmin_t >= zmin_s) & (zmax_t <= zmax_s + z_pad)))
         keep = np.flatnonzero(contained_xy & contained_z)
 
-        best = {}   # tf 在块内的下标 → (best_dist, best_idx)
+        passed = defaultdict(list)   # (tf 块内下标, soma 下标) → 通过的 gate 下标
         for k in keep:
-            t, idx = int(ti[k]), int(si[k])
-            dist = float(np.linalg.norm(soma_arr[idx] - tf_pts[t]))
+            t, g = int(ti[k]), int(si[k])
+            dist = float(np.linalg.norm(soma_arr[g] - tf_pts[t]))
             # Hard gate: nucleus centroid must be near soma center, not just inside bbox
-            if dist > max_center_dist_ratio * soma_radii[idx]:
+            if dist > max_center_dist_ratio * soma_radii[g]:
                 continue
-            if dist < best.get(t, (float('inf'), None))[0]:
-                best[t] = (dist, idx)
+            passed[(t, int(gate_owner[g]))].append((g, dist))
 
-        for t, (best_dist, best_idx) in best.items():
+        best = {}   # tf 在块内的下标 → (最远 gate 距离, soma 下标, 通过的 gates)
+        for (t, idx), gates in passed.items():
+            if len(gates) < n_gates[idx]:   # 规则 all：每个 soma 通道都要通过
+                continue
+            worst = max(dist for _, dist in gates)
+            if (worst, idx) < best.get(t, (float('inf'), -1))[:2]:
+                best[t] = (worst, idx, gates)
+
+        for t, (_, best_idx, gates) in best.items():
             cls = chunk[t]['class']
             if cls not in marker_of:
                 tf_base, tf_mk = split_class(cls)
                 marker_of[cls] = tf_mk[-1] if tf_mk else tf_base
             soma_markers[best_idx].add(marker_of[cls])
             if source_channel is not None:
+                g_worst, d_worst = max(gates, key=lambda gate: gate[1] / soma_radii[gate[0]])
                 soma_vol_list[best_idx].setdefault('source_tracks', []).append(
                     (source_channel, chunk[t]))
                 soma_vol_list[best_idx].setdefault('match_evidence', []).append({
                     'match_type': 'tf_containment',
                     'channel': source_channel,
                     'track_id': chunk[t].get('track_id', ''),
-                    'center_distance': best_dist,
-                    'center_distance_ratio': best_dist / soma_radii[best_idx],
+                    'center_distance': d_worst,
+                    'center_distance_ratio': d_worst / soma_radii[g_worst],
                     'center_distance_ratio_max': max_center_dist_ratio,
                     'xy_margin': xy_margin,
                     'z_pad': z_pad,
+                    'tf_gates': json.dumps([
+                        {'soma_channel': gate_channel[g],
+                         'soma_track_id': gate_cells[g].get('track_id', ''),
+                         'center_distance': round(dist, 3),
+                         'center_distance_ratio': round(dist / soma_radii[g], 4)}
+                        for g, dist in sorted(gates)]),
                 })
 
     for idx, soma in enumerate(soma_vol_list):

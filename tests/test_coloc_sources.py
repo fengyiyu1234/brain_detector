@@ -122,6 +122,52 @@ class ColocSourcesTest(unittest.TestCase):
         self.assertEqual(json.loads(results[0][1]['tf_positive_channels']),
                          ['Sox9', 'Olig2'])
 
+    def test_all_rule_requires_tf_inside_every_soma_channel(self):
+        # Real case (338600_388500 seam, z 419-423): the low-score RFP box is twice the
+        # GFP box; a neighbouring Sox9 nucleus sits inside RFP but past GFP's lower edge.
+        gfp = volume("neuron_GFP", 7010.119, 9390.447, 421,
+                     (6991.020, 9371.415, 7029.218, 9409.480), {421: (0, 0, 1, 1)})
+        rfp = volume("neuron_RFP", 7016.633, 9390.903, 421,
+                     (6979.665, 9355.778, 7053.601, 9426.028), {421: (0, 0, 1, 1)})
+        gfp["z_min"] = rfp["z_min"] = 419
+        gfp["z_max"] = rfp["z_max"] = 423
+        gfp["track_id"], rfp["track_id"] = "gfp-track", "rfp-track"
+        sox9 = volume("nucleus_Sox9", 7021.5, 9407.5, 422,
+                      (7017.0, 9401.5, 7026.0, 9413.5), {421: (0, 0, 1, 1)})
+        sox9["z_min"], sox9["z_max"] = 421, 423
+        # A nucleus at the centre of both boxes must still match under 'all'.
+        olig2 = volume("nucleus_Olig2", 7012.0, 9391.0, 421,
+                       (7007.0, 9386.0, 7017.0, 9396.0), {421: (0, 0, 1, 1)})
+
+        def merged():
+            soma = merge_soma_volumes_union(copy.deepcopy(gfp), copy.deepcopy(rfp))
+            soma["class"] = "neuron_GFP_RFP"
+            soma["source_tracks"] = [("GFP", gfp), ("RFP", rfp)]
+            return soma
+
+        union = merged()
+        annotate_soma_with_tf_containment([union], [sox9], source_channel="Sox9")
+        self.assertEqual(union["class"], "neuron_GFP_RFP_Sox9")
+
+        strict = merged()
+        for channel, tf in (("Sox9", sox9), ("Olig2", olig2)):
+            annotate_soma_with_tf_containment(
+                [strict], [tf], source_channel=channel, soma_channels={"GFP", "RFP"})
+        self.assertEqual(strict["class"], "neuron_GFP_Olig2_RFP")
+        self.assertEqual([ch for ch, _ in strict["source_tracks"]],
+                         ["GFP", "RFP", "Olig2"])
+        gates = json.loads(strict["match_evidence"][0]["tf_gates"])
+        self.assertEqual([g["soma_channel"] for g in gates], ["GFP", "RFP"])
+        self.assertEqual(gates[0]["soma_track_id"], "gfp-track")
+
+    def test_all_rule_without_soma_sources_uses_own_box(self):
+        soma = volume("neuron_GFP", 20, 15, 10, (0, 0, 40, 30), {10: (0, 0, 40, 30)})
+        soma["source_tracks"] = [("Olig2", {})]   # no soma-channel track saved
+        sox9 = volume("nucleus_Sox9", 22, 15, 10, (20, 13, 24, 17), {10: (20, 13, 24, 17)})
+        annotate_soma_with_tf_containment(
+            [soma], [sox9], z_pad=0, source_channel="Sox9", soma_channels={"GFP"})
+        self.assertEqual(soma["class"], "neuron_GFP_Sox9")
+
     def test_tf_on_center_distance_boundary_still_matches(self):
         # radius = hypot(40, 30) / 2 = 25, gate = 0.4 * 25 = 10; the TF sits at exactly 10px,
         # so the search radius (derived from the gate) must not drop it.

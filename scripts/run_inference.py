@@ -1214,6 +1214,13 @@ if __name__ == '__main__':
         xy_margin          = zl_tf.get('containment_xy_margin', 0)
         z_pad_tf           = zl_tf.get('containment_z_pad', 2)
         max_center_dist    = zl_tf.get('max_center_dist_ratio', 0.5)
+        # 'all': a merged soma takes a TF only if the TF passes containment against the
+        # original box of every soma channel in it; 'union': gate on the merged union box.
+        soma_channel_rule  = zl_tf.get('soma_channel_rule', 'all')
+        if soma_channel_rule not in ('all', 'union'):
+            raise ValueError(f"z_linker.tf.soma_channel_rule must be 'all' or 'union', "
+                             f"got {soma_channel_rule!r}")
+        tf_gate_channels   = set(soma_ch_ids) if soma_channel_rule == 'all' else None
         tf_bbox_max_w = zl_tf.get('bbox_max_w', None)
         tf_bbox_max_h = zl_tf.get('bbox_max_h', None)
         for cid in tf_ch_ids:
@@ -1242,7 +1249,8 @@ if __name__ == '__main__':
             if tf_vols and merged_soma_vols:
                 merged_soma_vols = annotate_soma_with_tf_containment(
                     merged_soma_vols, tf_vols, z_pad=z_pad_tf, xy_margin=xy_margin,
-                    max_center_dist_ratio=max_center_dist, source_channel=cid
+                    max_center_dist_ratio=max_center_dist, source_channel=cid,
+                    soma_channels=tf_gate_channels
                 )
                 logging.info(f"✔️ [3B] [{cid}] TF containment 标注完成")
         matched_tf_objects = {

@@ -184,7 +184,7 @@ MATCH_COLUMNS = (
     "coloc_id", "match_type", "channel", "track_id",
     "iou", "iomin", "iou_threshold", "iomin_threshold",
     "center_distance", "center_distance_ratio",
-    "center_distance_ratio_max", "xy_margin", "z_pad",
+    "center_distance_ratio_max", "xy_margin", "z_pad", "tf_gates",
 )
 
 

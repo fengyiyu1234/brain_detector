@@ -1595,3 +1595,14 @@ post-alignment 流程已不再使用，可视化只保留 `prealign` 和 `2d` �
 - **修改**：`suppress_cross_class_overlap` / `suppress_cross_class_per_channel` 新参数 `contain_thresh`（None = 关）：neuron 体积 ≤ glia 且 IoMin ≥ 阈值时也删 neuron；反过来（大 neuron 包小 glia）不删。decision 行 `reason = inside_glia`，metric 为 IoMin。`run_inference.py` 读 `z_linker.soma.cross_class_contain_thresh`（默认 0.8），Phase A 前后两次去重都用。
 - `run_inference.py`、`stitcher.py` 改了：下次运行所有样本重跑 Stage 4（colocalization）。
 - 测试：`test_cross_class_per_channel` 新增 2 项（本例被删；大 neuron 包小 glia 保留），共 5 项通过；`test_checkpoint_code_lists`、`test_detection_filter` 通过。
+
+## 2026-11-08 TF 共定位改为逐 soma 通道判定（soma_channel_rule = all）
+
+现象：GFP+RFP 细胞（seam 338600_388500+338600_399800，z419–423，`coloc:be92311d…`）被标成 Sox9+，但细胞本身不表达 Sox9。
+
+- **原因**：Phase A 合并后 soma 框取 GFP/RFP 的并集。这里 RFP 框（score 0.32，74×70 px）是 GFP 框（38×38 px）的两倍，并集就等于 RFP 框。旁边的 Sox9 核（多半是贴着神经元的星形胶质细胞）在 RFP 框内，中心距 17.3 px，上限 25.5 px，能通过。用 GFP 框判的话两条都不过：Sox9 下沿超出 GFP 框 4 px，中心距 20.5 px，上限 13.5 px。
+- **修改**：`annotate_soma_with_tf_containment` 新参数 `soma_channels`。给出时，合并细胞里每个 soma 通道在 `source_tracks` 中的原始框各算一个 gate（包含 + 中心距），TF 要通过全部 gate 才归给这个细胞。多个细胞都接受同一个 TF 时，最远 gate 距离最小的胜出。没有 soma 通道 track 的细胞回退用自身框。单通道细胞的结果和以前一样。
+- 配置：`z_linker.tf.soma_channel_rule`，可选 `all`（默认）或 `union`（旧行为），写其他值报错。
+- `match_evidence.csv` 新增 `tf_gates` 列（JSON，列出每个 soma 通道的中心距和比值）。`center_distance*` 两列改记比值最大的那个 gate。
+- `run_inference.py`、`stitcher.py`、`coloc_sources.py` 改了：所有样本下次运行会重跑 Stage 4。Sox9+/Olig2+ 的计数预计会下降（只影响多通道 soma）。
+- 测试：`test_coloc_sources` 新增 2 项（本例在 all 下不再是 Sox9+、union 下仍是；Olig2 在中心仍匹配；无 soma 通道 source 时回退），共 9 项通过；`test_checkpoint_code_lists` 通过。其余测试文件逐个跑通过；`test_qc_alignment`、`test_tile_2d_sources` 在本机原生崩溃，原代码上也一样（与本次无关）。
