@@ -23,7 +23,7 @@ from src.utils.saved_view import (
     s4_source_tracks, stage3_geometry, track_for_summary,
 )
 from src.utils.visualize import (
-    _canvas_shape_from_tile, _ch_vis, _list_tiffs, _make_fn_recorder,
+    _add_contrast_panel, _canvas_shape_from_tile, _ch_vis, _list_tiffs, _make_fn_recorder,
     _resolve_z_range, _show_only_images_initially, load_frame_volume,
 )
 
@@ -114,8 +114,10 @@ def _add_s4_layers(viewer, rows, registry, width=4):
 
 def _add_images(viewer, vis_cfg, paths, routing, anchor_dir, tile_path,
                 tile_name, z_range, offsets, origin, global_view):
+    """Add channel image layers; return [(label, layer)] for the contrast panel."""
+    image_layers = []
     if vis_cfg.get("no_images", False):
-        return
+        return image_layers
     pct = tuple(vis_cfg.get("contrast_pct", [0.1, 99.9]))
     for ch in routing:
         cid = ch["id"]
@@ -135,6 +137,7 @@ def _add_images(viewer, vis_cfg, paths, routing, anchor_dir, tile_path,
             vol, name=label, translate=origin,
             contrast_limits=limits, **_ch_vis(cid))
         layer.contrast_limits_range = (0, 65535)
+        image_layers.append((f"{tile_name} {cid}" if global_view else cid, layer))
         if ch.get("double_exposure"):
             second = ch["second_intensity_id"]
             second_dir = resolve_tile_dir(
@@ -149,12 +152,16 @@ def _add_images(viewer, vis_cfg, paths, routing, anchor_dir, tile_path,
                         not np.isfinite(second_limits).all() or
                         second_limits[1] <= second_limits[0]):
                     second_limits = (0, 65535)
-                viewer.add_image(
+                second_layer = viewer.add_image(
                     second_vol,
                     name=(f"[img] {tile_name} {second}" if global_view
                           else f"[img] {second}"),
                     translate=origin, contrast_limits=second_limits,
                     visible=False, **_ch_vis(cid))
+                second_layer.contrast_limits_range = (0, 65535)
+                image_layers.append(
+                    (f"{tile_name} {second}" if global_view else second, second_layer))
+    return image_layers
 
 
 def _add_tile_2d(viewer, result_dir, tile_name, routing, offsets,
@@ -467,6 +474,7 @@ def _attach_clicks(viewer, registry, result_dir, context, tile_contexts,
     """Inspect saved rows and print complete Stage 3 coordinates on click."""
     track_cache = {}
     fn_recorders = {}
+    clicks = [0]
     if not global_view:
         for tile_name, (tile_path, z_range, offsets, _) in tile_contexts.items():
             fn_recorders[tile_name] = _make_fn_recorder(
@@ -510,9 +518,16 @@ def _attach_clicks(viewer, registry, result_dir, context, tile_contexts,
             (r["world_x2"] - r["world_x1"]) *
             (r["world_y2"] - r["world_y1"])))
         label = row["layer_name"]
+        clicks[0] += 1
+        print(f"\n{'=' * 26} CELL COORDINATE OUTPUT #{clicks[0]}  "
+              f"(clicked z={z}, x={x:.0f}, y={y:.0f}) {'=' * 26}", flush=True)
+        def num(key, fmt):
+            try:
+                return format(float(row.get(key, "nan")), fmt)
+            except (TypeError, ValueError):
+                return str(row.get(key))
         v.status = (f"{label} {row['class']} z={row['z']} "
-                    f"score={row.get('score', float('nan')):.3f} "
-                    f"mean={row.get('mean', float('nan')):.1f}")
+                    f"score={num('score', '.3f')} mean={num('mean', '.1f')}")
         print(f"[saved row] {label}: {row}")
         if row["source"] != "6_3d_global":
             if is_shift and row["source"] == "s4":
@@ -616,8 +631,10 @@ def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles, progres
             pos = context.position(tile_name) if context else None
             viewer = napari.Viewer(title=f"Saved pre-align local — {tile_name}")
             registry = []
-            _add_images(viewer, vis_cfg, paths, routing, anchor_dir, tile_path,
-                        tile_name, z_range, offsets, (z_range[0], 0, 0), False)
+            image_layers = _add_images(
+                viewer, vis_cfg, paths, routing, anchor_dir, tile_path,
+                tile_name, z_range, offsets, (z_range[0], 0, 0), False)
+            _add_contrast_panel(viewer, image_layers)
             _add_tile_2d(viewer, result_dir, tile_name, routing, offsets,
                          z_range, pos, False, registry, width, vis_cfg)
             if pos is not None:
@@ -652,7 +669,7 @@ def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles, progres
     count = int(vis_cfg.get("z_count") or (first_range[1] - first_range[0]))
     global_range = (global_z0, global_z0 + count)
     viewer = napari.Viewer(title=f"Saved pre-align global — {context.frame_channel}")
-    registry, tile_contexts, bounds_list = [], {}, []
+    registry, tile_contexts, bounds_list, image_layers = [], {}, [], []
     for tile_index, (tile_path, tile_name) in enumerate(selected_tiles, 1):
         pos = context.position(tile_name)
         offsets = context.offsets_for_tile(tile_name)
@@ -660,11 +677,13 @@ def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles, progres
         bounds = _tile_bounds(tile_path, local_range, pos)
         tile_contexts[tile_name] = (tile_path, local_range, offsets, pos)
         bounds_list.append(bounds)
-        _add_images(viewer, vis_cfg, paths, routing, anchor_dir, tile_path,
-                    tile_name, local_range, offsets,
-                    (global_range[0], pos.y, pos.x), True)
+        image_layers += _add_images(
+            viewer, vis_cfg, paths, routing, anchor_dir, tile_path,
+            tile_name, local_range, offsets,
+            (global_range[0], pos.y, pos.x), True)
         if progress:
             progress(tile_index, len(selected_tiles), tile_name)
+    _add_contrast_panel(viewer, image_layers)
     # Keep every tile's image layers together in Napari's layer list.
     for tile_name, (_, local_range, offsets, pos) in tile_contexts.items():
         _add_tile_2d(viewer, result_dir, tile_name, routing, offsets,
