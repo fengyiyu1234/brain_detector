@@ -91,7 +91,7 @@ class AutomaticResumeTests(unittest.TestCase):
             params={'min_z_layers':1,'iou_thresh':.3,'max_cell_z_span':5,'max_z_gap':0}
             def run():
                 return stitch_and_link_channel({'id':'GFP','type':'soma'},str(source),str(glob),str(tracks),geom,params)
-            with patch('src.core.channel_stage3.run_z_linker',side_effect=RuntimeError('interrupted')):
+            with patch('src.core.channel_stage3.link_tracks',side_effect=RuntimeError('interrupted')):
                 with self.assertRaisesRegex(RuntimeError,'interrupted'):run()
             self.assertTrue((glob/'GFP_global_manifest.json').is_file())
             with patch('src.core.channel_stage3._stitch_channel',side_effect=AssertionError('restitch')):
@@ -100,14 +100,14 @@ class AutomaticResumeTests(unittest.TestCase):
                 run()
                 # A timestamp-only touch must not invalidate either stage.
                 os.utime(source/'tile_GFP_result.csv',None)
-                with patch('src.core.channel_stage3.run_z_linker',side_effect=AssertionError('relink')):
+                with patch('src.core.channel_stage3.link_tracks',side_effect=AssertionError('relink')):
                     run()
             self.assertEqual(len(pd.read_csv(tracks/'GFP_3d_tracked.csv')),1)
             # Adopt a complete old combined checkpoint without recomputing either stage.
             (glob/'GFP_global_manifest.json').unlink()
             (tracks/'GFP_tracks_manifest.json').unlink()
             with patch('src.core.channel_stage3._stitch_channel',side_effect=AssertionError('restitch')), \
-                 patch('src.core.channel_stage3.run_z_linker',side_effect=AssertionError('relink')):
+                 patch('src.core.channel_stage3.link_tracks',side_effect=AssertionError('relink')):
                 run()
 
     def test_relocated_manifest_validates_current_files(self):

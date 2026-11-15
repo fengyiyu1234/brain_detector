@@ -71,6 +71,9 @@ class SavedPrealignTests(unittest.TestCase):
         video_panel = patch('src.utils.saved_gui.add_video_export_panel')
         video_panel.start()
         self.addCleanup(video_panel.stop)
+        contrast_panel = patch('src.utils.saved_gui._add_contrast_panel')
+        self.contrast_panel = contrast_panel.start()
+        self.addCleanup(contrast_panel.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
@@ -366,6 +369,9 @@ class SavedPrealignTests(unittest.TestCase):
         viewer.layers.selection.active = next(
             l for l in viewer.layers if l.name == "[img] RFP")
         self.assertEqual(_active_image_channel(viewer), "RFP")
+        panel_viewer, panel_layers = self.contrast_panel.call_args.args
+        self.assertIs(panel_viewer, viewer)
+        self.assertIn("RFP", [cid for cid, _ in panel_layers])
 
     def test_global_image_uses_saved_shift_and_xml_position(self):
         image_dir = self.images / "RFP" / "row" / self.tile
@@ -387,6 +393,8 @@ class SavedPrealignTests(unittest.TestCase):
         self.assertEqual(tuple(rfp.translate), (-2, 30, 20))
         self.assertEqual(rfp.data[3, 3, 2], 77)
         self.assertEqual(rfp.data[2, 3, 2], 0)
+        _, panel_layers = self.contrast_panel.call_args.args
+        self.assertIn((f"{self.tile} RFP", rfp), panel_layers)
 
     def test_second_exposure_saved_2d_is_available(self):
         second = "RFP2"

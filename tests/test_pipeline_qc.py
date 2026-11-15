@@ -101,6 +101,28 @@ class PipelineQCTest(unittest.TestCase):
             self.assertIn("track_member_integrity",{f["code"] for f in report["findings"]})
             self.assertIn("detection_partition",{f["code"] for f in report["findings"]})
 
+    def test_boxes_dropped_before_linking_are_accounted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);fixture(root)
+            tracks=root/"6_3d_global"
+            def rewrite(path, change, keep=lambda r: True):
+                with path.open(newline="", encoding="utf-8") as f:
+                    reader=csv.DictReader(f);fields=reader.fieldnames
+                    rows=[{**r,**change} for r in reader if keep(r)]
+                table(path,rows,fields)
+            # d2 never joined t1: Stage 3 dropped it as a cross-tile duplicate before linking
+            rewrite(tracks/"SomaX_3d_tracked.csv",{"member_count":1,"z_max":1})
+            rewrite(tracks/"SomaX_track_members.csv",{},lambda r: r["detection_id"]!="d2")
+            coloc=root/"7_colocalization"
+            rewrite(coloc/"coloc_source_3d.csv",{"member_count":1})
+            rewrite(coloc/"coloc_source_boxes.csv",{},lambda r: r["detection_id"]!="d2")
+            report=self.run_qc(root)
+            self.assertIn("detection_partition",{f["code"] for f in report["findings"]})
+            table(tracks/"SomaX_link_dedup.csv",[{"detection_id":"d2","kept_detection_id":"d1"}],
+                  ["detection_id","kept_detection_id"])
+            report=self.run_qc(root)
+            self.assertNotIn("detection_partition",{f["code"] for f in report["findings"]})
+
     def test_input_failure_and_frame_offset(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);fixture(root)

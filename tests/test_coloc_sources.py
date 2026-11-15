@@ -11,7 +11,8 @@ from src.core.coloc_sources import (cell_id, coloc_display_box, colocalization_s
                                     primary_source_trace, source_3d_json,
                                     write_source_3d, write_source_boxes)
 from src.core.stitcher import (annotate_soma_with_tf_containment,
-                               match_soma_3d_iou, merge_soma_volumes_union)
+                               match_soma_3d_iou, merge_soma_volumes_union,
+                               tf_nucleus_groups, tf_nucleus_z_ranges)
 
 
 def volume(cls, cx, cy, z, box, per_z):
@@ -39,7 +40,7 @@ class ColocSourcesTest(unittest.TestCase):
         soma["source_tracks"] = [("GFP", gfp), ("RFP", rfp)]
 
         annotate_soma_with_tf_containment(
-            [soma], [sox9, distant], z_pad=1, source_channel="Sox9")
+            [soma], [sox9, distant], source_channel="Sox9")
         self.assertEqual(soma["class"], "neuron_GFP_RFP_Sox9")
         self.assertEqual([ch for ch, _ in soma["source_tracks"]],
                          ["GFP", "RFP", "Sox9"])
@@ -110,7 +111,7 @@ class ColocSourcesTest(unittest.TestCase):
             candidate = copy.deepcopy(soma)
             for channel, tf in (first, second):
                 annotate_soma_with_tf_containment(
-                    [candidate], [tf], z_pad=0, max_center_dist_ratio=0.6,
+                    [candidate], [tf], max_center_dist_ratio=0.6,
                     source_channel=channel)
             status = colocalization_status(
                 candidate, ['GFP', 'RFP'], ['Sox9', 'Olig2'])
@@ -178,16 +179,71 @@ class ColocSourcesTest(unittest.TestCase):
         soma["source_tracks"] = [("GFP", gfp), ("RFP", rfp)]
         self.assertEqual((soma["z_min"], soma["z_max"]), (425, 428))
         annotate_soma_with_tf_containment(
-            [soma], [sox9], z_pad=1, max_center_dist_ratio=0.35,
+            [soma], [sox9], max_center_dist_ratio=0.35,
             source_channel="Sox9", soma_channels={"GFP", "RFP"})
         self.assertEqual(soma["class"], "glia_GFP_RFP_Sox9")
+
+    def test_tf_z_uses_representative_layer_inside_soma_range(self):
+        # Real case (tile 327300_388500): GFP seen on z409 only; Olig2 spans z408-410
+        # with its median layer at 409, centred in the GFP box. The TF's full z range
+        # may extend past the soma; at least half of its layers must lie inside.
+        def gfp():
+            return volume("neuron_GFP", 5834.92, 8475.78, 409,
+                          (5817.50, 8458.52, 5852.34, 8493.04), {409: (0, 0, 1, 1)})
+        olig2 = volume("nucleus_Olig2", 5833.0, 8477.0, 409,
+                       (5824.0, 8468.0, 5842.0, 8486.0), {409: (0, 0, 1, 1)})
+        olig2["z_min"], olig2["z_max"] = 408, 410
+        soma = gfp()
+        annotate_soma_with_tf_containment([soma], [olig2], source_channel="Olig2")
+        self.assertEqual(soma["class"], "neuron_GFP_Olig2")
+
+        # Same xy; only the TF's layer range changes. Accepted when at least half of its
+        # layers overlap the soma's z409. [408, 409] has cz 408 (int median) but must
+        # still match: its exact midpoint 408.5 is used, not the truncated cz.
+        for z_min, z_max, matched in ((408, 409, True), (409, 410, True),
+                                      (409, 411, False), (407, 409, False),
+                                      (407, 408, False)):
+            tf = dict(olig2, cz=float(int((z_min + z_max) / 2)), z_min=z_min, z_max=z_max)
+            soma = gfp()
+            annotate_soma_with_tf_containment([soma], [tf], source_channel="Olig2")
+            self.assertEqual(soma["class"] == "neuron_GFP_Olig2", matched, (z_min, z_max))
+
+    def test_nucleus_partner_carries_a_tf_into_the_soma_z_range(self):
+        # Soma on z401-402. Olig2 seen on z403 only: its own midpoint fails. Its Sox9 on
+        # z402-404 shares z403 with an IoMin 1.0 box; the nucleus midpoints span 403, so
+        # the merged range [403, 403] still fails; a Sox9 on z401-403 (midpoint 402)
+        # brings the nucleus to [402, 403] and both TFs pass.
+        def soma():
+            return volume("neuron_GFP", 20, 20, 401, (0, 0, 40, 40),
+                          {401: (0, 0, 40, 40), 402: (0, 0, 40, 40)})
+        olig2 = volume("nucleus_Olig2", 20, 20, 403, (15, 15, 25, 25), {403: (15, 15, 25, 25)})
+        far = volume("nucleus_Olig2", 300, 300, 403, (295, 295, 305, 305),
+                     {403: (295, 295, 305, 305)})
+        for sox_layers, passes in (((402, 403, 404), False), ((401, 402, 403), True)):
+            sox9 = volume("nucleus_Sox9", 20, 20, 402, (14, 14, 26, 26),
+                          {z: (14, 14, 26, 26) for z in sox_layers})
+            tfs = {"Sox9": [sox9], "Olig2": [far, olig2]}
+            groups, pairs = tf_nucleus_groups(tfs, 0.7)
+            self.assertEqual([(a, i, b, j) for a, i, b, j, _ in pairs], [("Sox9", 0, "Olig2", 1)])
+            ranges = tf_nucleus_z_ranges(tfs, groups)
+            olig2_ranges = [ranges.get(("Olig2", i)) for i in range(2)]
+            self.assertIsNone(olig2_ranges[0])
+            cell = soma()
+            annotate_soma_with_tf_containment([cell], [far, olig2], source_channel="Olig2",
+                                              tf_z_ranges=olig2_ranges)
+            self.assertEqual("Olig2" in cell["class"], passes, sox_layers)
+        cell = soma()   # without the nucleus ranges the Olig2 alone fails
+        annotate_soma_with_tf_containment([cell], [olig2], source_channel="Olig2")
+        self.assertEqual(cell["class"], "neuron_GFP")
+        with self.assertRaises(ValueError):
+            annotate_soma_with_tf_containment([soma()], [olig2], tf_z_ranges=[])
 
     def test_all_rule_without_soma_sources_uses_own_box(self):
         soma = volume("neuron_GFP", 20, 15, 10, (0, 0, 40, 30), {10: (0, 0, 40, 30)})
         soma["source_tracks"] = [("Olig2", {})]   # no soma-channel track saved
         sox9 = volume("nucleus_Sox9", 22, 15, 10, (20, 13, 24, 17), {10: (20, 13, 24, 17)})
         annotate_soma_with_tf_containment(
-            [soma], [sox9], z_pad=0, source_channel="Sox9", soma_channels={"GFP"})
+            [soma], [sox9], source_channel="Sox9", soma_channels={"GFP"})
         self.assertEqual(soma["class"], "neuron_GFP_Sox9")
 
     def test_tf_on_center_distance_boundary_still_matches(self):
@@ -196,7 +252,7 @@ class ColocSourcesTest(unittest.TestCase):
         soma = volume("neuron_GFP", 20, 15, 10, (0, 0, 40, 30), {10: (0, 0, 40, 30)})
         sox9 = volume("nucleus_Sox9", 30, 15, 10, (28, 13, 32, 17), {10: (28, 13, 32, 17)})
         annotate_soma_with_tf_containment(
-            [soma], [sox9], z_pad=0, max_center_dist_ratio=0.4, source_channel="Sox9")
+            [soma], [sox9], max_center_dist_ratio=0.4, source_channel="Sox9")
         self.assertEqual(soma["class"], "neuron_GFP_Sox9")
         self.assertEqual(soma["match_evidence"][0]["center_distance"], 10.0)
 
