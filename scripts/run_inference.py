@@ -58,7 +58,9 @@ from src.core.seam_offsets import resolve_params as resolve_seam_params, run_sea
 from src.core.stitcher import (match_soma_3d_iou, merge_soma_volumes_union, soma_match_metrics,
                                annotate_soma_with_tf_containment,
                                _merge_class, suppress_cross_class_overlap,
-                               suppress_cross_class_per_channel)
+                               suppress_cross_class_per_channel,
+                               tf_nucleus_groups, tf_nucleus_z_ranges)
+from src.core.z_linker import stage3_link_params
 from src.core.point_cloud_aligner import (
     align_tile, tile_alignment_done,
     resolve_align_settings, check_align_settings, save_align_settings,
@@ -1075,16 +1077,7 @@ if __name__ == '__main__':
     zl      = config.get('z_linker', {})
     zl_soma = zl.get('soma', {})
     zl_tf   = zl.get('tf', {})
-    zl_params = {
-        'soma': dict(iou_thresh=zl_soma.get('iou_thresh', 0.35),
-                     min_z_layers=zl_soma.get('min_z_layers', 1),
-                     max_cell_z_span=zl_soma.get('max_cell_z_span', 5),
-                     max_z_gap=zl_soma.get('max_z_gap', 0)),
-        'tf':   dict(iou_thresh=zl_tf.get('iou_thresh', 0.25),
-                     min_z_layers=zl_tf.get('min_z_layers', 1),
-                     max_cell_z_span=zl_tf.get('max_cell_z_span', 3),
-                     max_z_gap=zl_tf.get('max_z_gap', 0)),
-    }
+    zl_params = stage3_link_params(zl)   # defaults: z_linker.STAGE3_LINK_DEFAULTS
     geom = {'dir_dict': dir_dict, 'disp_mat_fin': disp_mat_fin, 'z_start': z_start, 'Z': Z,
             'H': H, 'W': W, 'tile_size': tile_size, 'num_tiles': num_tiles,
             'xml_source': pATHxml}
@@ -1212,7 +1205,6 @@ if __name__ == '__main__':
 
         # Phase B: annotate soma with TF boxes fully contained by soma boxes.
         xy_margin          = zl_tf.get('containment_xy_margin', 0)
-        z_pad_tf           = zl_tf.get('containment_z_pad', 2)
         max_center_dist    = zl_tf.get('max_center_dist_ratio', 0.5)
         # 'all': a merged soma takes a TF only if the TF passes containment against the
         # original box of every soma channel in it; 'union': gate on the merged union box.
@@ -1223,6 +1215,10 @@ if __name__ == '__main__':
         tf_gate_channels   = set(soma_ch_ids) if soma_channel_rule == 'all' else None
         tf_bbox_max_w = zl_tf.get('bbox_max_w', None)
         tf_bbox_max_h = zl_tf.get('bbox_max_h', None)
+        # TF tracks of different channels on one nucleus (same layer, 2D IoMin >= this,
+        # one-to-one) pass the z test together; null = each TF on its own midpoint.
+        nucleus_iomin = zl_tf.get('nucleus_iomin', 0.7)
+        tf_kept_by_ch = {}
         for cid in tf_ch_ids:
             tf_vols = tf_vol_by_ch.get(cid, [])
             if (tf_bbox_max_w is not None or tf_bbox_max_h is not None) and tf_vols:
@@ -1246,11 +1242,27 @@ if __name__ == '__main__':
                         })
                 logging.info(f"  [{cid}] TF size filter: {n_before} → {len(tf_vols)} "
                              f"(bbox_max_w={tf_bbox_max_w}, bbox_max_h={tf_bbox_max_h})")
+            tf_kept_by_ch[cid] = tf_vols
+        nucleus_z = {}
+        if nucleus_iomin is not None:
+            nucleus_list, nucleus_pairs = tf_nucleus_groups(tf_kept_by_ch, nucleus_iomin)
+            nucleus_z = tf_nucleus_z_ranges(tf_kept_by_ch, nucleus_list)
+            decision_rows.extend({
+                'stage': 'tf_nucleus', 'channel': ch_a,
+                'track_id': tf_kept_by_ch[ch_a][i].get('track_id', ''),
+                'other_track_id': tf_kept_by_ch[ch_b][j].get('track_id', ''),
+                'decision': 'same_nucleus', 'reason': f'paired_with_{ch_b}',
+                'metric': iomin, 'threshold': nucleus_iomin,
+            } for ch_a, i, ch_b, j, iomin in nucleus_pairs)
+            logging.info(f"✔️ [3B] TF 同一细胞核: {len(nucleus_list)} 组（z 判定共用）")
+        for cid in tf_ch_ids:
+            tf_vols = tf_kept_by_ch[cid]
             if tf_vols and merged_soma_vols:
                 merged_soma_vols = annotate_soma_with_tf_containment(
-                    merged_soma_vols, tf_vols, z_pad=z_pad_tf, xy_margin=xy_margin,
+                    merged_soma_vols, tf_vols, xy_margin=xy_margin,
                     max_center_dist_ratio=max_center_dist, source_channel=cid,
-                    soma_channels=tf_gate_channels
+                    soma_channels=tf_gate_channels,
+                    tf_z_ranges=[nucleus_z.get((cid, i)) for i in range(len(tf_vols))],
                 )
                 logging.info(f"✔️ [3B] [{cid}] TF containment 标注完成")
         matched_tf_objects = {

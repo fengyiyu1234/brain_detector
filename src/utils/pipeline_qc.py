@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from src.config.loader import load_config, expand_double_exposure_channels
+from src.core.z_linker import stage3_link_params
 
 BOX = {"x1", "y1", "x2", "y2", "z", "score", "mean", "class"}
 STAGES = ("detection", "filtering", "alignment", "geometry", "global", "tracks", "coloc", "exports")
@@ -114,6 +115,7 @@ class PipelineQC:
         self.result = mapped_path(sample["result_dir"], self.maps)
         runtime = mapped_path(sample.get("runtime_config", self.result / "runtime_config.json"), self.maps)
         self.config = load_config(runtime)
+        self.link_params = stage3_link_params(self.config.get("z_linker"))   # as Stage 3 ran
         self.inputs, self.findings, self.files, self.tile_rows, self.z_rows, self.review = [], [], [], [], [], []
         self.routing = [c for c in self.config["channels_routing"] if c.get("active", True)]
         self.channels = {c["id"]: c for c in self.routing}
@@ -204,13 +206,12 @@ class PipelineQC:
                 if track:
                     n, lo, hi = (integer(r[k]) for k in ("member_count", "z_min", "z_max"))
                     values.update(n=n, lo=lo, hi=hi)
-                    kind = self.channels[channel].get("type", "soma")
-                    params = self.config.get("z_linker", {}).get(kind, {})
-                    cap = params.get("max_cell_z_span", 5 if kind == "soma" else 3)
+                    params = self.link_params["tf" if self.channels[channel].get("type") == "tf" else "soma"]
+                    cap = params["max_cell_z_span"]
                     counts["single_layer"] += n == 1
                     counts["at_span_cap"] += hi-lo+1 == cap
                     histogram[n] += 1
-                    if n < params.get("min_z_layers", 1) or n > hi-lo+1 or hi-lo+1 > cap or not lo <= z <= hi:
+                    if n < params["min_z_layers"] or n > hi-lo+1 or hi-lo+1 > cap or not lo <= z <= hi:
                         counts["invalid_track_extent"] += 1
                 if scope:
                     self.insert(scope, identity, stage, path, **values)
@@ -493,6 +494,10 @@ class PipelineQC:
                     raise ValueError("member_detection_ids must be a JSON array")
                 for identity in ids:
                     self.insert("rejected_members:" + cid, identity, "tracks", directory)
+            dedup = directory / f"{cid}_link_dedup.csv"   # boxes dropped before linking
+            if dedup.is_file():
+                for r in self.rows(dedup, {"detection_id"}, "tracks"):
+                    self.insert("rejected_members:" + cid, r["detection_id"], "tracks", directory)
             if self.deep:
                 tracks, members, global_scope = "tracks:" + cid, "members:" + cid, "global:" + cid
                 bad = self.count("""SELECT COUNT(*) FROM ids m WHERE scope=? AND NOT EXISTS
@@ -500,8 +505,7 @@ class PipelineQC:
                 mismatch = self.count("""SELECT COUNT(*) FROM ids t LEFT JOIN
                     (SELECT parent,COUNT(*) n,COUNT(DISTINCT z) nz,MIN(z) lo,MAX(z) hi FROM ids WHERE scope=? GROUP BY parent) m
                     ON t.id=m.parent WHERE t.scope=? AND (m.n IS NULL OR t.n!=m.n OR m.n!=m.nz OR t.lo!=m.lo OR t.hi!=m.hi)""", (members, tracks))
-                kind = self.channels[cid].get("type", "soma")
-                gap = self.config.get("z_linker", {}).get(kind, {}).get("max_z_gap", 0)
+                gap = self.link_params["tf" if self.channels[cid].get("type") == "tf" else "soma"]["max_z_gap"]
                 bad_gaps = self.count("""SELECT COUNT(*) FROM
                     (SELECT z-LAG(z) OVER(PARTITION BY parent ORDER BY z)-1 gap FROM ids WHERE scope=?) WHERE gap>?""", (members,gap))
                 if bad_gaps:

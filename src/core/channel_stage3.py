@@ -18,7 +18,7 @@ import pandas as pd
 from src.core import stitcher
 from src.core.stitcher import combine_predictions
 from src.core.seam_offsets import grid_names, load_offsets
-from src.core.z_linker import run_z_linker
+from src.core.z_linker import LINK_DEDUP_COLUMNS, link_tracks
 from src.utils.markers import channel_marker
 from src.core.provenance import (stable_id, file_stamp, file_sha256, source_sha256,
                                  output_manifest_valid, write_output_manifest, content_signature, manifest_outputs_valid)
@@ -198,6 +198,8 @@ def stitch_and_link_channel(ch, src_dir, global_2d_dir, channel_3d_dir, geom, zl
         os.path.join(channel_3d_dir, f"{ch_id}_3d_tracked.csv"),
         os.path.join(channel_3d_dir, f"{ch_id}_track_members.csv"),
         os.path.join(channel_3d_dir, f"{ch_id}_track_rejections.csv"),
+        # global 2D boxes dropped before linking (z_linker.dedup_cross_tile)
+        os.path.join(channel_3d_dir, f"{ch_id}_link_dedup.csv"),
     ]
     global_manifest = os.path.join(global_2d_dir, f'{ch_id}_global_manifest.json')
     track_manifest = os.path.join(channel_3d_dir, f'{ch_id}_tracks_manifest.json')
@@ -288,15 +290,22 @@ def stitch_and_link_channel(ch, src_dir, global_2d_dir, channel_3d_dir, geom, zl
     if not need_relink:
         logging.info(f"✔️ [{ch_id}] 已存在 3D 追踪结果，直接加载（跳过 Z-Linker）。")
     elif mat is not None:
-        rejected_tracks = []
-        summary, vol_list = run_z_linker(
-            mat, channel_id=ch_id, rejected_tracks=rejected_tracks, **zl_params)
+        rejected_tracks, dedup_rows = [], []
+        summary, vol_list = link_tracks(
+            mat, channel_id=ch_id, rejected_tracks=rejected_tracks, dedup_rows=dedup_rows,
+            **zl_params)
         rejected_path = os.path.join(channel_3d_dir, f"{ch_id}_track_rejections.csv")
         pd.DataFrame(rejected_tracks, columns=[
             'track_id', 'channel', 'decision', 'reason',
             'member_count', 'threshold', 'member_detection_ids',
         ]).to_csv(rejected_path + '.part', index=False)
         os.replace(rejected_path + '.part', rejected_path)
+        dedup_path = sidecars[4]
+        pd.DataFrame(dedup_rows, columns=LINK_DEDUP_COLUMNS).to_csv(
+            dedup_path + '.part', index=False)
+        os.replace(dedup_path + '.part', dedup_path)
+        if dedup_rows:
+            logging.info(f"✔️ [{ch_id}] 跨 tile 去重（连接前）: 去掉 {len(dedup_rows)} 个框 → {dedup_path}")
         out_3d = os.path.join(channel_3d_dir, f"{ch_id}_3d_tracked.csv")
         summary_df = pd.DataFrame(summary, columns=BOX_COLS)
         for field in ('track_id', 'best_detection_id', 'best_box_z',

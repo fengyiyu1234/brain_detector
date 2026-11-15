@@ -1623,3 +1623,300 @@ post-alignment 流程已不再使用，可视化只保留 `prealign` 和 `2d` �
 - 最初怀疑 GPU 是 Exclusive_Process 模式（双卡时每个 worker 的 TF 放在另一块卡上，每块卡有两个进程）。在 gpu18 上用 `srun` 查到 compute_mode 为 `Default`，排除了这个原因，为它加的 worker 改动已撤回。
 - 目前判断是 gpu18 的某块卡本身不可用（被占用或状态异常）。处理方式：提交时加 `--exclude=gpu18`。
 - `inference_tsc11.slurm` 的 GPU 检查改为同时输出 compute_mode，以后能直接从 .out 里看到。
+
+## 2026-11-09 TF 共定位 z 条件改为“TF 至少一半的层落在 soma z 范围内”（未提交，规则待定，见文末“交接”）
+
+现象：tile 327300_388500 的 GFP neuron（`track3d:9177120871d0…`，只在 z409 检出，score 0.247）和 Olig2 核（`track3d:ec7612ce5c0b…`，z408–410，xy 在 GFP 框中心）没有共定位。同一位置的 Sox9（`track3d:245491e904…`，z409）按 GFP 框算三项都能过，但也没挂上，原因未查（可能 GFP 在 Stage 4 被跨类 dedup 删了、和 RFP/GFP2 合并后过不了 all 规则，或者 Sox9 被别的 soma 抢走）。要查需要该样本（含 Olig2 通道）的 `7_colocalization/coloc_decisions.csv`、`coloc_source_3d.csv`，按这三个 track_id grep。
+
+- **原因**：旧规则要求 TF 的整个 z 范围都在 soma z 范围内，`containment_z_pad` 只能加在一侧。单层 soma 包不住上下各多一层的核。
+- **修改**（`stitcher.py`）：新增 `_tf_z_contained(t_zmin, t_zmax, s_zmin, s_zmax)`，规则是 `soma.z_min − 0.5 ≤ (tf.z_min + tf.z_max)/2 ≤ soma.z_max + 0.5`，即 TF 至少一半的层与 soma 重叠，不加 padding。`annotate_soma_with_tf_containment` 调用它，去掉了 `z_pad` 参数；xy 包含、中心距、all 规则都不变。
+  - 中间版本用过 `cz`（`int(median)`），偶数层 TF 会被向下取整（[408,409] → 408），导致本来能过的被拒，所以改用真实中点。
+  - TF 的 `max_cell_z_span=3`，所以新规则下 TF 最多在 soma 上下各多出 1 层。
+- `run_inference.py`：Stage 4 不再读取 `z_linker.tf.containment_z_pad`；`coloc_match_evidence.csv` 中 tf_containment 行的 `z_pad` 列为空。
+- **没改** `point_cloud_aligner._containment_score`（Stage 2.9 / 通道对齐用，在 `SOLVE_CODE` 里），它仍用 `containment_z_pad`。改了会让已有 tile 位置失效、流程停下。所以配置里的 `containment_z_pad` 不能删。
+- `stitcher.py`、`run_inference.py` 改了：所有样本下次运行会重跑 Stage 4。
+- 测试：`test_coloc_sources` 新增本例回归测试（[408,410]、[408,409]、[409,410] 匹配；[409,411]、[407,409]、[407,408] 不匹配），共 11 项通过；`test_checkpoint_code_lists`、`test_cross_class_per_channel` 通过。
+
+**新旧规则对比**：脚本 `src/utils/compare_tf_z_rule.py`（读已有的 `6_3d_global/*_3d_tracked.pkl`，按 `run_inference.py` 复现 Phase A，然后对每个 TF 通道分别用新、旧 z 规则跑 Phase B；旧规则通过替换 `stitcher._tf_z_contained` 实现）。在其他电脑上重跑：
+
+```
+cd Y:\Fengyi\brain_detector
+set PYTHONPATH=.
+<brain_detector env python> src/utils/compare_tf_z_rule.py --out W:/Fengyi/tf_z_rule_compare ^
+    Y:/Fengyi/TSC_brain/sample10/detection_results_20261107 ^
+    Y:/Fengyi/TSC_brain/sample8/detection_results_20261107
+```
+
+输出在 `W:\Fengyi\tf_z_rule_compare\`：`summary.csv`、`changed_tfs.csv`（每个变化的 TF 的 track_id、坐标、新旧 soma，可在 GUI 里定位）、`1_summary.png`、`2_z_patterns.png`、`3/4/5_examples_*.png`（XY + XZ 示意图）。需要 Sox9 pkl（各约 2 GB），本机内存够用。
+
+**对比结果（sample10 / sample8，Sox9，旧规则 `containment_z_pad=1`）**——新规则整体**更严**，不是更宽：
+
+| | sample10 | sample8 |
+|---|---|---|
+| 旧规则匹配的 TF | 94,958 | 98,746 |
+| 新规则匹配的 TF | 77,901 | 81,538 |
+| 只有新规则匹配（gained） | 2,323 | 1,982 |
+| 只有旧规则匹配（lost） | 19,380 | 19,190 |
+| 匹配到不同 soma | 911 | 841 |
+| Sox9 阳性 soma：旧 → 新 | 74,340 → 64,423（−13%） | 81,739 → 70,821（−13%） |
+
+- gained 共 4,305 个，全部是“TF 有 3 层，soma 只在中间那 1 层”（即 Olig2 这种情况）。
+- lost 共 38,570 个，全部是“TF 只有 1 层，与 soma 的 z 范围**完全不重叠**，紧挨在 soma 上一层（20,919）或下一层（17,651）”。旧规则的单侧 z_pad=1 放过了它们。这些 soma 的层数：1 层 21,831，2 层 9,935，3 层 4,076，4 层及以上 2,728；neuron 24,501，glia 14,069。
+- switched 中 1,545 个是“1 层 TF 与 soma 重叠，但被分给了别的 soma”（因为 lost 的那些不再参与竞争）。
+
+**交接（换电脑后从这里继续）**
+
+1. **待定（需要人决定）**：只有 1 层、在 soma 相邻层（相距 8 µm）、xy 和中心距都满足的核，算不算共定位？
+   - 算 → 规则改成“新规则 OR 旧规则”：`_tf_z_contained` 里返回新条件 `|` 旧的单侧 pad 条件（需要重新传入 `containment_z_pad`，即把 `run_inference.py` 和函数签名里的 z_pad 加回去）。效果：旧的全部保留，再加 4,305 个。
+   - 不算 → 保持现在的代码。
+   - 先看示例图再决定（第 2 步）。
+2. **出图还没完成**。`W:\Fengyi\tf_z_rule_compare\` 里只有第一次运行的 `summary.csv`、`changed_tfs.csv`，没有 `soma_gates` 列，所以示例图要完整重跑一次（约 8 分钟）：
+   ```
+   set MKL_THREADING_LAYER=SEQUENTIAL
+   set PYTHONPATH=.
+   <env python> src/utils/compare_tf_z_rule.py --out W:/Fengyi/tf_z_rule_compare ^
+       Y:/Fengyi/TSC_brain/sample10/detection_results_20261107 ^
+       Y:/Fengyi/TSC_brain/sample8/detection_results_20261107
+   ```
+   之后只改图的话用 `--out W:/Fengyi/tf_z_rule_compare --replot`，不用重新读 pkl。脚本在 F: 盘那台电脑上的首次运行，画图时崩了（`0xc06d007f`，numpy 默认 MKL 线程层下矩阵乘法崩溃）；设 `MKL_THREADING_LAYER=SEQUENTIAL` 就好了。别的电脑不一定需要。`compare_tf_z_rule.py` 出图后还没人看过效果，需要检查标签是否重叠。
+3. 决定后：更新 `test_coloc_sources` 中 `test_tf_z_uses_representative_layer_inside_soma_range` 的期望值，跑 `test_coloc_sources`、`test_checkpoint_code_lists`，再提交。目前的改动都**还没提交**（`stitcher.py`、`run_inference.py`、`tests/test_coloc_sources.py`、`src/utils/compare_tf_z_rule.py`、本日志）。工作区里原本就有的 `saved_gui.py` / `test_saved_pre_gui.py` 改动和本次无关。
+4. 原始问题里的 Sox9（`track3d:245491e904…`）为什么没挂上 GFP，还没查（见本条开头）。
+
+## 2026-11-09（续）TF z 规则对比：ET10 4 个 tile；GUI 可显示变化的 TF（未提交，规则仍待定）
+
+换到新电脑（conda env 在 `C:\ProgramData\miniconda3\envs\brain_detector`；旧电脑的 `W:\Fengyi` = 这台的 `X:\Fengyi`）。
+
+- **TSC 重跑出图**：sample10 / sample8 数字与上一条完全一致，图在 `X:\Fengyi\tf_z_rule_compare\`。
+- **ET10**（只有 ET10 用的是当前 pipeline）：tile 327300_388500、327300_377200、316000_388500、316000_377200，结果在 `X:\Fengyi\tf_z_rule_compare_ET10\`。
+
+  | | Sox9 | Olig2 |
+  |---|---|---|
+  | 旧 / 新规则匹配的 TF | 58,040 / 54,275 | 36,280 / 34,152 |
+  | gained / lost / switched | 2,070 / 5,835 / 494 | 1,802 / 3,930 / 286 |
+  | TF 阳性 soma 旧 → 新 | 47,406 → 46,183（−2.6%） | 31,465 → 30,635（−2.6%） |
+  | matched soma 为 neuron 的比例：lost / 新旧相同 / gained | 59% / 51% / 52% | 63% / 55% / 72% |
+
+  - 变化模式与 TSC 相同（gained = 3 层 TF 包住 1 层 soma；lost = 1 层 TF 紧贴 soma 上/下一层）。影响比 TSC（−13%）小得多。
+  - 原始 Olig2 例子（`track3d:ec7612ce5c0b…`）在新规则下匹配到 GFP+RFP soma（gained）。
+  - neuron 比例：新旧都匹配的 Sox9 也有一半是 neuron，所以这个比例不能用来判断 lost 是否错配。
+  - Sox9 `track3d:245491e904…`（交接第 4 条）：按现在的代码，新旧规则下都挂在 GFP `9177120871d0…` + RFP `e61e163353ab…` 这个细胞上（旧 GFP+RFP+Sox9 → 新 GFP+Olig2+RFP+Sox9）。之前看到没挂上，应是 ET10 已保存的 s4 用较早的代码跑的，不需要再查。
+- **`compare_tf_z_rule.py`**：
+  - 新增 `--tiles a,b,c`（逗号分隔；保留任一成员框在这些 tile 的 track）；
+  - TF 通道逐个载入；
+  - `summary.csv` 加 `{kind}_neuron`；
+  - `changed_tfs.csv` 加 `tf_best_detection_id`、`tf_best_box_z`，`soma_gates` 每项末尾加 best_detection_id、best_box_z；
+  - 修了 `1_summary.png` 标签重叠；
+  - 新增 `somas.csv`：每个 Phase A soma 一行，新旧规则下的 marker 组合（`old_combo`/`new_combo`）、挂上的 TF track（`old_tfs`/`new_tfs`）、各 soma 通道 track 的框和代表框（`gates`，GUI 定位用）。
+- **GUI 新模式 `zrule_compare`**（`saved_gui.run_saved_zrule_compare`；launcher Mode 下拉框，“Z-rule comparison” 填对比输出文件夹 → config `tf_rule_compare`；命令行 `--mode zrule_compare`）：
+  - 只显示原始图像和对比结果，tile-local。每个 marker 组合一层（与 s4 相同，neuron/glia 不分），层名带删除/保留/新增个数。
+  - 每个 soma 画成各 soma 通道 track 的 3D 并集框，画在其 z 范围的每一层：白 = 新旧组合相同（保留），黄 = 只有旧规则是这个组合（删除），蓝 = 只有新规则是（新增）。组合变化的 soma 同时出现在两层。
+  - 各 soma 通道 track 按 s3 层的方式（代表检测框 + seam offset）放回本 tile 坐标系。
+  - 不含 TF 的组合（GFP、RFP、GFP+RFP）默认隐藏，因为它们的变化只是 TF 层的镜像。
+  - 点框时状态栏显示状态、新旧组合、soma z 范围，终端打印 TF track id。
+  - ET10 tile 327300_388500（GUI 编号 [023]）离线检查：50,238 个 soma，GFP/RFP track 全部找到源检测，没有退回 XML 放置。
+  - 这次加在 prealign 模式里的 6 层 overlay 已删除，被这个模式取代。
+  - `test_saved_pre_gui`（17）、`test_saved_s3_tile_frame`（6）通过。不影响任何 checkpoint。
+- **下一步**：在 GUI 里看 lost 的例子，决定“新规则”还是“新 OR 旧”（见上一条交接第 1、3 条）。
+
+## 2026-11-11 TF z 规则对比：ET10 old vs nucleus（未提交，规则仍待定）
+
+- **补记（2026-11-09 17:15 的改动，当时没写日志）**：`compare_tf_z_rule.py` 新增 `--base`/`--cand`（`old` / `new` / `nucleus`）和 `--nucleus-iomin`（默认 0.7）。`nucleus` = new 规则 + 同层 2D IoMin ≥ 0.7、一一对应的不同通道 TF track 合并为同一个核；合并后任一 track 按 new 规则过 z 即整个核通过（例：Olig2 只有 1 层在 soma 旁，但配对的 Sox9 伸进 soma）。未合并的 TF 与 new 完全相同；xy 包含、中心距仍各用自己的框。只在对比脚本里，pipeline（`stitcher._tf_z_contained`）没改。
+  - 当时已跑 ET10 new vs nucleus：`X:\Fengyi\tf_z_rule_compare_ET10_nucleus\`。
+- **本次**：ET10 同 4 个 tile，`--base old --cand nucleus`，结果在 `X:\Fengyi\tf_z_rule_compare_ET10_old_vs_nucleus\`（约 8 分钟）。"old" 是在同一份 Stage 3 上用当前 Stage 4 代码按旧 z 规则重算，不是读已保存的 s4（那是更早的代码跑的）。
+
+  | | Sox9 | Olig2 |
+  |---|---|---|
+  | old / nucleus 匹配的 TF | 58,040 / 55,395 | 36,280 / 35,535 |
+  | gained / lost / switched | 2,840 / 5,485 / 552 | 2,821 / 3,566 / 301 |
+  | TF 阳性 soma old → nucleus | 47,406 → 46,991（−0.9%） | 31,465 → 31,624（+0.5%） |
+
+  - Sox9-Olig2 配对的核 368,180 个。
+  - 与 old vs new（−2.6% / −2.6%）相比，nucleus 补回了一部分：Sox9 lost 5,835 → 5,485，Olig2 lost 3,930 → 3,566，gained 都增加约 1,000。
+- **下一步**：GUI `zrule_compare` 模式填这个文件夹，看 lost（黄）的例子，决定用 new / nucleus / new OR old。
+
+## 2026-11-11（续）残片 soma 的来源；测试脚本 relink_soma_test.py（未提交，pipeline 未改）
+
+- **现象**（GUI 例子，ET10 全局约 x 5176, y 6970, z 426–431）：一个 GFP+RFP 细胞在 Phase A 里被拆成 3 个 soma：本体（GFP d36db2b1 + RFP ef1aa108）、RFP 261e19e9（z428 单层 glia，score 0.16）、RFP a4465ac5（z431 单层 neuron，score 0.20）。Sox9 在不同规则下在这些碎片之间挪动（nucleus 下挪到 261e，old 下 a4465 多算一个 RFP+Sox9）。
+- **原因链**：
+  1. Stage 3 z 连接只连同类（`z_linker._match_sparse` 的 base 检查），z428 的 glia 框连不上 z429–431 的 neuron track；
+  2. z431 两个来自不同 tile（316000_388500 / 327300_377200）的同一细胞框 IoU 0.33 / IoMin 0.49，没过跨 tile 去重阈值（0.4 / 0.6）；
+  3. Phase A `match_soma_3d_iou` 一对一，GFP 只配 ef1a，另两条 RFP 成了独立 soma（与 GFP 的 3D IoMin 0.49 / 0.94）；
+  4. `suppress_cross_class_overlap` 只删 neuron 且要求 neuron 不大于 glia；同类之间无去重。
+- **规模**（old vs nucleus 的 somas.csv）：残片 soma（与更大 soma 的 3D IoMin ≥ 0.5 / 0.8）12,897 / 6,914 个（8.9% / 4.8%），多为单通道单层。switched TF 约 60% 涉及残片，lost 只约 7%。
+- **测试脚本 `src/utils/relink_soma_test.py`**：复用 compare_tf_z_rule.py（不改它），只对 soma 通道从 `5_2d_global` 重做 Stage 3 后半段：
+  - 修复 B：同层不同 tile 的框 IoU > 0.25 或 IoMin > 0.45 视为同一细胞，留高分框（glia 优先改标）；
+  - 修复 A：z 连接不分 neuron/glia；含 glia 成员的 track 记为 glia（用户决定）。
+  - 额外输出 `relink_changes.csv`、`relink_dropped.csv`、`relink_settings.json`，somas.csv 多 `relinked` 列；GUI `zrule_layer_rows` 有此列时点框打印出来。
+- **ET10 4 tile，old vs nucleus**（`X:\Fengyi\tf_z_rule_compare_ET10_relink_old_vs_nucleus\`，约 8 分钟）：
+  - 删框 GFP 4,735 / RFP 4,509；混合类别 track GFP 7,308 / RFP 8,503；与 Stage 3 不同的 soma track 13,871。
+  - Phase A soma 144,972 → 139,679；neuron 105,573 → 100,063，glia 39,399 → 39,616。
+  - 残片（IoMin ≥ 0.5 / 0.8）12,897 / 6,914 → 9,994 / 5,188。
+  - Sox9：lost / gained / switched 5,485 / 2,840 / 552 → 5,316 / 2,480 / 404；Olig2：3,566 / 2,821 / 301 → 3,412 / 2,664 / 217。
+  - 例子细胞合成一个 soma（RFP track 493fda0a，z428–431），两种规则下都是 GFP+Olig2+RFP+Sox9，类别 glia（因含 261e 的 glia 层）。
+- **下一步**：GUI 里对照两个文件夹看修复效果，抽查 `relink_dropped.csv` 有无误删相邻细胞；剩余残片是否还需要 Phase A 吸收。
+
+## 2026-11-12 四通道细胞被 nucleus 规则删掉 Sox9：z 跨度上限造成的残片抢走 TF（未改代码）
+
+- **现象**（GUI zrule_compare，relink old vs nucleus，tile 坐标 z431, x1759, y923；全局约 x 6970, y 7867）：GFP eca5a303 + RFP 61c848ee（z424–429）旧规则 GFP+Olig2+RFP+Sox9，nucleus 规则变 GFP+Olig2+RFP。Sox9 6777d010（z428–430）和 Olig2 11e0c4ac（z428–430）都 switched 到 GFP 07825977。
+- **原因**：
+  1. GFP 07825977 只有 z429 一层，xy 框与 eca5 几乎相同（IoU 约 0.95），是同一个细胞。Stage 3 `z_linker` 在 track 达到 `max_cell_z_span=5`（eca5 = z424–428）后关闭，z429 只能另起一条 track（span-cap 残片，与 11-11 那条的类别/跨 tile 残片来源不同，`relink_soma_test.py` 不处理）。
+  2. Phase A 一对一配对：RFP 61c8 已配 eca5，07825977 成了单独的 soma。
+  3. 旧规则下 3 层 TF 包不进 1 层的残片，只有本体能接；new/nucleus 规则下两者都能接，`annotate_soma_with_tf_containment` 选“最远 gate 距离最小”的：残片 1 个 gate 4.45 px，本体 GFP gate 5.16 px / RFP 3.96 px，残片以 0.7 px 之差胜出。
+- **规模**（ET10 4 tile，`somas.csv`；残片判据 = 同通道 track 紧接在一个满 5 层 track 之后/之前，xy IoU ≥ 0.5）：relink 文件夹 5,337 个 span-cap 残片 soma（3.8%；1 层 2,480，2 层 1,179，≥3 层 1,678），其中持有 TF 的 old 1,191 / nucleus 1,135。old→nucleus 中 TF 从本体换到残片 86 个（Sox9 54、Olig2 32），反方向 87 个；对 z 规则对比的净影响很小，但两种规则下残片都在多计细胞、抢本体的 TF。
+- 统计脚本只在临时目录，未加入仓库。
+- **待定**：是否在 Phase A 把残片并回本体（同通道、z 相邻或落在本体 z 范围内、xy IoU 高），或者 TF 竞争时优先 z 重叠层数多的 soma，或者放宽 Stage 3 的 span 上限（会重跑 Stage 3）。
+- **soma `max_cell_z_span` 5 是否太小**（ET10 4 tile，old_vs_nucleus 的 somas.csv，未 relink）：
+  - GFP track 层数 1/2/3/4/5 = 29,913 / 26,660 / 19,934 / 10,911 / 10,091；RFP 30,738 / 27,140 / 16,367 / 8,988 / 8,319。5 层明显堆积（按前面的下降趋势应约 6k），说明更长的细胞被截断了。
+  - 5 层 track 的下一层有同通道、xy IoU ≥ 0.5 的框：GFP 30%、RFP 27%（IoU 中位数 0.63 / 0.61）。
+  - 这些后续段的层数：GFP 1 层 1,901、2 层 670、3 层 219、4 层 91、5 层 110；RFP 1,352 / 494 / 208 / 96 / 117。后续段偏短（1 层占约 64%），而独立细胞的层数分布是 31% / 27% / 20% / …，所以大多是同一细胞的尾巴。
+  - cap 6 可接回约 64%，cap 7 约 86%。
+  - 注意：Stage 2.5 对齐（`point_cloud_aligner.resolve_align_settings` 的 `z_link`）也读 `z_linker.soma`，并保存在 `_align_settings.json`。直接改配置会让 `check_align_settings` 报错，需要删对齐目录从 2.5 重跑。要只改 Stage 3，需要给 Stage 3 单独的配置键。
+- **6 还是 7**（ET10 全脑 GFP/RFP 的 `6_3d_global/*_3d_tracked.pkl`，逐层 member 框；脚本在临时目录）：把每个 5 层 track 和它下一层 IoU ≥ 0.35、同类的 track（linker 没有 cap 时会连上的那个）接起来，看接缝之后面积或平均亮度是否再升高 ≥ 1/0.85（第二个细胞的迹象）。对照 = 普通 5 层 track 内部在第 3 层后切开、后面 2 层的同一检验。
+
+  | GFP（RFP） | 后续 1 层 | 2 层 | 3 层 | 4 层 | 5 层 |
+  |---|---|---|---|---|---|
+  | 个数 | 9,292（6,854） | 2,814（2,480） | 1,115（1,162） | 579（654） | 721（720） |
+  | 接缝后面积再升高 | — | 8.0%（20%） | 10.6%（28%） | 13.6%（37%） | 21%（43%） |
+  | 接缝后亮度再升高 | — | 3.4%（2.5%） | 4.8%（9.9%） | 13%（28%） | 29%（47%） |
+  | 后续段最亮 / 本体最亮 | 0.81（0.71） | 0.87（0.84） | 0.95（0.95） | 0.99（0.99） | 1.01（1.01） |
+  | 后续段最高 score（本体约 0.74 / 0.43） | 0.41（0.28） | 0.65（0.36） | 0.69（0.39） | 0.70（0.40） | 0.73（0.41） |
+
+  - 对照（同一细胞内部）：面积再升高 6.8%（17%），亮度再升高 2.4%（4.0%）。后续 2 层与对照几乎一样，而且更暗，是同一细胞的尾巴；4–5 层的亮度与本体相同、再升高比例高很多，像是叠在下面的另一个细胞；3 层介于两者之间。
+  - cap 6 / 7 / 8 后仍被切断的链：GFP 36% / 17% / 9%，RFP 42% / 21% / 12%。
+- **8 是否更好**：8 比 7 多接回的只有“后续 3 层”的链（GFP 1,115 / RFP 1,162）。这组后续段最亮层是本体最亮层的 0.95，几乎一样亮；按“比本体暗 10% 以上、且之后不再变亮”判为尾巴的只有 34%（GFP）/ 34%（RFP），2 层后续段是 57% / 64%，1 层是 82% / 88%。所以 cap 8 多连上的大多是另一个细胞；同时后续 4–5 层（多半是另一个细胞，每通道约 1,300）会被多并 1 层。8 层按 8 µm 层距跨约 56–64 µm，也远大于胞体。结论：7 合适，不用 8。
+
+## 2026-11-12（续）relink 测试：soma z 跨度上限 6 / 7（未提交，pipeline 未改）
+
+- **`relink_soma_test.py`**：
+  - 新增 `--soma-span N`，覆盖配置里的 `z_linker.soma.max_cell_z_span`，只用于 relink 的 soma track；值写进 `relink_settings.json`。
+  - 新输出 `soma_tracks_{GFP,RFP}.csv`：每个 soma 通道的 relink track 经过同通道 neuron/glia 去重之后的结果（Phase A 跨通道合并的输入），一行一个 track。列包括 3D 框、代表框 `rep_*`、`layers`（每层的框）、`relinked`、`stage3_track_ids`（与 Stage 3 不同的 track 记原来的 track id）。在 `suppress_cross_class_per_channel` 返回时立刻取行，因为之后 Phase A 合并会原地改这些 dict。
+- **GUI `zrule_compare` 模式**（`saved_gui.zrule_soma_tracks`、`soma_tracks_in_tile`）：文件夹里有 `soma_tracks_{ch}.csv` 时，每个 soma 通道加一层 `[relink s3 after class dedup] {ch}`，默认隐藏。每个 track 在它连上的每一层画该层自己的框（neuron 蓝、glia 橙），用 `_place_gates` 按代表检测放回本 tile 坐标系，和 z-rule 层一样。点框会打印 track_id、`track_z`、`n_layers`、`relinked`、`stage3_track_ids`。
+- **ET10 4 tile，old vs nucleus**，结果在 `X:\Fengyi\tf_z_rule_compare_ET10_relink_span{6,7}_old_vs_nucleus\`（两个并行跑，约 8 分钟）。对照组是 span 5 relink（`..._relink_old_vs_nucleus`）：
+
+  | | span 5 | span 6 | span 7 |
+  |---|---|---|---|
+  | Phase A soma | 139,679 | 136,300 | 135,096 |
+  | span-cap 残片 soma（持有 TF：old / nucleus） | 5,337（1,191 / 1,135） | 1,882（475 / 444） | 837（232 / 211） |
+  | 残片 IoMin ≥ 0.5 / ≥ 0.8 | 9,994 / 5,188 | 8,300 / 3,670 | 7,777 / 3,233 |
+  | Sox9 lost / gained / switched | 5,316 / 2,480 / 404 | 5,222 / 2,437 / 316 | 5,208 / 2,410 / 303 |
+  | Olig2 lost / gained / switched | 3,412 / 2,664 / 217 | 3,384 / 2,630 / 171 | 3,359 / 2,611 / 161 |
+  | GFP track 6 / 7 层（去重后） | — | 4,790 / — | 2,859 / 1,943 |
+  | RFP track 6 / 7 层（去重后） | — | 3,752 / — | 2,203 / 1,547 |
+
+  - 本次的例子细胞：span 6、7 都合成一个 soma（GFP 85de1ea3 + RFP e4610c8d，z424–430，neuron），old 和 nucleus 下都是 GFP+Olig2+RFP+Sox9。
+  - span-cap 残片判据和上一条一样：同通道 track 紧接在一个满 cap 层的 track 之后或之前，xy IoU ≥ 0.5。
+- 测试：`test_saved_pre_gui` 新增 1 项（共 18 项通过），`test_saved_s3_tile_frame`（6）通过。
+- **下一步**：在 GUI 里看 span 7 的 6–7 层 track 有没有把上下两个细胞连成一个（`[relink s3 after class dedup]` 层，点框看 `n_layers`）；没问题就给 Stage 3 加单独的 span 配置键（对齐继续用 5）。
+
+## 2026-11-13 Olig2 假阳性：没有 SNR 过滤；挑阈值用的图（未改 pipeline）
+
+- **现象**（GUI zrule_compare，relink 文件夹，ET10 tile 327300_388500）：两个 GFP+RFP 细胞被判成 GFP+Olig2+RFP+Sox9，实际没有 Olig2。old 和 nucleus 规则下都分到了这个 Olig2，所以与 z 规则无关。
+  - cell #2（全局约 x 6170, y 7008, z479）：Olig2 track cc8ae5de 只有 1 层，只在相邻 tile 327300_388500 的重叠区检测到，score 0.40，mean 800，SNR 2.5（该层最低的 5%）。检测到 Sox9 核的 tile 316000_388500 在这里没有 Olig2 框；它旁边的真 Olig2 核 mean 约 2200，SNR 5.7–7.5。
+  - cell #3（全局约 x 5866, y 7660, z484–485）：Olig2 track 5a982b03 与 Sox9 track 94b2e50d 的框几乎重合（同一 tile），SNR 3.9 / 5.6，可能是 Sox9 核在 Olig2 通道里的弱信号；Sox9 的 Stage 3 detection id 与现在的 Sox9 raw CSV 对不上，没能核实。
+- **原因**：`contrast_filter` 只配了 Sox9，Olig2 没有 SNR 过滤。
+- **SNR 阈值影响**（6 层，Stage 3 的 Olig2 框 4,015 个）：SNR < 4 / 5 / 6 的占 12% / 22% / 34%。snr_min 5 能删掉 cell #2 的 Olig2，删不掉 cell #3 的（z485 那层 5.6，track 只要 1 层就保留）。
+- **挑阈值用的图**：`Y:\Fengyi\EGFR_brain\ET10\olig2_contrast_test_20261113\`，ET10 5 个 tile × 3 层（含两个病例层），每层 SNR ≥ 3…15 的图和标签。SNR 直接调用 `local_contrast.slice_ring_stats`；现有过滤已删的框画灰色、不计数。脚本 `scripts/build_olig2_slices.py`，约 2.5 分钟。
+- **下一步**：用户看图填 `threshold_choices.csv`，再定 Olig2 的 `snr_min`（Olig2 参与对齐的话，要从 Stage 2.25 重跑）。
+
+## 2026-11-13（续）Olig2 SNR ≥ 4 加入 relink 测试（未改 pipeline）
+
+- 用户按挑阈值的图选定 Olig2 `snr_min 4`（15 层里大多选 4，范围 3–5.5）。核对过：加上绝对亮度（mean − 背景、mean / 背景）没有提升，见上一条。
+- **SNR 表**：ET10 区域内的 15 个 tile（4 个测试 tile + 邻 tile）用 Stage 2.2 的 `tile_contrast` 计算，结果在 `X:\Fengyi\olig2_contrast_ET10\`（脚本 `compute_olig2_snr.py` 把 /rsstu 路径映射到盘符；15 个并行约 15 分钟）。没写 manifest，以后正式跑 Stage 2.2 时会重算。
+- **`relink_soma_test.py` 新增 `--tf-snr CH=V`、`--snr-dir`**：从区域内的 5_2d_global 删掉 SNR < V 的 TF 框（无 SNR 的保留，与 Stage 2.25 一致），再用配置里的 `z_linker.tf` 参数重新 z 连接这个 TF 通道（Stage 3 对 TF 的做法）。没有模拟的：pipeline 里过滤在对齐和拼接去重之前，所以拼接时输给被删框的重复框会回来（本次 9,717 个，只计数）。`relink_settings.json` 记 `tf_snr_min`、`tf_snr_stats`。
+- **ET10 4 tile，old vs nucleus**：`X:\Fengyi\tf_z_rule_compare_ET10_relink_span{6,7}_olig2snr4_old_vs_nucleus\`
+  - 区域 Olig2 框删掉 193,808 / 2,356,673（8.2%）；Olig2 track 850,768 → 775,732。自检：没丢框的 Stage 3 track 有 701,038 / 715,524 原样回来，其余约 2% 因为相邻 track 丢层后 3 层上限的位置变了，重新连接。
+
+  | span 7（span 6 相近） | 无 Olig2 SNR | Olig2 SNR ≥ 4 |
+  |---|---|---|
+  | Olig2 阳性 soma old / nucleus | 31,241 / 31,423 | 29,912 / 30,021 |
+  | GFP+Olig2+RFP+Sox9（nucleus） | 7,928 | 7,604 |
+  | GFP+RFP+Sox9（nucleus） | 7,139 | 7,458 |
+  | Olig2 lost / gained / switched | 3,359 / 2,611 / 161 | 2,895 / 2,212 / 153 |
+  | Sox9 匹配 old / nucleus | 58,358 / 55,560 | 58,358 / 55,497 |
+
+  - 病例：cell #2 两种规则下都变成 GFP+RFP+Sox9（Olig2 只有 SNR 2.5 那一层，被删）。cell #3 的 Olig2 只剩 z485 那层（SNR 5.6）：old 规则下仍是 GFP+Olig2+RFP，nucleus 规则下变成 GFP+RFP。中点 485 超出 soma z481–484 半层，它的 Sox9 搭档（z484–486）原来也是靠这个 Olig2 才通过的，现在一起被拒。
+
+## 2026-11-13（续）soma max_z_gap = 1 测试（未改 pipeline）
+
+- **起因**：GUI 里两个四通道细胞在 nucleus 规则下被拆开，都是因为 GFP 或 RFP 漏检一层、`max_z_gap = 0` 让 track 断开：
+  - 6c37/c164（全局约 x 6370, y 7720）：RFP 在 z435 漏检，拆成 GFP+RFP（z434–435）和 RFP（z436–437）。z436 的 Sox9 和 Olig2 在 nucleus 规则下都去了后者。
+  - cdb2/26e5（约 x 7030, y 7790）：RFP 缺 z420、GFP 缺 z421，拆成 z418–420 和 z421–423 两个 soma。跨在断点上的 Sox9 和 Olig2 按 xy 距离分到两边，变成 GFP+RFP+Sox9 和 GFP+Olig2+RFP。
+- **`relink_soma_test.py` 新增 `--soma-gap N`**，覆盖配置里的 `z_linker.soma.max_z_gap`，只用于 relink 的 soma track；值记进 `relink_settings.json`。
+- **ET10 4 tile，Olig2 SNR ≥ 4，old vs nucleus**：`X:\Fengyi\tf_z_rule_compare_ET10_relink_span{6,7}_gap1_olig2snr4_old_vs_nucleus\`，对照组是同 span 的 `..._span{6,7}_olig2snr4_...`。soma track 用 `soma_tracks_{ch}.csv`（同通道 neuron/glia 去重之后）按 track_id 比较：
+
+  | | span 6 GFP | span 6 RFP | span 7 GFP | span 7 RFP |
+  |---|---|---|---|---|
+  | gap 0 → gap 1 track 数 | 92,859 → 90,699 | 86,567 → 84,330 | 92,007 → 89,590 | 85,935 → 83,442 |
+  | 净变化 | −2,160 | −2,237 | −2,417 | −2,493 |
+  | 消失（并入别的 track） | 5,924 | 6,931 | 6,125 | 7,137 |
+  | 新增 | 3,764 | 4,694 | 3,708 | 4,644 |
+  | 新增中跨过一层空缺的 | 3,137 | 3,761 | 3,251 | 3,866 |
+
+  - 1 层 track 减少约 2,400 个/通道。Phase A soma：span 6 136,300 → 132,541，span 7 135,096 → 130,934。
+  - span 7 nucleus：Sox9 lost / gained / switched 5,220 / 2,359 / 297 → 5,044 / 2,186 / 327；Olig2 2,895 / 2,212 / 153 → 2,823 / 2,068 / 143。
+  - 两个病例都合成一个 soma（z434–437、z418–423），两种规则下都是 GFP+Olig2+RFP+Sox9。
+- **GUI（11-13 续）**：`zrule_compare` 模式的 `[relink s3 after class dedup] {ch}` 改成一个 track 一个框（代表框画在代表层，同 s3 层），统一白色，不再按 neuron/glia 分色；点框多打印 `bridged_layers`（z 范围内跨过的空缺层数）。
+  - `relink_soma_test.py` 带 `--before` 时写 `soma_tracks_removed_{ch}.csv`：before 文件夹里本次不再存在的 track，加 `absorbed_by`（本次哪些 track 包含它的逐层框）。两个 gap1 文件夹已补写：span 7 GFP 6,125（6,123 被吸收）、RFP 7,137（7,107）；span 6 GFP 5,924（5,922）、RFP 6,931（6,907）。
+  - GUI 读到这个文件时加两层：`[gap removed] {ch}`（黄色，消失的 track）和 `[gap merged] {ch}`（蓝色，吸收它们的 track），默认都显示。
+  - 测试：`test_saved_pre_gui` 19 项通过（改 1 项、新增 1 项），`test_saved_s3_tile_frame` 6 项通过。
+
+## 2026-11-13（续）soma z 连接加 IoMin（大框套小框也连）；GUI 打印逐层框（未改 pipeline）
+
+- **起因**（GUI，span7 gap1，全局约 x 6765, y 8420, z445–452）：同一细胞的 RFP 框在大框（约 85 px）和小框（约 27×38）之间来回变，相邻层 IoU 约 0.14，过不了 0.35。gap 1 让 41ce 跳过 z449、z451 连上 z450、z452，但 z449、z451 的框各自成了单层 track（da6b、90c7）。z445 的大框 f9c7 成了单独的 RFP soma，还拿到 Sox9/Olig2。
+- `z_linker` 本身只按 IoU 连接。用户记得的包含判断在别处：Stage 2.25 containment NMS（同层 2D）、Phase A `cross_class_contain_thresh`、`patch_fragment_iomin`，都不管 z 连接。
+- **`relink_soma_test.py` 新增 `--link-iomin T`**：soma z 连接时 IoU ≥ `iou_thresh` 或 IoMin ≥ T 都可连（同类 base；修复 A 下不分 neuron/glia）。每个连通块一对一，先使连接数最多，再使 IoU 和最大。不加此项时仍用 Stage 3 原来的匹配函数。值记进 `relink_settings.json`（`soma_link_iomin`）。
+- **ET10 4 tile，span {6,7} + gap 1 + IoMin 0.8 + Olig2 SNR ≥ 4**：`X:\Fengyi\tf_z_rule_compare_ET10_relink_span{6,7}_gap1_iomin08_olig2snr4_old_vs_nucleus\`（`--before` = 同 span 的 gap1 文件夹）
+
+  | span 7（span 6 相近） | gap1 | gap1 + IoMin 0.8 |
+  |---|---|---|
+  | GFP / RFP track | 89,590 / 83,442 | 88,300 / 79,017 |
+  | RFP 单层 track | 22,620 | 18,263 |
+  | RFP 7 层 track | 1,481 | 2,013 |
+  | Phase A soma | 130,934 | 125,560 |
+  | 残片 soma IoMin ≥ 0.5 / 0.8 | 7,602 / 3,025 | 6,414 / 1,867 |
+  | Sox9 lost / gained / switched | 5,044 / 2,186 / 327 | 4,846 / 1,944 / 117 |
+  | Olig2 lost / gained / switched | 2,823 / 2,068 / 143 | 2,660 / 1,932 / 54 |
+  | Sox9 阳性 soma old / nucleus | 46,293 / 45,666 | 45,303 / 44,647 |
+
+  - 相对 gap1 消失的 track：GFP 2,686、RFP 10,715（`soma_tracks_removed_*`）。
+  - 例子细胞：RFP 合成 e42d（z445–451，7 层大小框连续）；f9c7、da6b、90c7 三个 RFP 单独 soma 消失。z452 的大框 cb3c 因为 7 层上限又成了单层 track（无 TF）。附近另有 RFP a83d（z449–452）配上 GFP 96eb，成了新的 GFP+RFP soma，待 GUI 确认是不是另一个细胞。
+- **GUI**：点 relink 层（含 gap removed / merged）的框，会逐层打印该 track 的框（全局坐标、宽×高），跨过的空缺层标 `bridged`；状态栏显示 bridged 层数。
+- 测试：`test_saved_pre_gui` 21 项通过（新增 IoMin 连接、逐层打印各 1 项），`test_saved_s3_tile_frame` 6 项通过。
+- **待查**：IoMin 连接可能把上下相邻的两个细胞连成一个（大 glia 框盖住下一层另一个细胞的小框）。RFP 7 层 track 增加约 530 个，需要在 GUI 抽查。
+
+## 2026-11-13（续）z 规则对比结果文件夹改为数字编号
+
+- 用户要求测试输出文件夹名改短。`X:\Fengyi\tf_z_rule_compare*` 共 13 个按完成时间移到 `X:\Fengyi\zrule_tests\01` … `13`。`index.csv` 记每个编号的旧名、完成时间、样本、tile、base/cand 规则、relink、soma span/gap、link_iomin、TF SNR 和 `before`（对照组编号）。
+- 本日志之前写的旧路径对应：ET10_relink_old_vs_nucleus = 05；relink_span{6,7} = 06/07；relink_span{6,7}_olig2snr4 = 08/09；…_gap1_… = 10/11；…_gap1_iomin08_… = 12/13（偶数 span 6，奇数 span 7）。
+- `relink_settings.json` 以后也记 `before`（之前没存，08–13 的对照组是按本次会话补记的）。以后新的测试接着编号（14 起），并更新 `index.csv`。
+- **决定（11-13）**：soma z 连接上限先定 7（GUI 里看不出 6 和 7 的差别，7 的残片更少：12 vs 13 残片 soma IoMin ≥ 0.8 为 2,292 vs 1,867，单层 1,860 vs 1,367）。以后的测试以 13（span 7 + gap 1 + IoMin 0.8 + Olig2 SNR ≥ 4）为基线，不再同时跑 span 6。
+
+## 2026-11-13（续）测试 13 的改动正式写进 pipeline；测试脚本和 GUI zrule_compare 模式删除
+
+用户决定：Stage 4 用 nucleus 规则，soma z linker 用 gap 1，以及测试 13 的其余改动都进 pipeline，作为所有样本的默认。Olig2/Sox9 的 SNR 阈值先不改配置，等每个样本的抽样报告。
+
+- **Stage 3 soma 连接**（`src/core/z_linker.py`）：
+  - 新增 `STAGE3_LINK_DEFAULTS` / `stage3_link_params(config z_linker)`（run_inference 和 pipeline_qc 共用）、`dedup_cross_tile`、`link_tracks`。`run_z_linker` 及其 helper 一行没改：它们在 Stage 2.9 的 `SOLVE_CODE` 里，也被 Stage 2.5 对齐调用。核对过：ET10 的 solver hash 不变，下次运行不会被 2.9 的保护拦下。
+  - `link_tracks` = 连接前跨 tile 去重（同层不同 tile，IoU > 0.25 或 IoMin > 0.45，留高分框，glia 优先改标）+ IoU ≥ 0.35 或 IoMin ≥ 0.8 都可连（一对一，先使连接数最多，再使 IoU 和最大）+ neuron/glia 可互连（含 glia 成员的 track 为 glia）+ span 7 / gap 1。每项都可在 config 里设 null 关掉；全关时与 `run_z_linker` 相同（有测试）。匹配函数通过 `_matchers` 临时替换，`run_z_linker` 调用时才去取。
+  - TF 通道参数不变（span 3、gap 0、只看 IoU）。
+- **Stage 3 checkpoint**（`channel_stage3.py`）：去重删掉的框写 `6_3d_global/{ch}_link_dedup.csv`，列入 track manifest 的输出。track 签名含新参数和整个 `z_linker.py` 的 hash，所以所有样本下次运行都会重新连接（不重新拼接，5_2d_global 保留）。
+- **Stage 4 nucleus 规则**（`stitcher.py`、`run_inference.py`）：`tf_nucleus_groups`、`tf_nucleus_z_ranges` 从测试脚本移过来。`annotate_soma_with_tf_containment` 新参数 `tf_z_ranges`；`_tf_z_contained` 改为对中点区间 [lo, hi] 判断（单个 TF 时 lo = hi，与原 new 规则相同）。Phase B 先对所有 TF 通道做尺寸过滤，再配对，再逐通道标注。配对记进 `coloc_decisions.csv`（stage `tf_nucleus`，decision `same_nucleus`，metric = IoMin），已在 Stage 4 manifest 里。config `z_linker.tf.nucleus_iomin`（默认 0.7，null = 关）。
+  - 测试脚本的 docstring 说"同一核的成员中点最多差一层"，不成立（z400–402 与 z402–404 共享 z402，中点差 2）。实际用的是区间判断，与测试 13 一致，docstring 已改。
+- **配置**：25 个 config（EGFR、TSC、TSC2）的顶层 `z_linker.soma` 改为 span 7、gap 1，加 `link_iomin_thresh`、`link_across_classes`、`cross_tile_dedup_iou/_iomin`，`tf` 加 `nucleus_iomin`。`pre_align_params.z_linker`（对齐用）不动；脚本核对过每个 config 除 `z_linker` 外其余设置完全不变。原文件备份在会话临时目录。
+- **QC**（`pipeline_qc.py`）：span/gap/min_z_layers 用 `stage3_link_params`（原来缺省 5/0 会误报）；`{ch}_link_dedup.csv` 里的框计入 detection_partition。
+- **删除**：`src/utils/compare_tf_z_rule.py`、`src/utils/relink_soma_test.py`；GUI `zrule_compare` 模式（saved_gui 的 zrule/relink 层、visualize/visualize_gui 的模式选项）和对应测试。同期的 contrast 面板、点击编号保留。`X:\Fengyi\zrule_tests\01–13` 留在磁盘上，GUI 不能再打开。
+- **核对**：用新的 pipeline 代码（ET10 config）对 4 个 tile 区域的 5_2d_global 重连 GFP/RFP，再做同通道类别去重，与测试 13 完全一致：GFP 88,300、RFP 79,017 条 track 的 id 和类别全部相同，去重删掉的框 4,735 / 4,509 个也相同。
+- **测试**：新增 `tests/test_stage3_link_tracks.py`（6 项）；`test_coloc_sources` 新增 nucleus 1 项；`test_pipeline_qc` 新增 link_dedup 1 项；`test_automatic_resume` 的 patch 目标改为 `link_tracks`。全部测试文件逐个运行通过（238 项），`test_tile_2d_sources.py` 进程崩溃，改动前就如此。
+- **注意**：顶层 `z_linker.tf.containment_z_pad` 已无人读取（Stage 4 从 11-09 起不用，对齐读 `pre_align_params` 里的），config 注释还是旧的。
+- **下一步**：HPC 上重跑样本时，Stage 3 只重新连接，Stage 4 重算；Olig2/Sox9 每个样本的 SNR 抽样报告。
+
+## 2026-11-13（续）各样本 Olig2/Sox9 SNR 抽样报告（未改配置）
+
+- **新工具 `src/utils/snr_survey.py`**（只读）：对每个 config 的每个单曝光 StarDist TF 通道，从组织多的 tile 里随机抽 4 个（seed 20261113），每个 tile 按深度三等分抽 3 层（常规过滤后 ≥ 100 个框）。SNR 优先用 Stage 2.2 已有的 contrast 表，没有就用 `slice_ring_stats` 现算（公式相同）。只统计常规过滤保留的框（2_2d_filtered 的结果 + 原因为 snr_min 的 rejected），报告各阈值去掉的比例；以 ET10 为参照（Olig2 4、Sox9 5），并给出"匹配阈值"（去掉与 ET10 相同比例时的 SNR）。每个样本写 report.html（表、SNR 分布图、每层一张按 SNR 分色的图），总表 summary.csv / index.html。每个样本×通道完成后缓存，断了可续跑。Windows 盘符从 `net use` 读取（这台机器 Chlamydia = X:）。测试 `tests/test_snr_survey.py`（3 项）；连同上一条的 238 项，全部 241 项通过。
+  - 修正：config 路径先 normpath 再去重，否则参照样本（ET10）因路径分隔符不同会被排两次。
+- **结果** `X:\Fengyi\snr_survey\01\`（25 个样本，44 个样本×通道，8 进程约 1.5 小时；`X:\Fengyi\snr_survey\index.csv` 记设置）：
+  - Olig2：ET10 在 SNR 4 去掉 11.5%。多数样本在 7–19%，匹配阈值 3.1–5.8。偏离较大的有 TSC_FW2（18.9%，匹配 3.1）、batch4_sample5（16.2%，3.5）、TSC_FW8（3.7%，5.8）。
+  - Sox9：ET10 在 SNR 5 去掉 35.1%。多数样本在 26–43%，匹配阈值 4.2–6.1。batch4_sample5（69.5%，环形背景中位数仅 176，SNR 中位数 3.2，匹配 2.4）和 batch4_sample4（51.6%，3.7）明显偏离。
+  - 层与层之间差别很大（同一样本的单层去除比例可差 3–10 倍），所以每个样本的数字只是 12 层的合计。
+  - 注意：匹配阈值假设各样本假阳性比例与 ET10 相同，不一定成立，需要看图判断。
+- **下一步**：用户看报告后决定每个样本的 `contrast_filter.{Olig2,Sox9}.snr_min`；改了之后该样本要从 Stage 2.2/2.25 重跑（对齐也会重跑）。

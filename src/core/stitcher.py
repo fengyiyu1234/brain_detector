@@ -1,3 +1,4 @@
+import itertools
 import json
 import logging
 import numpy as np
@@ -841,14 +842,120 @@ def _tf_gate_volumes(soma, soma_channels):
     return [(None, soma)]
 
 
-def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_margin=0,
-                                       max_center_dist_ratio=0.5, source_channel=None,
-                                       soma_channels=None):
+def _tf_z_contained(mid_lo, mid_hi, s_zmin, s_zmax):
+    """TF z test on layer-range midpoints: [mid_lo, mid_hi] reaches within half a layer
+    of the soma's z range, no padding.
+
+    A TF on its own has mid_lo = mid_hi = (z_min + z_max) / 2, i.e. at least half of its
+    layers overlap the soma. Its full range may extend past the soma: a soma detected on
+    fewer layers than its nucleus would otherwise reject a correctly placed TF. The exact
+    midpoint is used instead of the track's cz, which int() truncates for an even layer
+    count and so biases two-layer TFs downwards.
+    A TF in a multi-channel nucleus (tf_nucleus_groups) carries the lowest and highest
+    midpoint of the nucleus' tracks, so an Olig2 seen on one layer next to the soma
+    passes when its Sox9 partner reaches into the soma.
     """
-    Annotate soma cells with TF markers using strict 3D bbox containment.
-    A TF is colocalized only if its 3D bounding box is fully enclosed within
-    a soma's 3D bounding box (with optional xy_margin and z_pad tolerance),
-    AND its centroid is within max_center_dist_ratio * soma_radius of the soma center.
+    return (s_zmin - 0.5 <= mid_hi) & (mid_lo <= s_zmax + 0.5)
+
+
+def _tf_layer_boxes(tracks):
+    """{z: (track indices, boxes array)} from each track's per-layer detection boxes."""
+    by_z = defaultdict(lambda: ([], []))
+    for i, t in enumerate(tracks):
+        for z, box in (t.get('per_z_boxes') or {}).items():
+            by_z[int(z)][0].append(i)
+            by_z[int(z)][1].append(box[:4])
+    return {z: (np.asarray(ix), np.asarray(bx, dtype=float)) for z, (ix, bx) in by_z.items()}
+
+
+def _tf_pair_candidates(tracks_a, tracks_b, iomin_thresh):
+    """{(i, j): best same-layer 2D IoMin} for track pairs reaching iomin_thresh."""
+    la, lb = _tf_layer_boxes(tracks_a), _tf_layer_boxes(tracks_b)
+    best = {}
+    for z in la.keys() & lb.keys():
+        ia, ba = la[z]
+        ib, bb = lb[z]
+        diag = lambda b: np.hypot(b[:, 2] - b[:, 0], b[:, 3] - b[:, 1])
+        radius = (diag(ba).max() + diag(bb).max()) / 2
+        tree = cKDTree((bb[:, :2] + bb[:, 2:]) / 2)
+        hits = tree.query_ball_point((ba[:, :2] + ba[:, 2:]) / 2, radius)
+        area_b = (bb[:, 2] - bb[:, 0]) * (bb[:, 3] - bb[:, 1])
+        for k, js in enumerate(hits):
+            if not js:
+                continue
+            js = np.asarray(js)
+            a, b = ba[k], bb[js]
+            inter = (np.clip(np.minimum(a[2], b[:, 2]) - np.maximum(a[0], b[:, 0]), 0, None) *
+                     np.clip(np.minimum(a[3], b[:, 3]) - np.maximum(a[1], b[:, 1]), 0, None))
+            iomin = inter / np.maximum(np.minimum((a[2] - a[0]) * (a[3] - a[1]), area_b[js]),
+                                       1e-9)
+            for j, v in zip(js[iomin >= iomin_thresh], iomin[iomin >= iomin_thresh]):
+                key = (int(ia[k]), int(ib[j]))
+                if v > best.get(key, 0.0):
+                    best[key] = float(v)
+    return best
+
+
+def tf_nucleus_groups(tf_by_channel, iomin_thresh):
+    """Merge TF tracks of different channels that are the same nucleus.
+
+    Per channel pair, candidates are tracks sharing a layer whose 2D boxes on it reach
+    iomin_thresh; they pair one-to-one, highest IoMin first. Pairs join across channels
+    (union-find). Returns (groups, pairs): groups = [[(channel, track index), ...], ...]
+    with two or more tracks; pairs = [(channel_a, index_a, channel_b, index_b, iomin)].
+    """
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    pairs = []
+    channels = [c for c in tf_by_channel if tf_by_channel[c]]
+    for a, b in itertools.combinations(channels, 2):
+        cand = _tf_pair_candidates(tf_by_channel[a], tf_by_channel[b], iomin_thresh)
+        used_a, used_b = set(), set()
+        for (i, j), iomin in sorted(cand.items(), key=lambda kv: -kv[1]):
+            if i in used_a or j in used_b:
+                continue
+            used_a.add(i)
+            used_b.add(j)
+            parent[find((a, i))] = find((b, j))
+            pairs.append((a, i, b, j, iomin))
+        logging.info(f"  TF nucleus pairs {a}-{b}: {len(used_a)} (IoMin >= {iomin_thresh})")
+    groups = defaultdict(list)
+    for x in list(parent):
+        groups[find(x)].append(x)
+    return [g for g in groups.values() if len(g) > 1], pairs
+
+
+def tf_nucleus_z_ranges(tf_by_channel, groups):
+    """{(channel, index): (lowest, highest) z midpoint of the tracks in its nucleus}."""
+    out = {}
+    for g in groups:
+        mids = [(tf_by_channel[c][i]['z_min'] + tf_by_channel[c][i]['z_max']) / 2
+                for c, i in g]
+        for key in g:
+            out[key] = (min(mids), max(mids))
+    return out
+
+
+def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, xy_margin=0,
+                                       max_center_dist_ratio=0.5, source_channel=None,
+                                       soma_channels=None, tf_z_ranges=None):
+    """
+    Annotate soma cells with TF markers using bbox containment.
+    A TF is colocalized only if its xy box is fully enclosed within a soma's xy box
+    (with optional xy_margin tolerance), at least half of its layers overlap the soma's
+    z range (see _tf_z_contained; no padding), AND its centroid is within
+    max_center_dist_ratio * soma_radius of the soma center.
+
+    tf_z_ranges (None = every TF's own midpoint): list parallel to tf_vol_list of
+    (lowest, highest) z midpoint for TFs merged into a nucleus (tf_nucleus_z_ranges), or
+    None entries for TFs judged on their own midpoint. Only the z test uses it.
 
     soma_channels (None = gate on the soma's own box): soma channel ids whose original
     tracks in source_tracks are each a separate gate; the TF must pass every one of the
@@ -861,6 +968,8 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
     """
     if not soma_vol_list or not tf_vol_list:
         return soma_vol_list
+    if tf_z_ranges is not None and len(tf_z_ranges) != len(tf_vol_list):
+        raise ValueError("tf_z_ranges must have one entry per TF volume")
 
     gate_owner, gate_channel, gate_cells, n_gates = [], [], [], []
     for idx, soma in enumerate(soma_vol_list):
@@ -903,8 +1012,12 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
         chunk = tf_vol_list[c0:c0 + _TF_CHUNK]
         tf_pts = np.array([[t['cx'], t['cy'], t['cz']] for t in chunk], dtype=float)
         t_box = np.array([[t['x1_3d'], t['y1_3d'], t['x2_3d'], t['y2_3d']] for t in chunk], dtype=float)
-        t_zmin = np.array([t['z_min'] for t in chunk])
-        t_zmax = np.array([t['z_max'] for t in chunk])
+        mid_lo = np.array([(t['z_min'] + t['z_max']) / 2 for t in chunk], dtype=float)
+        mid_hi = mid_lo.copy()
+        if tf_z_ranges is not None:
+            for k, rng in enumerate(tf_z_ranges[c0:c0 + _TF_CHUNK]):
+                if rng is not None:
+                    mid_lo[k], mid_hi[k] = rng
 
         cands = tree.query_ball_point(tf_pts, r=query_radius, return_sorted=False, workers=-1)
         counts = np.fromiter((len(c) for c in cands), dtype=np.int64, count=len(cands))
@@ -915,13 +1028,7 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
         sb, tb = s_box[si], t_box[ti]
         contained_xy = ((sb[:, 0] - xy_margin <= tb[:, 0]) & (tb[:, 2] <= sb[:, 2] + xy_margin) &
                         (sb[:, 1] - xy_margin <= tb[:, 1]) & (tb[:, 3] <= sb[:, 3] + xy_margin))
-        # z_pad slices of tolerance on exactly one side only, never both at once
-        # (padding both sides simultaneously lets a truncated box balloon into
-        # an oversized capture window) — applies the same way to single- and
-        # multi-layer soma boxes.
-        zmin_t, zmax_t, zmin_s, zmax_s = t_zmin[ti], t_zmax[ti], s_zmin[si], s_zmax[si]
-        contained_z = (((zmin_t >= zmin_s - z_pad) & (zmax_t <= zmax_s)) |
-                       ((zmin_t >= zmin_s) & (zmax_t <= zmax_s + z_pad)))
+        contained_z = _tf_z_contained(mid_lo[ti], mid_hi[ti], s_zmin[si], s_zmax[si])
         keep = np.flatnonzero(contained_xy & contained_z)
 
         passed = defaultdict(list)   # (tf 块内下标, soma 下标) → 通过的 gate 下标
@@ -959,7 +1066,6 @@ def annotate_soma_with_tf_containment(soma_vol_list, tf_vol_list, z_pad=2, xy_ma
                     'center_distance_ratio': d_worst / soma_radii[g_worst],
                     'center_distance_ratio_max': max_center_dist_ratio,
                     'xy_margin': xy_margin,
-                    'z_pad': z_pad,
                     'tf_gates': json.dumps([
                         {'soma_channel': gate_channel[g],
                          'soma_track_id': gate_cells[g].get('track_id', ''),

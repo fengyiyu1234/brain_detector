@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 from functools import lru_cache
 
 import numpy as np
@@ -329,3 +330,214 @@ def run_z_linker(full_stack_matrix, iou_thresh=0.45, min_z_layers=2,
 
     summary = np.array(final_rows, dtype=object) if final_rows else np.empty((0, 8), dtype=object)
     return summary, volumetric_list
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 3 linking options.
+# run_z_linker and the helpers above are also hashed by Stage 2.9
+# (tile_position_pipeline.SOLVE_CODE) and called by Stage 2.5 alignment, so options that
+# only Stage 3 uses live below and leave them unchanged.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Stage 3 defaults per channel type; config z_linker.<type>.<key> overrides, null disables
+# an option. Stage 2.5/2.9 read pre_align_params.z_linker (or these four base keys of the
+# top-level z_linker) through point_cloud_aligner.resolve_align_settings instead.
+STAGE3_LINK_DEFAULTS = {
+    'soma': {
+        'iou_thresh': 0.35, 'min_z_layers': 1,
+        'max_cell_z_span': 7,           # 5 cut off cells; 8 joins the cell below
+        'max_z_gap': 1,                 # bridge one layer without a box
+        'link_iomin_thresh': 0.8,       # also link a small box inside a large one
+        'link_across_classes': True,    # neuron and glia boxes of one cell link
+        'cross_tile_dedup_iou': 0.25,   # same-layer duplicates from different tiles
+        'cross_tile_dedup_iomin': 0.45,
+    },
+    'tf': {'iou_thresh': 0.25, 'min_z_layers': 1, 'max_cell_z_span': 3, 'max_z_gap': 0},
+}
+
+LINK_DEDUP_COLUMNS = [
+    'detection_id', 'tile_name', 'z', 'class', 'score', 'x1', 'y1', 'x2', 'y2',
+    'kept_detection_id', 'kept_tile', 'kept_score', 'iou', 'iomin', 'kept_relabelled_glia',
+]
+
+
+def stage3_link_params(z_linker_config):
+    """Stage 3 link_tracks keyword arguments per channel type: config over defaults."""
+    z_linker_config = z_linker_config or {}
+    return {kind: {key: z_linker_config.get(kind, {}).get(key, value)
+                   for key, value in defaults.items()}
+            for kind, defaults in STAGE3_LINK_DEFAULTS.items()}
+
+
+def _base_and_rest(cls):
+    base, _, rest = str(cls).partition('_')
+    return base, rest
+
+
+def _as_glia(cls):
+    _, rest = _base_and_rest(cls)
+    return f'glia_{rest}' if rest else 'glia'
+
+
+def dedup_cross_tile(mat, iou_thresh, iomin_thresh, dropped=None):
+    """Drop same-layer duplicates from different tiles before linking.
+
+    On one layer, two boxes from different tiles (column 9) with IoU > iou_thresh or
+    IoMin > iomin_thresh are one cell; pairs go by IoU, highest first, and the lower
+    score box is dropped (ties keep the earlier row). Glia priority: dropping a glia box
+    relabels a kept non-glia box glia. Stitching (stitcher.combine_predictions) removed
+    the clear duplicates after the measured seam offset; this catches the rest in the
+    stitched global frame. dropped: list collecting one LINK_DEDUP_COLUMNS dict per
+    dropped box. Returns the kept rows (class column updated).
+    """
+    if len(mat) < 2 or mat.shape[1] < 10:
+        return mat
+    mat = mat.copy()
+    x1, y1, x2, y2, score = (mat[:, k].astype(float) for k in range(5))
+    z = mat[:, 7].astype(int)
+    tile = mat[:, 9]
+    drop = np.zeros(len(mat), bool)
+    order = np.argsort(z, kind='stable')
+    starts = np.flatnonzero(np.r_[True, z[order][1:] != z[order][:-1]])
+    for rows in np.split(order, starts[1:]):
+        if len(rows) < 2:
+            continue
+        centers = np.c_[(x1[rows] + x2[rows]) / 2, (y1[rows] + y2[rows]) / 2]
+        # overlapping boxes have centers closer than the largest box side on each axis
+        side = np.maximum(x2[rows] - x1[rows], y2[rows] - y1[rows]).max()
+        pairs = cKDTree(centers).query_pairs(r=side * 1.5, output_type='ndarray')
+        if not len(pairs):
+            continue
+        a, b = rows[pairs[:, 0]], rows[pairs[:, 1]]
+        other = tile[a] != tile[b]
+        a, b = a[other], b[other]
+        inter = (np.clip(np.minimum(x2[a], x2[b]) - np.maximum(x1[a], x1[b]), 0, None) *
+                 np.clip(np.minimum(y2[a], y2[b]) - np.maximum(y1[a], y1[b]), 0, None))
+        area_a = (x2[a] - x1[a]) * (y2[a] - y1[a])
+        area_b = (x2[b] - x1[b]) * (y2[b] - y1[b])
+        iou = inter / (area_a + area_b - inter + 1e-8)
+        iomin = inter / (np.minimum(area_a, area_b) + 1e-8)
+        hit = np.flatnonzero((iou > iou_thresh) | (iomin > iomin_thresh))
+        for k in hit[np.argsort(-iou[hit], kind='stable')]:
+            i, j = int(a[k]), int(b[k])
+            if drop[i] or drop[j]:
+                continue
+            kept, gone = (i, j) if score[i] >= score[j] else (j, i)
+            relabel = (_base_and_rest(mat[gone, 6])[0] == 'glia'
+                       and _base_and_rest(mat[kept, 6])[0] != 'glia')
+            if dropped is not None:
+                dropped.append({
+                    'detection_id': mat[gone, 8], 'tile_name': tile[gone], 'z': int(z[gone]),
+                    'class': mat[gone, 6], 'score': float(score[gone]),
+                    'x1': float(x1[gone]), 'y1': float(y1[gone]),
+                    'x2': float(x2[gone]), 'y2': float(y2[gone]),
+                    'kept_detection_id': mat[kept, 8], 'kept_tile': tile[kept],
+                    'kept_score': float(score[kept]), 'iou': float(iou[k]),
+                    'iomin': float(iomin[k]), 'kept_relabelled_glia': relabel})
+            if relabel:
+                mat[kept, 6] = _as_glia(mat[kept, 6])
+            drop[gone] = True
+    return mat[~drop]
+
+
+def _match_iou_or_iomin(iomin_thresh):
+    """run_z_linker match function that also links a box contained in the other.
+
+    A (detection, track) pair is linkable when IoU >= iou_thresh (the base rule) or
+    IoMin >= iomin_thresh, same class base. Per connected block of linkable pairs, a
+    one-to-one assignment maximises the number of links, then the summed IoU.
+    """
+    def match(det_boxes, det_bases, track_boxes, track_bases, iou_thresh):
+        pairs = _candidate_pairs(det_boxes, track_boxes)
+        if len(pairs) == 0:
+            return []
+        di, ti = pairs[:, 0], pairs[:, 1]
+        a, b = det_boxes[di], track_boxes[ti]
+        inter = (np.maximum(0.0, np.minimum(a[:, 2], b[:, 2]) - np.maximum(a[:, 0], b[:, 0]))
+                 * np.maximum(0.0, np.minimum(a[:, 3], b[:, 3]) - np.maximum(a[:, 1], b[:, 1])))
+        area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+        area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+        iou = inter / (area_a + area_b - inter + 1e-8)
+        iomin = inter / (np.minimum(area_a, area_b) + 1e-8)
+        ok = ((((1.0 - iou) <= 1.0 - iou_thresh) | (iomin >= iomin_thresh))
+              & (det_bases[di] == track_bases[ti]))
+        di, ti, weight = di[ok], ti[ok], 1.0 + iou[ok]
+        if len(di) == 0:
+            return []
+        n_d = len(det_boxes)
+        graph = coo_matrix((np.ones(len(di)), (di, n_d + ti)),
+                           shape=(n_d + len(track_boxes),) * 2)
+        block = connected_components(graph, directed=False)[1][di]
+        out = []
+        for c in np.unique(block):
+            sel = block == c
+            ud, rd = np.unique(di[sel], return_inverse=True)
+            ut, rt = np.unique(ti[sel], return_inverse=True)
+            sub = np.zeros((len(ud), len(ut)))
+            sub[rd, rt] = weight[sel]
+            r, k = linear_sum_assignment(sub, maximize=True)
+            keep = sub[r, k] > 0
+            out.extend(zip(ud[r[keep]], ut[k[keep]]))
+        return out
+    return match
+
+
+def _class_blind(match):
+    """Match function that ignores the neuron/glia base of detections and tracks."""
+    def run(det_boxes, det_bases, track_boxes, track_bases, iou_thresh):
+        return match(det_boxes, np.zeros(len(det_bases), int), track_boxes,
+                     np.zeros(len(track_bases), int), iou_thresh)
+    return run
+
+
+@contextmanager
+def _matchers(sparse, dense):
+    """Run run_z_linker with other match functions (it looks them up at call time).
+    Not thread-safe; Stage 3 links each channel in its own process or in sequence."""
+    global _match_sparse, _match_dense
+    saved = _match_sparse, _match_dense
+    _match_sparse, _match_dense = sparse, dense
+    try:
+        yield
+    finally:
+        _match_sparse, _match_dense = saved
+
+
+def link_tracks(full_stack_matrix, iou_thresh, min_z_layers, max_cell_z_span, max_z_gap,
+                link_iomin_thresh=None, link_across_classes=False,
+                cross_tile_dedup_iou=None, cross_tile_dedup_iomin=None,
+                channel_id=None, rejected_tracks=None, dedup_rows=None):
+    """Stage 3 z linking: run_z_linker plus the soma options (STAGE3_LINK_DEFAULTS).
+
+    cross_tile_dedup_iou / _iomin: dedup_cross_tile before linking (both None = off);
+        dropped boxes are appended to dedup_rows.
+    link_iomin_thresh: a box also continues a track when one of the two boxes contains
+        the other (IoMin >= this), not only when IoU >= iou_thresh.
+    link_across_classes: neuron and glia boxes link into one track; a track with any
+        glia member is glia (as the Phase A neuron/glia dedup keeps glia).
+    With every option off this is run_z_linker.
+    """
+    if isinstance(full_stack_matrix, list):
+        full_stack_matrix = np.array(full_stack_matrix, dtype=object)
+    mat = full_stack_matrix
+    if mat.size and (cross_tile_dedup_iou is not None or cross_tile_dedup_iomin is not None):
+        mat = dedup_cross_tile(
+            mat, np.inf if cross_tile_dedup_iou is None else cross_tile_dedup_iou,
+            np.inf if cross_tile_dedup_iomin is None else cross_tile_dedup_iomin, dedup_rows)
+    sparse, dense = _match_sparse, _match_dense
+    if link_iomin_thresh is not None:
+        sparse = dense = _match_iou_or_iomin(link_iomin_thresh)
+    if link_across_classes:
+        sparse, dense = _class_blind(sparse), _class_blind(dense)
+    with _matchers(sparse, dense):
+        summary, volumes = run_z_linker(
+            mat, iou_thresh=iou_thresh, min_z_layers=min_z_layers,
+            max_cell_z_span=max_cell_z_span, max_z_gap=max_z_gap,
+            channel_id=channel_id, rejected_tracks=rejected_tracks)
+    if link_across_classes:
+        # summary rows and volumes are built in the same order, one per kept track
+        for row, cell in zip(summary, volumes):
+            if (_base_and_rest(cell['class'])[0] != 'glia' and any(
+                    _base_and_rest(m['class'])[0] == 'glia' for m in cell['member_detections'])):
+                cell['class'] = row[6] = _as_glia(cell['class'])
+    return summary, volumes
