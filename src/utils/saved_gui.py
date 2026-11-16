@@ -23,7 +23,7 @@ from src.utils.saved_view import (
     s4_source_tracks, stage3_geometry, track_for_summary,
 )
 from src.utils.visualize import (
-    _add_contrast_panel, _canvas_shape_from_tile, _ch_vis, _list_tiffs, _make_fn_recorder,
+    _add_contrast_panel, _apply_initial_layout, _canvas_shape_from_tile, _ch_vis, _list_tiffs, _make_fn_recorder,
     _resolve_z_range, _show_only_images_initially, load_frame_volume,
 )
 
@@ -657,6 +657,7 @@ def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles, progres
             _show_only_images_initially(viewer, vis_cfg)
             viewer.reset_view()
             add_video_export_panel(viewer, vis_cfg)
+            _apply_initial_layout(viewer)
             if progress:
                 progress(tile_index, len(selected_tiles), tile_name)
         return
@@ -703,6 +704,7 @@ def run_saved_prealign(vis_cfg, paths, routing, context, selected_tiles, progres
     _show_only_images_initially(viewer, vis_cfg)
     viewer.reset_view()
     add_video_export_panel(viewer, vis_cfg)
+    _apply_initial_layout(viewer)
 
 
 def _load_offsets_if_present(result_dir, tile_name):

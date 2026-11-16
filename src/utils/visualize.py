@@ -37,8 +37,9 @@ from src.utils.coordinate_context import CoordinateContextError
 import numpy as np
 import pandas as pd
 import napari
-from qtpy.QtCore import QTimer
-from qtpy.QtWidgets import QApplication, QMessageBox, QWidget, QGridLayout, QLabel, QSpinBox, QLineEdit
+from qtpy.QtCore import Qt, QTimer
+from qtpy.QtWidgets import (QApplication, QDockWidget, QMessageBox, QWidget, QGridLayout,
+                            QLabel, QSpinBox, QLineEdit)
 
 from src.utils.video_export import add_video_export_panel
 from src.config.loader import load_config
@@ -346,6 +347,28 @@ def _show_only_images_initially(viewer, vis_cfg):
         return
     for layer in viewer.layers:
         layer.visible = layer.name.startswith('[img]')
+
+
+def _apply_initial_layout(viewer):
+    """Hide every box (Shapes) layer, keep the layer list alone on the left and
+    stack every other visible panel as tabs on the right. Call after all docks exist."""
+    for layer in viewer.layers:
+        if isinstance(layer, napari.layers.Shapes):
+            layer.visible = False
+
+    qt_window = viewer.window._qt_window
+    layer_list = viewer.window._qt_viewer.dockLayerList
+    controls = viewer.window._qt_viewer.dockLayerControls
+    qt_window.addDockWidget(Qt.LeftDockWidgetArea, layer_list)
+    # napari's console dock is created hidden; leave hidden docks alone.
+    others = [d for d in qt_window.findChildren(QDockWidget)
+              if d is not layer_list and d is not controls and not d.isHidden()]
+    qt_window.addDockWidget(Qt.RightDockWidgetArea, controls)
+    for dock in others:
+        qt_window.addDockWidget(Qt.RightDockWidgetArea, dock)
+        qt_window.tabifyDockWidget(controls, dock)
+    controls.show()
+    controls.raise_()
 
 
 # ── Contrast control panel ─────────────────────────────────────────────────────
@@ -772,6 +795,7 @@ def _run_2d(vis_cfg, paths, routing_config, tile_path, tile_name):
     _show_only_images_initially(viewer, vis_cfg)
     viewer.reset_view()
     add_video_export_panel(viewer, vis_cfg)
+    _apply_initial_layout(viewer)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

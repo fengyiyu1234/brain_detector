@@ -1920,3 +1920,17 @@ set PYTHONPATH=.
   - 层与层之间差别很大（同一样本的单层去除比例可差 3–10 倍），所以每个样本的数字只是 12 层的合计。
   - 注意：匹配阈值假设各样本假阳性比例与 ET10 相同，不一定成立，需要看图判断。
 - **下一步**：用户看报告后决定每个样本的 `contrast_filter.{Olig2,Sox9}.snr_min`；改了之后该样本要从 Stage 2.2/2.25 重跑（对齐也会重跑）。
+
+## 2026-11-15 SNR：局部噪声 vs 本层噪声对比图（未改 pipeline）
+
+- **起因**（用户看 ERH 抽样图）：挤在一起的亮核 SNR < 3 被去掉，孤立在黑背景里的暗框 SNR ≥ 5 却留下。ERH 抽样数据确认问题在分母（环噪声 = 框外 2–8 px 环的 1.4826 × MAD）：SNR < 3 但亮度差（均值 − 环中位数）在本层前一半的框，环噪声是本层中位数的 4.4 倍（Sox9）/ 6.3 倍（Olig2），这类框占 SNR<3 的 20% / 25%；SNR ≥ 5 但亮度差在本层最低 1/4 的框，环噪声只有 0.6 倍。原始亮度不适合直接做阈值：ERH 各层背景中位数 Olig2 3221–8417、Sox9 689–1445。
+- **新工具 `src/utils/snr_slice_compare.py`**（只读）：分子不变，分母换成本层噪声（同 tile 同层所有框环噪声的中位数，0 不计）。复用 `snr_survey/01` 的 features.csv（同样的层），每层一张图左右对照：左边按现在的 SNR 上色，右边按新算法上色；新算法的阈值取"在该样本去掉同样多的框"，青点 = 只有现在的算法去掉，品红点 = 只有新算法去掉。图上写了整层在 <3 … <8 各阈值下两种算法去掉的框数和占比（用户要求）。截取区域选这一层里结果不同的框最多的地方。测试 `tests/test_snr_slice_compare.py`（2 项），连同 test_snr_survey 共 5 项通过。
+- **结果** `X:\Fengyi\snr_survey\02\`（25 个样本，44 个样本×通道，`index.csv` 已登记）：ET10 上新算法相当于现在阈值的值为 Olig2 3.7、Sox9 5.3。去掉同样多的框时，约三分之一换成别的框（如 ERH Sox9：两种都去掉 4,181，只有一种去掉的各 2,288）。
+- **看到的问题**：组织边缘的亮带（如 TSC_FW2 Olig2）上的框，现在的算法判成低 SNR 去掉，新算法反而保留。这些可能是边缘亮光，不是核。备选折中：分母仍用环噪声，但限制在本层噪声的 0.5–2 倍之间。待用户看图决定。
+
+## 2026-11-15（续）可视化 GUI 打开时的默认布局
+
+- `src/utils/visualize.py` 新增 `_apply_initial_layout(viewer)`，在所有面板加好之后调用（`visualize.py` 的 2D 查看器，`saved_gui.py` 的 local / global 两个查看器）：
+  - 所有 box 层（napari Shapes 层）打开时一律隐藏，不受"Start with images only"选项影响；其他层仍按该选项处理。
+  - 左侧只放 layer list；layer controls、Contrast (manual)、Source image、Video export 全部移到右侧，叠成一组标签页（默认显示 layer controls）。napari 自带的 console（默认隐藏）不动。
+- `tests/test_saved_pre_gui.py` 的假 viewer 没有 Qt 窗口，setUp 里把 `_apply_initial_layout` patch 掉（与 contrast / video 面板相同）。test_saved_pre_gui（17 项）、test_tile_2d_sources、test_video_export 通过；布局逻辑用纯 Qt 窗口单独验证过（本机 Claude 会话里无法创建 napari 层，DLL 加载报 0xC06D007F，未在真实窗口里看）。
