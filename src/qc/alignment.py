@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import tifffile
 from src.config.loader import load_config
-from src.core.provenance import file_sha256, file_stamp, output_manifest_valid, write_output_manifest
+from src.core.provenance import code_sha256, file_sha256, file_stamp, output_manifest_valid, write_output_manifest
 from src.utils import validate_align_shifts as validation
 from src.utils.alignment_intensity_qc import image_files
 from src.utils.io import anchor_slice_key
@@ -23,6 +23,18 @@ from .alignment_flags import resolve_flag_options, write_flags
 from .alignment_plots import curve_summary, overview, plot_curves
 from .common import mapped_path, save_json, stamps, unchanged, worker_count
 from .sampling import choose_region, cohort, prepare_tile, scan_footprint
+
+# The linking code QC runs (validate_align_shifts -> run_z_linker and its helpers), hashed by function so
+# Stage 3-only linking code later in z_linker.py does not invalidate QC records.
+# tests/test_checkpoint_code_lists.py fails if run_z_linker starts using an unlisted helper.
+ALIGN_LINK_CODE = (
+    'src.core.z_linker:_IOU_BLOCK', 'src.core.z_linker:_candidate_pairs',
+    'src.core.z_linker:_iou_matrix', 'src.core.z_linker:_match_dense',
+    'src.core.z_linker:_match_sparse', 'src.core.z_linker:_median',
+    'src.core.z_linker:_parse_cached', 'src.core.z_linker:parse_class_string',
+    'src.core.z_linker:run_z_linker',
+    'src.utils.markers:clean_markers', 'src.utils.markers:split_class',
+)
 
 DEFAULTS = {
     'enabled': False, 'reference_channel': None, 'soma_channels': None, 'tf_channels': None,
@@ -230,7 +242,8 @@ def input_signature(tile, params, previous=None, saved_region=None):
     report_only = {'alignment_flags.py', 'run_qc.py'}
     code = {str(p): file_sha256(p) for p in [*(q for q in Path(__file__).parent.glob('*.py') if q.name not in report_only),
         Path(validation.__file__), Path(__file__).parents[1]/'core/point_cloud_aligner.py',
-        Path(__file__).parents[1]/'core/z_linker.py', Path(__file__).parents[1]/'utils/alignment_intensity_qc.py']}
+        Path(__file__).parents[1]/'utils/alignment_intensity_qc.py']}
+    code['z_linker'] = code_sha256(None, ALIGN_LINK_CODE)
     options = {k: v for k, v in params['options'].items() if k != 'flagging'}
     return dict(options=options, settings=params['settings'], inputs=stamps(paths), code=code,
                 roots=params['channel_roots'], previous=previous, saved_region=saved_region,

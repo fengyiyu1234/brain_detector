@@ -11,8 +11,9 @@ import pandas as pd
 
 from scripts.run_inference import prepare_alignment_inputs, run_contrast_stage
 from src.core.local_contrast import (
-    CONTRAST_SUBDIR, resolve_contrast_filter, run_contrast_tile, contrast_settings, slice_ring_stats,
+    CONTRAST_SUBDIR, run_contrast_tile, contrast_settings, slice_ring_stats,
 )
+from src.core.snr_filter import resolve_snr_filter as resolve_contrast_filter
 
 SOX9 = {"id": "Sox9", "type": "tf", "model": "stardist", "dir_key": "sox9_dir"}
 GFP = {"id": "GFP", "type": "soma", "model": "yolo", "dir_key": "gfp_dir"}
@@ -69,10 +70,21 @@ class ResolveContrastFilterTests(unittest.TestCase):
                          {"Sox9": {"snr_min": 5.0}})
         self.assertEqual(resolve_contrast_filter(self.config({"Sox9": {"snr_min": None}})), {})
         self.assertEqual(resolve_contrast_filter({"channels_routing": [SOX9]}), {})
+        self.assertEqual(resolve_contrast_filter(self.config({"Sox9": {"snr_min": 5, "noise": "ring"}})),
+                         {"Sox9": {"snr_min": 5.0}})
+        self.assertEqual(
+            resolve_contrast_filter(self.config({"Sox9": {"snr_min": 5, "noise": "slice",
+                                                          "max_removed_frac": 0.35}})),
+            {"Sox9": {"snr_min": 5.0, "noise": "slice", "max_removed_frac": 0.35,
+                      "snr_step": 1.0, "snr_floor": 2.0}})
 
     def test_rejects_bad_specs(self):
         for spec in ({"Olig2": {"snr_min": 5}}, {"GFP": {"snr_min": 5}},
-                     {"Sox9": {"snr": 5}}, {"Sox9": {"snr_min": True}}, {"Sox9": {"snr_min": float("nan")}}):
+                     {"Sox9": {"snr": 5}}, {"Sox9": {"snr_min": True}}, {"Sox9": {"snr_min": float("nan")}},
+                     {"Sox9": {"snr_min": 5, "noise": "local"}},
+                     {"Sox9": {"snr_min": 5, "max_removed_frac": 1.5}},
+                     {"Sox9": {"snr_min": 5, "max_removed_frac": 0.3, "snr_step": 0}},
+                     {"Sox9": {"snr_min": 5, "max_removed_frac": 0.3, "snr_floor": 6}}):
             with self.assertRaises(ValueError):
                 resolve_contrast_filter(self.config(spec))
         fused = dict(SOX9, double_exposure=True)
@@ -128,6 +140,14 @@ class ContrastPipelineTests(unittest.TestCase):
             config["contrast_filter"]["Sox9"]["snr_min"] = 0.5
             prepare_alignment_inputs(config, ["t"], [SOX9], str(raw), str(filtered))
             self.assertEqual(len(pd.read_csv(filtered / "t_Sox9_result.csv")), 6)
+
+            config["contrast_filter"]["Sox9"] = {"snr_min": 5, "noise": "slice", "max_removed_frac": 0.3}
+            prepare_alignment_inputs(config, ["t"], [SOX9], str(raw), str(filtered))
+            slice_kept = pd.read_csv(filtered / "t_Sox9_result.csv")
+            # the dim box is 1/3 of each slice > 30%: threshold drops to the floor (2), still below
+            self.assertEqual(slice_kept.detection_id.tolist(), ["d1_0", "d1_2", "d2_0", "d2_2"])
+            self.assertEqual(slice_kept.snr_threshold.tolist(), [2.0] * 4)
+            self.assertTrue(slice_kept.slice_noise.gt(0).all())
 
             del config["contrast_filter"]
             prepare_alignment_inputs(config, ["t"], [SOX9], str(raw), str(filtered))

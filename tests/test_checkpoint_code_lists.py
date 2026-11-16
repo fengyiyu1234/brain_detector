@@ -110,6 +110,16 @@ class CheckpointCodeListTest(unittest.TestCase):
                       _closure({'measure_seams'}, solver, tpp.SOLVE_LOG_CALLS))
         tpp.solver_code_sha256()
 
+    def test_alignment_qc_link_list_is_closed(self):
+        from src.qc import alignment as qc_alignment
+        listed = set(qc_alignment.ALIGN_LINK_CODE)
+        missing = _closure(listed, qc_alignment, ()) - listed
+        self.assertFalse(
+            missing, f"src.qc.alignment.ALIGN_LINK_CODE is missing {sorted(missing)}")
+        self.assertIn('src.core.z_linker:_match_sparse',
+                      _closure({'src.core.z_linker:run_z_linker'}, qc_alignment, ()))
+        code_sha256(None, qc_alignment.ALIGN_LINK_CODE)
+
     def test_code_hash_ignores_comments_line_endings_and_logging(self):
         def text(*source_lines, newline='\n'):
             source = newline.join(source_lines) + newline

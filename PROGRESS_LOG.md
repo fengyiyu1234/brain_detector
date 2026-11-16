@@ -1934,3 +1934,55 @@ set PYTHONPATH=.
   - 所有 box 层（napari Shapes 层）打开时一律隐藏，不受"Start with images only"选项影响；其他层仍按该选项处理。
   - 左侧只放 layer list；layer controls、Contrast (manual)、Source image、Video export 全部移到右侧，叠成一组标签页（默认显示 layer controls）。napari 自带的 console（默认隐藏）不动。
 - `tests/test_saved_pre_gui.py` 的假 viewer 没有 Qt 窗口，setUp 里把 `_apply_initial_layout` patch 掉（与 contrast / video 面板相同）。test_saved_pre_gui（17 项）、test_tile_2d_sources、test_video_export 通过；布局逻辑用纯 Qt 窗口单独验证过（本机 Claude 会话里无法创建 napari 层，DLL 加载报 0xC06D007F，未在真实窗口里看）。
+
+## 2026-11-16 SNR 过滤：可选本层噪声 + 按层自动降低阈值（配置未改）
+
+- 用户决定 Sox9/Olig2 的 SNR 用本层噪声（`snr_survey/02` 对比过的算法），并希望每层自动调阈值：从 `snr_min` 开始，若某层会去掉超过 `max_removed_frac` 的框，阈值减 `snr_step`，直到不超过或再减就低于 `snr_floor`。
+- **新模块 `src/core/snr_filter.py`**（`resolve_snr_filter`、`apply_snr_filter`、`snr_filter_signature`、`slice_thresholds`），`run_inference.py`、`refilter_align.py`、`refilter_detections.py` 改用它。配置：
+  `"contrast_filter": {"Sox9": {"snr_min": 5, "noise": "slice", "max_removed_frac": 0.35, "snr_step": 1, "snr_floor": 2}}`
+  - `noise`：`ring`（默认，原算法）或 `slice`（分母 = 同 tile 同一张层图像上所有原始框环噪声的中位数，0 不计；与 snr_slice_compare 相同）。
+  - 层 = 同 tile 同一张 source_image。比例的分母 = 这一层进入 SNR 这一步的框（常规过滤、patch fragment 之后），没有 SNR 的框保留并计入分母。默认 step 1、floor 2，`max_removed_frac` 默认 null（不自动调）。
+  - 输出多两列：`snr_threshold`（该层实际阈值），slice 模式还有 `slice_noise`；`snr` 列是实际比较的值（slice 模式下是本层 SNR）。日志打印每个 tile 降了几层、最低到多少。
+  - 只写 `snr_min` 的旧配置（简单形式）结果和 checkpoint 签名与原来完全一样（有测试对比旧函数），这些样本不会重跑。用了新选项的签名加 `snr_filter.py` 的 hash。
+- **`local_contrast.py` 一个字节没改**：Stage 2.2 签名对整个文件做 hash，改了会让所有样本重新读图算 SNR 表。因此里面旧的 `resolve_contrast_filter` / `apply_snr_filter` 已不被 pipeline 调用（只在测试里用来对比），以后 2.2 本身必须改时再删。
+- SNR 过滤每组框只执行一次（pre_align 在 2.25，其他模式在 2.75），不会出现 2.25 降了阈值、2.75 又按原阈值去掉的问题。
+- `run_inference.py` 改动 → 下次运行 Stage 4 colocalization 会重算（CLAUDE.md 所述）。
+- **抽样估计**（`snr_survey/01` 的 12 层，本层噪声，Olig2 4 / Sox9 5，35%，floor 2）：Olig2 多数样本 0–1 层被降，TSC_FW2 5 层；Sox9 每个样本 2–11 层被降（约一半），总去除比例从 25–66% 变为 21–36%（batch4_sample5 66% → 36%，ET10 33% → 28%）。降到 floor 2 的层不少（ET10、batch4_sample4/5、TSC8/10、tsc12q/t 等）。
+- 测试：新增 `tests/test_snr_filter.py`（4 项）；`test_local_contrast` 增加新选项的校验和 slice 模式管线测试。全部测试文件逐个运行通过（`test_tile_2d_sources.py` 未跑，改动前就崩溃）。
+- **下一步**：用户决定每个 config 的 Sox9/Olig2 参数。改了的样本从 Stage 2.25 重新过滤，已有对齐的会被 2.25 的冲突检查拦下，需先归档对齐及之后的结果。
+
+## 2026-11-16（续）TF 通道去掉百分位过滤；Sox9/Olig2 SNR 配置全部改为本层噪声 + 自动降阈值；预览 snr_survey/03
+
+- **配置（25 个，原文件备份在会话临时目录）**：
+  - `detection_params.stardist` 删掉 `bbox_area_pct_min`、`bbox_mean_pct_min`、`bbox_mean_min`。只有 Sox9/Olig2 用 stardist；YOLO（GFP/RFP）的 `bbox_area_pct_min 5` 不动，代码里这些选项也保留。TF 的 2.25 过滤顺序现在是 bbox 8–28 → 长宽比 ≤ 3 → score ≥ 0.35 → SNR（stardist 注释已改）。
+  - `contrast_filter`：25 个 Sox9 都是 `{"snr_min": 5, "noise": "slice", "max_removed_frac": 0.35, "snr_step": 1, "snr_floor": 2}`；有 Olig2 的 19 个加 `{"snr_min": 5, "noise": "slice", "max_removed_frac": 0.35, "snr_step": 1, "snr_floor": 4}`（之前没有任何 config 给 Olig2 设 SNR）。参数都写明在 config 里，用户会逐个样本看报告再改。
+  - 脚本核对过：除这三项和 contrast_filter 外，每个 config 解析后完全不变。
+  - 注意：所有样本的 2.25 签名都变了，下次运行重新过滤 Sox9/Olig2；已有对齐的样本会被冲突检查拦下，需要先归档对齐及之后的结果。2.25 的结果用于对齐和 tile 位置（Olig2 是 stitching_reference_channel），所以拼接也会变。Stage 2.2 SNR 表不用重算。
+- **`snr_filter.py`**：本层噪声 SNR 提成 `slice_snr()`，供管线和预览工具共用。
+- **新工具 `src/utils/snr_filter_preview.py`**（只读）：读 snr_survey/01 缓存的抽样层（每层所有原始框及环形统计），按各 config 的新常规过滤 + contrast_filter 计算（调用管线同一套函数；遇到需要整个 tile 的百分位或 patch_fragment 规则就报错）。每个样本写 report.html：每层的阈值、去掉的框数、各 SNR 下的占比，每层一张图（框按 SNR 分色，品红点 = 被 SNR 去掉，灰 = 被常规过滤去掉）。测试 `tests/test_snr_filter_preview.py`：预览保留的框与管线 `filter_detection_df` + `apply_snr_filter` 完全相同。
+- **结果 `X:\Fengyi\snr_survey\03\`**（index.csv 已登记）：去掉百分位过滤后，常规过滤多保留 7–20% 的框。
+  - Olig2：SNR 去掉 15–32%（固定 5 时 15–41%），每样本 1–9/12 层降到 4。降到 4 仍超过 35% 的层：TSC_FW2 5 层（最高 62%），ERH 3 层，另有 9 个样本各 1 层。
+  - Sox9：SNR 去掉 23–30%（固定 5 时 31–50%）；batch4_sample5 例外，12 层全降，仍去掉 41%，其中 4 层在 floor 2 仍超过 35%（最高 75%）。最低阈值 2 或 3。
+- 测试：test_snr_filter_preview（1）、test_snr_filter（4）、test_local_contrast（6）、test_snr_slice_compare、test_snr_survey 通过。
+- **（11-16 续）** 用户要求：所有 config 的 `max_removed_frac` 默认改为 0.4（25 个 Sox9、19 个 Olig2，脚本核对过其他设置不变）。规则不变（逐步降，每步重新算比例）；之后由用户按报告逐个样本、分通道手动调。snr_survey/03 是按 0.35 算的。
+- **（11-16 续）** 用户要求：所有 config 的 `snr_floor` 统一为 3（原 Sox9 2、Olig2 4）。现在 25 个 Sox9、19 个 Olig2 都是 `{"snr_min": 5, "noise": "slice", "max_removed_frac": 0.4, "snr_step": 1, "snr_floor": 3}`，阈值只会是 5、4、3。
+- **（11-16 续）** 用户要求：所有 config 的 Sox9 `snr_step` 改为 0.5（Olig2 仍为 1）。Sox9 阈值可取 5、4.5、4、3.5、3。
+- **（11-16 续）** 用户要求：16 个 TSC 样本（config/TSC、config/TSC2）的 Sox9 `snr_min` 改为 5.5；EGFR 的 9 个仍为 5。TSC_FF6 的 Sox9 `max_removed_frac` 是用户手动设的 0.45，未动。
+
+## 2026-11-16（续）Sox9 参数全部统一；SNR 过滤敏感性检查 snr_survey/04
+
+- **配置**：用户决定所有样本（EGFR + TSC，25 个）用同一套参数，便于比较。Sox9 统一为 `{"snr_min": 5.5, "noise": "slice", "max_removed_frac": 0.45, "snr_step": 0.5, "snr_floor": 3}`（之前 EGFR 9 个是 5/0.4，TSC 13 个 5.5/0.4，3 个已手动设 0.45）。Olig2 仍为 `{"snr_min": 5, "noise": "slice", "max_removed_frac": 0.4, "snr_step": 1, "snr_floor": 3}`。
+- **新工具 `src/utils/snr_sensitivity.py`**（只读，无图，约 40 秒）：在 snr_survey/01 的抽样层上，以各 config 的参数为基线，每次只改一个参数（snr_min ±0.5、max_removed_frac ±0.05 和关掉、snr_floor ±步长、换步长、不做 SNR），用 `snr_filter_preview.apply_filters`（管线同一套函数）。指标：各样本保留框数相对基线的比值在样本间的范围（max/min）和样本排序的 Spearman。
+- **结果 `X:\Fengyi\snr_survey\04\`**：
+  - 基线：Sox9 中位样本去掉 39%，Olig2 26%。
+  - 单个参数在上述范围内变化：各样本保留框数变化 ≤ 10%，样本间的比值差（max/min）Sox9 ≤ 1.10、Olig2 ≤ 1.09，Spearman ≥ 0.996。样本间比较不依赖这些参数的具体值。
+  - 关掉自动降阈值：Sox9 max/min 1.51（batch4_sample5 少 35%，其他样本少 2–10%），Olig2 1.14（TSC_FW2）。
+  - 不做 SNR：Sox9 多保留 47–135%（max/min 1.59），Olig2 17–50%（1.28，Spearman 0.96）。用不用 SNR 过滤会改变样本间比较，参数的细调不会。
+  - 局限：每个样本只有 12 层；只说明结果稳不稳，不说明过滤对不对（要靠看图）。
+
+## 2026-11-16（续）对齐 QC 全部打开；ERH QC 设置修正；QC 签名不再 hash 整个 z_linker.py
+
+- **配置**：25 个 config 的 `qc.alignment.enabled` 全部为 true（之前只有 batch4_sample4/5、ETail）。ERH 的 `qc.alignment.soma_channels` 由 `["RFP"]` 改为 `["GFP"]`（与 reference_channel RFP 重复，一打开就会报错）。脚本核对过其他设置不变，25 个都能通过 `resolve_options`。对齐 QC 读图像，每个样本运行时间会增加。
+- **对齐 QC checkpoint**（已有，按 tile：`qc/alignment/tiles/{tile}.json` + manifest）：签名原来含整个 `z_linker.py` 的 hash，11-13 加 Stage 3 连接代码后所有样本的 QC 都会无谓重算。现在改为 `ALIGN_LINK_CODE`（`run_z_linker` 及其 helper，按函数 `code_sha256`），与 Stage 2.9 的做法相同。新测试（`test_checkpoint_code_lists`）发现 `run_z_linker` 还用到 `src.utils.markers` 的 `split_class`、`clean_markers`，原来的整文件 hash 也没覆盖，已加入列表。CLAUDE.md 已记。
+  - 签名格式变化 → 下次运行所有 tile 的对齐 QC 重算一次（本来也会：Sox9/Olig2 过滤改了，对齐要重跑）。
+- 测试：test_checkpoint_code_lists（5）、test_alignment_qc_runner（5）、test_qc_alignment（5，本机现在能跑通）、test_alignment_flags、test_alignment_sampling 通过。

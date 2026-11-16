@@ -23,7 +23,7 @@ from src.core.detection_filter import (
     FILTER_SCHEMA_VERSION, filter_detection_df, resolve_filter_params,
     source_dir_for_channel,
 )
-from src.core.local_contrast import resolve_contrast_filter
+from src.core.snr_filter import resolve_snr_filter
 
 
 def _derived_paths(config: dict) -> dict[str, str]:
@@ -75,7 +75,7 @@ def main() -> int:
            .get('patch_fragment_iomin') is not None
            for ch in config.get('channels_routing', []) if ch.get('id') in selected_ids):
         raise ValueError("patch_fragment_iomin needs the full pipeline (Stage 2.25/2.75)")
-    contrast = set(resolve_contrast_filter(config)) & set(selected_ids)
+    contrast = set(resolve_snr_filter(config)) & set(selected_ids)
     if contrast:
         raise ValueError(f"contrast_filter (SNR) channel(s) {sorted(contrast)} need the full pipeline "
                          "(Stage 2.2/2.25); this tool does not apply the SNR filter.")

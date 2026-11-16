@@ -35,9 +35,9 @@ from src.core.detection_filter import (
     FILTER_SCHEMA_VERSION, atomic_write_csv, filter_detection_df, resolve_filter_params, source_dir_for_channel,
 )
 from src.core.local_contrast import (
-    CONTRAST_SUBDIR, apply_snr_filter, contrast_filter_signature, contrast_paths, contrast_ready,
-    contrast_settings, resolve_contrast_filter, run_contrast_tile,
+    CONTRAST_SUBDIR, contrast_paths, contrast_ready, contrast_settings, run_contrast_tile,
 )
+from src.core.snr_filter import apply_snr_filter, resolve_snr_filter, snr_filter_signature
 from src.core.stitcher import fuse_dual_intensity_2d
 from src.core.patch_fragments import (
     candidate_paths as fragment_candidate_paths, resolve_patch_fragment,
@@ -221,16 +221,17 @@ def contrast_step(contrast_filter, raw_dir, tile, channel_id):
     if channel_id not in contrast_filter:
         return None, None
     contrast_csv, _ = contrast_paths(os.path.join(raw_dir, CONTRAST_SUBDIR), tile, channel_id)
+    raw_csv = os.path.join(raw_dir, f"{tile}_{channel_id}_result.csv")
     params = contrast_filter[channel_id]
-    signature = contrast_filter_signature(contrast_csv, params, contrast_settings())
+    signature = snr_filter_signature(contrast_csv, params, contrast_settings())
     return signature, lambda kept, rejected, stats: apply_snr_filter(
-        kept, rejected, stats, contrast_csv, params['snr_min'])
+        kept, rejected, stats, contrast_csv, raw_csv, params)
 
 
 def prepare_alignment_inputs(config, tile_names, detect_routing, raw_dir, filtered_dir):
     """Filter raw tile detections before estimating pre-align channel shifts."""
     os.makedirs(filtered_dir, exist_ok=True)
-    contrast_filter = resolve_contrast_filter(config)
+    contrast_filter = resolve_snr_filter(config)
     logical_channels = {ch['id']: ch for ch in config['channels_routing']}
     for ch in config['channels_routing']:
         if ch.get('double_exposure'):
@@ -548,7 +549,7 @@ if __name__ == '__main__':
     # Resolve and validate pre-align settings before detection to catch configuration
     # errors or conflicts with existing alignment results early.
     align_settings = None
-    contrast_filter = resolve_contrast_filter(config)
+    contrast_filter = resolve_snr_filter(config)
     if pipeline_mode == 'pre_align':
         align_settings = resolve_align_settings(config, routing_config)
         align_settings['input_stage'] = 'filtered_2d_v1'
