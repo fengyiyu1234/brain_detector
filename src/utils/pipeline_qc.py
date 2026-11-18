@@ -745,8 +745,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="QC JSON/JSONC; paths relative to project root")
     parser.add_argument("--samples", nargs="+", help="Override enabled sample IDs")
+    parser.add_argument("--pipeline-config", nargs="+", default=None,
+                        help="Pipeline config(s); check their pATHRESULT instead of --config's sample list "
+                             "(--config then only supplies thresholds and options)")
     args = parser.parse_args(argv)
     config = load_config(args.config)
+    if args.pipeline_config:
+        config["samples"] = []
+        for path in args.pipeline_config:
+            result_dir = load_config(path)["paths"]["pATHRESULT"]
+            config["samples"].append({"id": os.path.basename(os.path.normpath(result_dir)) + ":" + Path(path).stem,
+                                      "result_dir": result_dir})
     samples = config["samples"]
     ids = [s["id"] for s in samples]
     if len(ids) != len(set(ids)):

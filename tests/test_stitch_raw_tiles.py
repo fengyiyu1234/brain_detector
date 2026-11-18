@@ -83,6 +83,89 @@ class DirectStitchTests(unittest.TestCase):
             run(config)
             self.assertTrue((base / "result" / "GFP_3" / "z00000.tif").is_file())
 
+    def test_xy_only_downsampling_keeps_every_z_slice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            raw = base / "raw"
+            self.make_channel(raw, "640nm", "GFP",
+                              {"A": (0, 0, 0), "B": (2, 0, 1)},
+                              {"A": 100, "B": 200})
+            params = {"enabled": True, "markers": ["GFP"],
+                      "downsample_factor": 2, "downsample_factor_z": 1,
+                      "blend_width_px": 2, "output_dir": str(base / "result")}
+            config = base / "config.json"
+            config.write_text(json.dumps({"raw_sample_dir": str(raw),
+                                          "direct_stitching": params}),
+                              encoding="utf-8")
+            run(config)
+            result = base / "result"
+            manifest = json.loads((result / "stitch_manifest.json").read_text())
+            # 6 raw slices, tiles 1 slice apart in Z: 5 shared slices, none discarded.
+            self.assertEqual(manifest["output_slices"], 5)
+            self.assertEqual((manifest["downsample_factor_xy"],
+                              manifest["downsample_factor_z"]), (2, 1))
+            self.assertNotIn("downsample_factor_xyz", manifest)
+            self.assertEqual(manifest["output_voxel_size_um"], [2.0, 2.0, 2.0])
+            self.assertEqual(len(list((result / "GFP").glob("z*.tif"))), 5)
+            # Output slice k is raw slice k + 1 of tile A (A starts 1 slice earlier).
+            for k in range(5):
+                with Image.open(result / "GFP" / f"z{k:05d}.tif") as image:
+                    self.assertEqual(image.size, (3, 2))
+                    self.assertEqual(image.getpixel((0, 0)), 100 + 10 * (k + 1))
+            run(config, skip_completed=True)
+            params["downsample_factor_z"] = 2
+            config.write_text(json.dumps({"raw_sample_dir": str(raw),
+                                          "direct_stitching": params}),
+                              encoding="utf-8")
+            with self.assertRaises(FileExistsError):
+                run(config, skip_completed=True)
+
+    def test_single_volume_per_marker_in_shared_folder(self):
+        import tifffile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            raw = base / "raw"
+            self.make_channel(raw, "640nm", "GFP",
+                              {"A": (0, 0, 0), "B": (2, 0, 1)},
+                              {"A": 100, "B": 200})
+            shared = base / "stitched_imgs"
+            shared.mkdir()
+            (shared / "other_sample_Olig2_xy4x.tif").write_bytes(b"")
+            params = {"enabled": True, "markers": ["GFP"], "output_name": "S1",
+                      "downsample_factor": 2, "downsample_factor_z": 1,
+                      "blend_width_px": 2, "output_dir": str(shared)}
+            config = base / "config.json"
+            config.write_text(json.dumps({"raw_sample_dir": str(raw),
+                                          "direct_stitching": params}),
+                              encoding="utf-8")
+            run(config, dry_run=True)
+            self.assertFalse((shared / "S1_GFP_xy2x.tif").exists())
+            run(config)
+            volume = shared / "S1_GFP_xy2x.tif"
+            data = tifffile.imread(volume)
+            self.assertEqual(data.shape, (5, 2, 3))
+            self.assertEqual(data.dtype.itemsize, 2)
+            self.assertEqual([int(v) for v in data[:, 0, 0]],
+                             [100 + 10 * (k + 1) for k in range(5)])
+            manifest = json.loads((shared / "S1_GFP_xy2x.json").read_text())
+            self.assertEqual(manifest["file"], volume.name)
+            self.assertEqual(manifest["output_slices"], 5)
+            self.assertEqual(list(manifest["channels"]), ["GFP"])
+            self.assertFalse(list(shared.glob("*.part")))
+            run(config, skip_completed=True)  # finished: skipped
+            with self.assertRaises(FileExistsError):
+                run(config)  # never overwrites
+            (shared / "S1_GFP_xy2x.json").unlink()  # interrupted run: TIFF only
+            with self.assertRaises(FileExistsError):
+                run(config, skip_completed=True)
+            params["output_name"] = "bad/name"
+            config.write_text(json.dumps({"raw_sample_dir": str(raw),
+                                          "direct_stitching": params}),
+                              encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "output_name"):
+                run(config, dry_run=True)
+
     def test_shared_canvas_blending_and_z_offsets(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

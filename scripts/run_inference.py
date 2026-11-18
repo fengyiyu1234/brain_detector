@@ -61,6 +61,7 @@ from src.core.stitcher import (match_soma_3d_iou, merge_soma_volumes_union, soma
                                suppress_cross_class_per_channel,
                                tf_nucleus_groups, tf_nucleus_z_ranges)
 from src.core.z_linker import stage3_link_params
+from src.core.align_window import WINDOW_FILE, resolve_window_mode, tile_windows
 from src.core.point_cloud_aligner import (
     align_tile, tile_alignment_done,
     resolve_align_settings, check_align_settings, save_align_settings,
@@ -131,7 +132,7 @@ def run_stage3_channel_pool(routing, n_workers, src_dir, global_2d_dir, channel_
     return results
 
 
-def run_align_pool(tile_paths, n_workers, det_dir, align_dir, routing, settings):
+def run_align_pool(tile_paths, n_workers, det_dir, align_dir, routing, settings, windows=None):
     """
     Stage 2.5 aligns one tile per CPU task and returns missing detection CSV paths.
     Abort on any tile error; completed offset JSON files allow a later run to resume.
@@ -141,7 +142,8 @@ def run_align_pool(tile_paths, n_workers, det_dir, align_dir, routing, settings)
     missing = []
     with _single_threaded_children(), ProcessPoolExecutor(
             max_workers=n_workers, mp_context=mp.get_context('spawn')) as pool:
-        futs = {pool.submit(align_tile, p, det_dir, align_dir, routing, settings): p for p in tile_paths}
+        futs = {pool.submit(align_tile, p, det_dir, align_dir, routing, settings,
+                            (windows or {}).get(os.path.basename(p))): p for p in tile_paths}
         for fut in tqdm(as_completed(futs), total=len(futs), desc="Pre-Align Tiles"):
             try:
                 missing.extend(fut.result())
@@ -152,6 +154,28 @@ def run_align_pool(tile_paths, n_workers, det_dir, align_dir, routing, settings)
                     f.cancel()
                 raise
     return missing
+
+
+def compute_sample_windows(tile_paths, anchor_root, channel_roots, settings, align_dir):
+    """Non-blank windows/ranges for the tiles still to align, merged into _sample_windows.json.
+
+    nonblank_center uses start/stop; soma_dense uses first/last_nonblank as its bounds.
+    """
+    windows = tile_windows(tile_paths, anchor_root, channel_roots,
+                           settings['sample_z_center_count'], settings['blank_image_max_bytes'])
+    path = os.path.join(align_dir, WINDOW_FILE)
+    saved = {}
+    if os.path.isfile(path):
+        with open(path, encoding='utf-8') as handle:
+            saved = json.load(handle)
+    saved.update(windows)
+    atomic_json(path, saved)
+    empty = sorted(t for t, w in windows.items() if w['start'] is None)
+    logging.info(f"  [2.5] 非黑图窗口（< {settings['blank_image_max_bytes']} 字节算黑图）: "
+                 f"{len(windows) - len(empty)} 个 tile 有组织，{len(empty)} 个无组织（偏移记 0）")
+    if empty:
+        logging.info(f"    无组织: {', '.join(empty[:20])}{' ...' if len(empty) > 20 else ''}")
+    return windows
 
 
 def write_fusion_summary(tile_names, channels, fusion_dir):
@@ -551,7 +575,7 @@ if __name__ == '__main__':
     align_settings = None
     contrast_filter = resolve_snr_filter(config)
     if pipeline_mode == 'pre_align':
-        align_settings = resolve_align_settings(config, routing_config)
+        align_settings = resolve_window_mode(config, resolve_align_settings(config, routing_config))
         align_settings['input_stage'] = 'filtered_2d_v1'
         align_settings['filter_params'] = {
             ch['id']: resolve_filter_params(config, ch) for ch in routing_config
@@ -684,11 +708,17 @@ if __name__ == '__main__':
             todo = [p for p in pATHTILE
                     if not tile_alignment_done(os.path.basename(p), derived['pATH_DET_PREALIGN_FILTERED'],
                                                derived['pATH_ALIGN_OFFSETS'], routing_cfg_align)]
+            sample_windows = None
+            if align_settings.get('sample_z_mode') in ('nonblank_center', 'soma_dense') and todo:
+                sample_windows = compute_sample_windows(
+                    todo, anchor_dir, [paths[ch['dir_key']] for ch in detect_routing_config],
+                    align_settings, derived['pATH_ALIGN_OFFSETS'])
             n_workers = align_worker_count(pre_align_cfg, len(todo))
             logging.info(f"  [2.5] {len(pATHTILE) - len(todo)} 个 tile 已完成，剩余 {len(todo)} 个，"
                          f"{n_workers} 个 CPU 进程并行（纯 CPU 计算，不占 GPU）")
             missing_csvs = run_align_pool(todo, n_workers, derived['pATH_DET_PREALIGN_FILTERED'],
-                                          derived['pATH_ALIGN_OFFSETS'], routing_cfg_align, align_settings)
+                                          derived['pATH_ALIGN_OFFSETS'], routing_cfg_align, align_settings,
+                                          sample_windows)
 
             if missing_csvs:
                 raise RuntimeError(
@@ -1107,6 +1137,11 @@ if __name__ == '__main__':
                            {ch['id']: pATH_SRC_CSV[ch['id']] if isinstance(pATH_SRC_CSV, dict) else pATH_SRC_CSV
                             for ch in routing_config},
                            derived, stage3_worker_count(config, len(routing_config)))
+    # Seam consistency of the Stage 2.9 positions + images of the worst dedup seams (read-only).
+    from src.qc.run_qc import run_seam_checks
+    run_seam_checks(config, base_res_path, geom, routing_config,
+                    {ch['id']: pATH_SRC_CSV[ch['id']] if isinstance(pATH_SRC_CSV, dict) else pATH_SRC_CSV
+                     for ch in routing_config}, derived)
 
     stop_after(config, 'z_linking')
 
@@ -1488,5 +1523,11 @@ if __name__ == '__main__':
         logging.info("Stage 4 complete: cell centroids written.")
 
     stop_after(config, 'exports')
+
+    # Distribution QC, optional integrity QC and the summary qc/qc_summary.json + qc/index.html.
+    from src.qc.run_qc import run_final_checks
+    run_final_checks(config, base_res_path,
+                     {ch['id']: pATH_SRC_CSV[ch['id']] if isinstance(pATH_SRC_CSV, dict) else pATH_SRC_CSV
+                      for ch in routing_config})
 
     logging.info(f"🎉 动态多通道推断全部完成！总耗时: {(time.time() - start_time)/60:.2f} 分钟。")

@@ -4,7 +4,91 @@ from pathlib import Path
 from .common import save_json
 
 
+def run_check(name, function, results_dir, *args, fail_on_error=False, **kwargs):
+    """Run one sample QC check; failures are logged and saved to qc/<name>_error.json only."""
+    error_path = Path(results_dir)/'qc'/f'{name}_error.json'
+    try:
+        summary = function(*args, **kwargs)
+        if error_path.is_file():
+            error_path.unlink()
+        status = summary.get('status', '?') if isinstance(summary, dict) else '?'
+        log = logging.warning if status in ('WARN', 'FAIL') else logging.info
+        log(f"{'⚠️' if status == 'WARN' else '✔️'} [QC] {name}: {status}")
+        return summary
+    except Exception as exc:
+        logging.exception(f'QC check {name} failed')
+        save_json(error_path, {'status': 'failed', 'error': str(exc)})
+        if fail_on_error:
+            raise
+        return {'status': 'FAIL', 'error': str(exc)}
+
+
+def review_enabled(config):
+    return (config.get('qc') or {}).get('review', {}).get('enabled', True)
+
+
+def run_post_alignment_checks(config, results_dir):
+    """A (unaligned tiles) and C (SNR filter) after Stage 2.5; never stop the pipeline,
+    except A with qc.alignment.fail_on_unaligned."""
+    qc = config.get('qc') or {}
+    if config.get('pipeline_mode') == 'pre_align' and (qc.get('unaligned') or {}).get('enabled', True):
+        from .unaligned import run as run_unaligned
+        fail = bool((qc.get('alignment') or {}).get('fail_on_unaligned', False))
+        try:
+            summary = run_unaligned(config, results_dir)
+        except RuntimeError:
+            if fail:
+                raise
+            summary = None
+        except Exception as exc:
+            logging.exception('QC check unaligned failed')
+            save_json(Path(results_dir)/'qc'/'unaligned_error.json', {'status': 'failed', 'error': str(exc)})
+            summary = None
+        if summary:
+            (Path(results_dir)/'qc'/'unaligned_error.json').unlink(missing_ok=True)
+            if summary.get('unaligned_tiles'):
+                logging.warning(f"⚠️ [QC] {len(summary['unaligned_tiles'])} 个有细胞的 tile 对齐得分为 0（没对齐）: "
+                                f"{', '.join(summary['unaligned_tiles'])}")
+            else:
+                logging.info(f"✔️ [QC] unaligned: {summary.get('status')} {summary.get('counts', '')}")
+    if (qc.get('snr') or {}).get('enabled', True):
+        from .snr_qc import run as run_snr
+        run_check('snr', run_snr, results_dir, config, results_dir)
+
+
+def run_seam_checks(config, results_dir, geom, routing, src_dirs, derived):
+    """B (seam consistency of the Stage 2.9 positions) and top-seam dedup images after Stage 3."""
+    qc = config.get('qc') or {}
+    if (qc.get('seam_consistency') or {}).get('enabled', True):
+        from .seam_consistency import run as run_seams
+        run_check('seam_consistency', run_seams, results_dir, config, results_dir)
+    dedup = qc.get('stitch_dedup') or {}
+    if dedup.get('enabled', True) and review_enabled(config) and geom.get('seam_offsets_csv'):
+        from .stitch_dedup_top import run as run_top
+        run_check('stitch_dedup_top', run_top, results_dir, config, results_dir, geom, routing, src_dirs,
+                  derived, int((qc.get('review') or {}).get('top_dedup_seams', 3)))
+
+
+def run_final_checks(config, results_dir, src_dirs):
+    """D (distribution), E (integrity, off by default) and the F summary after Stage 4."""
+    qc = config.get('qc') or {}
+    if (qc.get('distribution') or {}).get('enabled', True):
+        from .distribution import run as run_distribution
+        run_check('distribution', run_distribution, results_dir, config, results_dir, src_dirs)
+    if (qc.get('integrity') or {}).get('enabled', False):
+        from .integrity import run as run_integrity
+        run_check('integrity', run_integrity, results_dir, config, results_dir)
+    from .summary import run as run_summary
+    return run_check('summary', run_summary, results_dir, config, results_dir)
+
+
 def run_alignment_stage(config, results_dir, tiles):
+    report = _run_alignment_qc(config, results_dir, tiles)
+    run_post_alignment_checks(config, results_dir)
+    return report
+
+
+def _run_alignment_qc(config, results_dir, tiles):
     options = config.get('qc', {}).get('alignment', {})
     if not options.get('enabled', False):
         return {'status': 'disabled'}

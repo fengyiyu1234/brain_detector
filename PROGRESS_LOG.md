@@ -1986,3 +1986,452 @@ set PYTHONPATH=.
 - **对齐 QC checkpoint**（已有，按 tile：`qc/alignment/tiles/{tile}.json` + manifest）：签名原来含整个 `z_linker.py` 的 hash，11-13 加 Stage 3 连接代码后所有样本的 QC 都会无谓重算。现在改为 `ALIGN_LINK_CODE`（`run_z_linker` 及其 helper，按函数 `code_sha256`），与 Stage 2.9 的做法相同。新测试（`test_checkpoint_code_lists`）发现 `run_z_linker` 还用到 `src.utils.markers` 的 `split_class`、`clean_markers`，原来的整文件 hash 也没覆盖，已加入列表。CLAUDE.md 已记。
   - 签名格式变化 → 下次运行所有 tile 的对齐 QC 重算一次（本来也会：Sox9/Olig2 过滤改了，对齐要重跑）。
 - 测试：test_checkpoint_code_lists（5）、test_alignment_qc_runner（5）、test_qc_alignment（5，本机现在能跑通）、test_alignment_flags、test_alignment_sampling 通过。
+
+## 2026-11-16（续）25 个样本的旧下游结果归档，准备从 Stage 2.25 重跑
+
+- 用户要求所有 EGFR/TSC 样本按新的核通道过滤重跑（选择移到归档而不是删除；确认没有正在运行的作业）。
+- 每个样本结果目录下新建 `old_results_snr_slice/`（附 README.txt，写明原因、移动清单和新参数），移入存在的 `3_2d_aligned`、`3_2d_aligned_fusion`、`4_2d_filtered`、`5_2d_global`、`6_3d_global`、`7_colocalization`、`qc`，以及 `1_2d_raw/histograms`（Stage 2.8 只看文件是否存在，不移走会留下旧图）。t10、ETail 的 `stitched_direct_4x_*` 拼接图像也移入（tile 位置会变，留着会让 direct stitching 报 FileExistsError）。都是同一共享盘上的改名，不是复制。
+- 保留：`1_2d_raw`（原始检测、contrast SNR 表；Olig2 的 SNR 表重跑时由 Stage 2.2 新算）、`2_2d_filtered`（Sox9/Olig2 签名变了会重新过滤，soma 复用）、日志、run_configs、以前的 old_results_*。
+- 核对：25 个样本 `runtime_config.json` 与当前 config 的原始检测设置一致（删掉的三项在 FILTER_KEYS 里，不算检测设置），启动时的 provenance 检查不会拦。现在每个结果目录只剩 1_2d_raw、2_2d_filtered 和归档。
+- 重跑时会依次：2.2 补算 Olig2 SNR → 2.25 重新过滤 Sox9/Olig2 → 2.5 对齐 + 对齐 QC → 2.6/2.75 → 2.8 直方图 → 2.9 tile 位置 → 拼接/2.97 → Stage 3 → Stage 4。
+
+## 2026-11-16（续）25 个样本提交 HPC 重跑（从 Stage 2.25 起）
+
+- 提交前核对：25 个结果目录只剩 1_2d_raw、2_2d_filtered（及归档、日志）。新建了缺失的日志目录 `scripts/logs`、`scripts/tsc_log`（slurm 的 --output 目录不存在时作业会直接失败）。
+- 每个样本用原 slurm 脚本，命令行覆盖 `--gres=gpu:l40s:1`（QOS p_bme_gpu 共 4 张 L40S，同时最多跑 4 个），CPU/内存/时间沿用脚本。作业号 1942624（batch4_sample4）… 1942648（TSC_FW8），EGFR 9 个在前，TSC 16 个在后。
+- 用户要求全部取消：25 个作业已 scancel。只有 1942624（batch4_sample4）启动过，运行约 2 分钟后被取消，其余都没开始。
+- **（11-16 续）拼接图像**：用户要求删掉以前的拼接图像、关掉所有样本的图像拼接。25 个 config 的 `direct_stitching.enabled` 都为 false（之前 t10、ETail 为 true）。已删除 pipeline 生成的拼接图像：t10、ETail 的 `stitched_direct_4x_*`（刚移进 old_results_snr_slice，README 已注明删除）和本机 `J:/EGFR/T70/stitched2`（只有 GFP、无 manifest 的未完成输出）。TeraStitcher 的输出（10 个 TSC2 样本的 561_stitched/stitched_561、T4/stitched、T4/488_terastitcher_backup）按用户要求保留。tile 位置（Stage 2.9）不受影响，照常计算。
+- 25 个 slurm 脚本的 `--time` 统一为 24:00:00（ET10 原 12h、batch4_sample4 原 48h），然后重新提交，仍用 `--gres=gpu:l40s:1`：作业号 1942770（batch4_sample4）… 1942794（TSC_FW8）。
+
+## 2026-11-17 25 个样本重跑结果检查：完成情况与 QC 问题（未改代码和配置）
+
+- **完成情况**（11-17 08:37 查看）：22 个作业结束，日志都有"全部完成"，exit 0，`.err` 里没有 error 或 traceback。仍在运行：TSC_FW2（Stage 4 3A）、TSC_FW8（Stage 3 Sox9 z-link）、TSC_FW6（2.75，最慢）。EGFR 用时 2.5–5 小时，TSC 1–2.5 小时。
+- **汇总脚本和表**（会话临时目录，只读）：`summarize_logs.py` → `log_summary.csv`（每个样本的 SNR 降阈值比例、2.25 保留率、对齐 QC、2.9 接缝、残留重复、soma/TF 数）；`zero_offsets.py`、`zero_tiles_detail.py` → `zero_tiles.csv`；`seam_resid.py` → `bad_seams.csv`。
+
+### 问题 1：ERH、t70 有含细胞的 tile 没被对齐（固定采样窗口）
+
+- 只有 ERH、t70 用 `sample_z_start_slice: 501`、`sample_z_count: 100`（取第 501–600 层），其余 23 个样本用细胞 z 中位数为中心的窗口。
+- 窗口里没有参考通道（RFP）细胞时，`compute_sequential_joint_shifts` 返回 `missing_reference`：所有通道偏移为 0，得分为 0，pipeline 不报警。
+- ERH 15 个 tile 得分为 0（11-04 记过、未核查的就是这些），其中 5 个 tile 的参考通道框 ≥ 2,000：314700_331400（4,006，细胞全在 z≈50–350）、314700_354000（32,592）、326000_331400（12,488）、337300_376600（3,399）、360000_376600（4,503）。对齐 QC 在这些 tile 上测到 GFP z 偏 +2 到 +4 层（16–32 µm），对齐前后 IoU 完全一样。t70 有 1 个这样的 tile：316800_353000（3,396）。
+- 其余 23 个样本得分为 0 的 tile（每个样本 0–18 个）参考通道框都少于 2,000，都是基本没组织的边角 tile，不影响结果。
+- ERH 对齐 QC 可疑 22/45，除上面这些 tile 外都是 TF 通道 xy 偏 3–6 µm 或 GFP z 偏 ±1 层，与其他样本相当。
+- **待修**：ERH、t70 改为中位数窗口（或加自动回退），然后从 Stage 2.5 重跑。`check_align_settings` 发现设置不一致会报错，需要先归档 3_2d_aligned 及之后的结果。
+
+### 问题 2：2.9 tile 位置，部分接缝多通道一致地偏离求解结果
+
+按 seams.csv 和 tile_positions.csv 重算的残差与 report.txt 一致（batch4_sample5 x/y 最大 148.5/148.3 px）。下面这些接缝上，多个通道的残差方向一致，说明 tile 位置本身可疑，不是某一次测量出错：
+
+- **batch4_sample5**：435100 → 446500 → 457800 行之间的 SOUTH 接缝，4 个通道残差 60–150 px（约 40–95 µm），y 方向最多约 116 px。共 14 条接缝、38 个接缝×通道超过 20 px 或 3 层。
+- batch4_sample4：496700_306700 → 508000_306700，GFP/RFP/Sox9 约 48 px；451400_374600 → 462800_374600，4 个通道约 25 px。
+- ET10：316000_354600 → 327300_354600、316000_365900 → 327300_365900，4 个通道约 30 px；另有 5 条 20–30 px。
+- t70：316800_319100 → 328100_319100，4 个通道约 27 px。t70 GFP 108 px 那条只有 35 个配对，是单次测量出错。
+- t10（333400_330300 → 344800_330300，约 22 px）、ERH（几条 20–54 px，多为 Sox9）、FF11（Sox9 一条 46 px）、FF8（36 px）。
+- 其余 TSC 样本最大残差 < 20 px。
+
+接缝去重用的是 2.97 在本地量出的偏移，所以残留重复不受影响；但这些 tile 的全局坐标（atlas 配准）会偏。
+
+### 问题 3：接缝残留重复（stitch_dedup QC）
+
+- GFP/RFP 全部 ≤ 0.03%。
+- Sox9 总体 0.3–3.4%，单条接缝最大：ERH 14.8%、FW2 11.6%、FF8 10.7%、ET10/t10/ETail 约 10.5%。
+- Olig2：ETail 单条接缝 25.0%、ET10 12.8%，其余 ≤ 9.3%。
+
+### 问题 4：SNR 自动降阈值用得很多，TF+ 比例有离群样本
+
+- Sox9 被降过阈值的层：EGFR 多数样本 28–49%，batch4_sample4 77%，batch4_sample5 96%；TSC 39–76%。对 TSC 和 batch4 来说，起始值 5.5 大多不起作用。Olig2 为 12–48%。
+- 日志只写每个 tile 最低降到多少，看不出降到 floor 3 之后仍然超过 `max_removed_frac` 的层有多少。
+- 有 TF 的 soma 比例：EGFR 38–50%，但 batch4_sample4 63%、batch4_sample5 56%，正好是 Sox9 降阈值最多的两个，需要核查是不是过滤造成的。TSC 22–46%，没有 Olig2 的 6 个老 TSC 样本是 22–32%。
+
+### 其他
+
+- 现成的离线 QC `src/utils/pipeline_qc.py` 没有在这批结果上跑过：`config/qc_config.json` 里只有 4 个旧样本（T4、T70、ET10、ETail），路径也是旧的。
+- 下一步：用户要求把这些 QC 全部加入 pipeline，并对所有样本评估。EGFR 与 TSC 分组分析，DT70/DT4/DT10/ET10/ETail（config 中 t70/t4/t10/ET10/ETail）是两组共用的对照。先做计划，不改代码。
+
+## 2026-11-17（续）样本分组；QC 加入 pipeline 的计划；DT47 新建 config（未改代码）
+
+### 分组（用户确认）
+
+- **WT 对照（7）**：t70（DT70）、t4（DT4）、t10（DT10）、ET10、ETail、ET1、ERH，两套分析共用。
+- **EGFR 疾病（3）**：batch4_sample4、batch4_sample5、DT47。
+- **TSC FF（8）**：TSC_FF6/8/9/11/19、TSC8、tsc12q、tsc12t。
+- **TSC FW（8）**：TSC_FW2/6/7/8/11、tsc18、TSC10、tsc11。FW 也是疾病组，不是对照。
+- 分析分开做：EGFR = WT vs EGFR；TSC = WT vs FF vs FW。FF、FW 各有 3 个老样本没有 Olig2。
+- 注意：对照都是 EGFR 那几批成像，TSC 是另外的批次，组间差异里可能混有批次差异。
+
+### DT47 新建 config 和 slurm（未提交）
+
+- `config/EGFR/5/config_EGFR_DT47.json`：以 ERH 为模板，只改了以下几项：
+  - 路径改为 `Y:\Fengyi\EGFR_brain\DT47`：GFP 用 `power3_exp50/640nm`，GFPhi 用 `power30_exp50/640nm`；结果目录 `detection_results_20261117`。
+  - 对齐窗口改为 `sample_z_center_count: 100`（以细胞 z 中位数为中心，与另外 23 个样本相同），不用 ERH 的固定 501–600 层。
+- DT47 共 55 个 tile、每个 tile 788 层，5 个图像目录的 tile 一致。config 用 `load_config` 和 `resolve_align_settings` 检查过。
+- `scripts/egfr/inference_DT47.slurm`：以 ERH 为模板，240G 内存、2 张 L40S、24 小时（tile 数和 t70、ETail 相近）。从检测开始全新运行；超时后重新提交会续跑。
+
+### 已定的决定
+
+- 已跑完的 23 个样本保持现有对齐结果，不重跑。
+- ERH、t70 的固定窗口导致 6 个含细胞的 tile 没对齐（见上一条）。修法是换窗口，然后归档 `3_2d_aligned` 及之后的结果，从 2.5 重跑。尚待用户确认。
+- 新的对齐采样规则（以后的样本用）：
+  - 每个 tile 取所有通道都不是黑图的层，以这些层的中间为中心，前后一共取 N 张连续的图。
+  - N 由 `sample_z_count` 指定，默认 100。不到 N 张就全部用上；一张都没有就跳过，标为"无组织"。
+  - 黑图 = 文件 < 1 MB（用户确认；ERH 的黑图是 131,782 字节，真实图片约 8 MB）。
+  - 这个规则要写进 `point_cloud_aligner.py`。改动前文件的 hash 加入 `compatible` 列表，`check_align_settings` 给旧设置补默认的窗口模式，保证已有样本的对齐不会因此失效。
+- QC 写进 `run_inference.py`，以后的样本跑完 pipeline 自动出 QC。已跑完的样本用单独命令 `python -m src.qc.sample_qc --config ...` 补跑，不碰 pipeline 结果。改了 `run_inference.py` 以后，已有样本如果再走 pipeline，Stage 4 会重算一次。
+
+### QC 计划
+
+新代码都放在 `src/qc/` 下，不改被 checkpoint hash 的文件（对齐窗口那一处除外，按上面的兼容做法处理）。每项 QC 有自己的 manifest，重跑时只算变了的部分；QC 不删除任何结果。
+
+| 项 | 检查内容 | 何时跑 | WARN 条件 | 可视化（真实图片 ≥ 1 MB；每样本约 40 张以内） |
+|---|---|---|---|---|
+| A | tile 内通道对齐：得分为 0 但 tile 里有细胞 | 2.5 后 | 参考通道框数 ≥ 200 且得分为 0；空/边缘 tile 只记录。默认不停 pipeline，`qc.alignment.fail_on_unaligned` 可打开 | 4 通道叠图（RFP 红、GFP 绿、Sox9 青、Olig2 品红）加单通道灰度图；左右对照"pipeline 实际用的偏移"和"QC 测出的最佳偏移" |
+| 对齐偏差大 | 现有对齐 QC 里的 bad | 2.5 后 | 不变 | 最差的几个（soma z ≥ 2 层、xy ≥ 6 µm 或 IoU 提升 ≥ 1.5 倍；TF > 6 µm），出图方式同上 |
+| B | 2.9 接缝一致性 | Stage 3 后 | ≥ 2 个通道残差都 > 20 px 或 > 3 层，且方向一致 | 两个 tile 的重叠区（A 绿、B 品红），左右对照"按解出的位置摆"和"按实测位移摆" |
+| 接缝重复 | 现有接缝去重 QC | Stage 3 后 | 不变 | 现在只随机抽图，另外加上残留重复最高的几条接缝 |
+| C | SNR 过滤 | 2.5 后 | 降到 floor 后仍超过 `max_removed_frac` 的层；阈值随 z 的曲线 | 原图，保留的框标绿、SNR 去掉的框标品红 |
+| D | 每层、每 tile 的细胞数；TF+ 比例随 z 和按 tile 的分布；单层 track 比例 | Stage 4 后 | 坏层、离群 tile | 坏层画上下各一层；离群 tile 画 soma 框并按有无 TF 着色 |
+| E | 完整性（现成的 `pipeline_qc.py`，改为读 pipeline config） | Stage 4 后 | 现有规则 | 不出图；先在 HPC 上对一个样本计时 |
+| F | 汇总：`qc/qc_summary.json` + `qc/index.html` | 最后 | — | 链接到各项的图 |
+
+- 共用模块 `src/qc/review_images.py`：读图和坐标换算复用 `stitch_dedup.py` 的代码，黑图界限在 `qc.review.min_image_bytes` 里设（默认 1,000,000）。
+- 分组 QC `src/qc/cohort_qc.py` 读 `config/cohorts.json`：技术指标和本组中位数比较（用中位数和 MAD）；生物学指标只比较技术 QC 通过的样本；离群样本链接到它的审查图；每个通道出一张跨样本、相同显示范围的截图对比，用来看批次差异。
+- 执行顺序：写代码和测试 → 补跑 25 个样本的 QC → 跑分组 QC → 修 ERH/t70。
+
+## 2026-11-17（续）代码实施计划（给 HPC 窗口实施用；本会话未改代码）
+
+用户确认：ERH、t70 从 2.5 重跑；另外 23 个样本保持现有对齐；黑图 = 文件 < 1 MB；QC 写进 pipeline，已跑完的样本用单独命令补跑。这一条取代上一条末尾的执行顺序。建议顺序：步骤 1 → 2 → 3 → 4（ERH/t70 重跑时就能顺便验证新 QC）→ 5 → 6。
+
+### 步骤 1：对齐采样窗口新增"非黑图中间"模式
+
+- **配置**（`pre_align_params`，只在写了 `sample_z_mode` 时生效）：
+  `"sample_z_mode": "nonblank_center", "sample_z_count": 100, "blank_image_max_bytes": 1000000`
+  N 由用户定，默认沿用 100。
+- **新模块 `src/core/align_window.py`**：
+  - `nonblank_indices(tile_dirs, max_bytes)`：对一个 tile 的所有通道目录（含 GFPhi），按与 worker 相同的排序列出 TIFF，用 `os.stat` 判断大小，返回所有通道都 ≥ `max_bytes` 的层号（从 1 开始）。各通道层数不一致时报错。
+  - `nonblank_center_window(indices, count)`：以非黑层的中位层号为中心，取 `count` 张连续图，并限制在第一个到最后一个非黑层之间。非黑层不足 `count` 张就取全部。返回 `(start, stop_exclusive, n_nonblank_in_window)`；没有非黑层时返回 None。
+- **`run_inference.py`**（约 690 行 `run_align_pool` 之前）：
+  - 新模式下，对待对齐的 tile 先算窗口。每个通道的 tile 目录按 `config['paths'][ch['dir_key']]`（以及 `second_intensity_dir_key`）加上与 `listTile` 相同的 `<x>/<x_y>` 结构拼出来。
+  - 结果写 `3_2d_aligned/_sample_windows.json`（tile → start/stop/n_nonblank/n_slices），再传给 `run_align_pool`。
+- **`point_cloud_aligner.py`**（这个文件整体被 hash，改动要尽量小）：
+  - `run_align_pool` 和 `align_tile` 加可选参数 `sample_window_override=None`。有值时代替 `alignment_sample_window()` 的结果，后面的流程不变（`measured_offsets.json` 已经会记 `sample_window`）。值为 None 且是新模式时（没有组织），所有通道偏移为 0，report 状态写 `no_tissue`。
+  - `resolve_align_settings`：沿用已有的 `**({...} if ... else {})` 写法，只在 config 写了 `sample_z_mode` 时才把 `sample_z_mode`、`blank_image_max_bytes` 放进 settings。这样旧样本的 `_align_settings.json` 不变，`check_align_settings` 也不会报不一致。新模式与 `sample_z_start_slice`、`sample_z_start_fraction` 互斥。
+  - 在 `tile_alignment_done` 的 `compatible` 集合里加入改动前的文件 hash `95f6dba865c6552761c2f15a0698cc3e426442755432a2bed9bac0def55da44f`（11-17 在共享盘上用 `provenance.file_sha256` 算的），并注释："nonblank_center 窗口之前；旧模式计算不变"。否则 23 个样本的对齐 checkpoint 都会报冲突。
+- **测试**：
+  - `align_window` 的单元测试：黑图在两端、全是黑图、非黑图不足 N 张、各通道层数不一致。
+  - 旧 config 的 settings 与改动前完全相同。
+  - 用旧 hash 的 manifest 能通过 `tile_alignment_done`。
+  - `test_checkpoint_code_lists`、`test_alignment_*` 照常通过。
+
+### 步骤 2：QC 公共部分
+
+- **新模块 `src/qc/review_images.py`**：
+  - 读图和坐标换算复用 `stitch_dedup.py` 的 `_Renderer`（`slices`/`render`/`offset`），只 import 不改 `stitch_dedup.py`。改它会让接缝去重 QC 的 manifest 失效、重算一次；真要改也可以接受。
+  - `real_slices(tile, ch, min_bytes)`：跳过 < `qc.review.min_image_bytes`（默认 1,000,000）的文件。
+  - `pick_layers(z_candidates, n=3)`：在有检测、且所有通道都是真实图片的层里，沿 z 均匀挑。
+  - `composite(images_by_channel)`：RFP 红、GFP 绿、Sox9 青、Olig2 品红，每个通道按 1–99.5 百分位拉伸；另出单通道灰度图。
+  - `crop_around(boxes, size=512)`：截取细胞最密或问题最明显的位置。tile 缩略图上标出截取框，可选叠加检测框。
+  - 每个样本每项检查最多 5 个对象；图已存在且输入没变就跳过（manifest 记录输入文件的 stamp 和本模块的 hash）。
+- **配置**：`qc.review`：`{"enabled": true, "min_image_bytes": 1000000, "max_items_per_check": 5, "layers_per_item": 3, "crop_px": 512}`。
+- QC 代码不进任何 pipeline 的 hash 列表；QC 失败只写 `qc/<项>_error.json`，不删除任何结果。
+
+### 步骤 3：各项 QC（`src/qc/` 下的新文件，入口都在 `src/qc/run_qc.py`）
+
+- **A `unaligned.py`**
+  - 输入：`3_2d_aligned/*_measured_offsets.json` 和 `_sample_windows.json`（有的话）；用 `2_2d_filtered/{tile}_{ref}_result.csv` 统计参考通道框数（整个 tile 和窗口内）。
+  - 分类：`empty`（框数 < `qc.alignment.unaligned_min_ref_boxes`，默认 200）只记录；`unaligned`（框数 ≥ 200 且非参考通道得分都为 0）→ WARN。`qc.alignment.fail_on_unaligned`（默认 false）为 true 时抛异常。
+  - 依据：11-17 统计 25 个样本里得分为 0 的 176 个 tile，用中位数窗口的样本最多 87 个框；固定窗口的 ERH/t70 有 9 个是 362–32,592 个框。
+  - 出图：`unaligned` 的 tile，以及现有对齐 QC `tile_verdicts.csv` 里 verdict=bad 且偏差大的 tile（soma `|dz|` ≥ 2 层、`|dxy|` ≥ 6 µm 或 IoU 提升 ≥ 1.5 倍；TF 残差 > 6 µm），按严重程度排序取前 5。每个 tile 出 4 通道叠图，左右对照：左边用 `offsets.json` 里的偏移，右边用 QC 测出的最佳偏移（`tile_verdicts` 里的 dx/dy/dz_um 换算成 px 和层）。
+  - 调用：`run_alignment_stage` 里，现有对齐 QC 之后（`run_inference.py` 约 716 行，这里不用改 `run_inference.py`）。
+  - 输出：`qc/alignment/unaligned_tiles.csv`、`qc/review/alignment/*.png`。
+- **B `seam_consistency.py`**
+  - 输入：`5_2d_global/tile_positions/seams.csv`（status == ok）和 `tile_positions.csv`。残差 = (P_ch[nb] − P_ch[tile]) − meas_d，ch ∈ 各通道、d ∈ x/y/z；与 report.txt 一致（11-17 用会话脚本验证过，b4s5 最大 148.5/148.3 px）。
+  - WARN：同一条接缝 ≥ 2 个通道残差都 > 20 px 或 > 3 层，且各通道残差向量两两相差 < 10 px。只有单个通道超限、而且 n_match < 100 的记为"单次测量离群"，不报警。
+  - 出图：重叠区原图，tile A 绿、tile B 品红，左右对照"按解出的位置摆"和"按实测位移摆"，每条接缝取 3 个真实图片的层。
+  - 调用：`run_stitch_dedup_stage` 之后（`run_inference.py` 约 1105 行），在 `run_qc.py` 里新增 `run_seam_consistency_stage`。
+  - 输出：`qc/seam_consistency/{seams.csv,report.md}`、`qc/review/seams/*.png`。
+  - 接缝去重 QC 另外加一项：给残留重复最高的 3 条接缝出三联图（现在只随机抽）。
+- **C `snr_qc.py`**
+  - 输入：`2_2d_filtered/{tile}_{Sox9,Olig2}_result.csv` 和 `_rejected.csv`（列：`snr`、`slice_noise`、`snr_threshold`、`rejection_reason`；reason 取值 bbox/aspect_ratio/score_min/snr_min）。进入 SNR 这一步的框 = result 全部 + rejected 中 `snr_min` 的；"层" = 同 tile 同一个 `source_image`。
+  - 统计每层的阈值和去掉比例；降过阈值的层数；**饱和层** = 阈值等于 `snr_floor` 且去掉比例 > `max_removed_frac`。参数从 config 的 `contrast_filter` 读。
+  - 出图：阈值和去掉比例随 z 的曲线（每个 tile 一条线）；去掉比例最高的 5 个饱和层出原图，保留的框标绿、被 SNR 去掉的标品红，写上阈值和比例。
+  - 调用：2.5 之后，在 `run_qc.py` 新增 `run_snr_qc_stage`，由 `run_alignment_stage` 之后调用，或并进它里面。
+  - 输出：`qc/snr/{slices.csv,summary.csv,report.md}`。
+- **D `distribution.py`**
+  - 输入：`7_colocalization/coloc_result.csv`（`tile_name`、`z`、`cz`、`soma_positive_channels`、`tf_positive_channels`）和 `6_3d_global/{ch}_3d_tracked.csv`（`z_min`、`z_max`、`member_count`）。
+  - 统计每层每通道的细胞数、单层 track 比例、TF+ 比例随 z 和按 tile 的分布。
+  - WARN：坏层 = 组织范围内某层细胞数 < 上下各 5 层中位数的 30%；离群 tile = TF+ 比例偏离本样本 tile 中位数超过 4×MAD，且该 tile soma ≥ 500。
+  - 出图：坏层画这一层和上下各一层的叠图；离群 tile 叠图加 soma 框，有 TF 绿、无 TF 红。
+  - 调用：Stage 4 之后（`run_inference.py` 约 1488 行 "Stage 4 complete" 之后、"全部完成"之前）。
+- **E 完整性**
+  - 改 `src/utils/pipeline_qc.py`，支持 `--pipeline-config config/....json`（直接从 pipeline config 取 `result_dir`），`qc_config.json` 保留作阈值的默认值。
+  - 先在 HPC 上对 ET1 计时：relational checks 在约 1,400 万行时可能很慢。超过 30 分钟就默认关闭（`qc.integrity.enabled`）。
+- **F `summary.py`**
+  - 汇总 A–E 和现有的对齐 QC、接缝去重 QC，写 `qc/qc_summary.json`：每项给 status（PASS/WARN/FAIL/NOT_RUN）、关键数字、报告和图片的路径。另写 `qc/index.html`（表加缩略图链接），日志结尾打印一张表。
+  - 调用：pipeline 最后一步。
+- **单独命令 `src/qc/sample_qc.py`**：`python -m src.qc.sample_qc --config <cfg> [--only A,B,...] [--force]`。从 config 和结果目录重建 `derived`、`geom`、`src_dirs`（参考 `stitch_dedup.main` 的做法），依次跑 A–F。对已跑完的样本不重算现有的对齐 QC 和接缝去重 QC，只读它们的输出。
+- **对 checkpoint 的影响**：`run_inference.py` 只加调用点（约 1105 行之后和约 1488 行之后），会让每个样本下次走 pipeline 时 Stage 4 重算一次（CLAUDE.md 所述）。不碰 `stitcher.py`、`coloc_sources.py`、`detection_filter.py`、`snr_filter.py`、`local_contrast.py`，也不碰 `tile_position_pipeline` 的 `SOLVE_CODE`。
+- **测试**：每个模块用合成数据测试（小 CSV 加几张假 TIFF，含 < 1 MB 的黑图），检查分类、计数和出图数量上限；`test_checkpoint_code_lists` 通过。CLAUDE.md 补一句：`src/qc/*` 不进 hash 列表，`run_inference.py` 新增的调用点会让 Stage 4 重算。
+
+### 步骤 4：ERH、t70 从 2.5 重跑
+
+1. 两个 config 的 `pre_align_params`：删掉 `sample_z_start_slice`，保留 `sample_z_count: 100`，加 `"sample_z_mode": "nonblank_center", "blank_image_max_bytes": 1000000`。
+2. 归档（同盘改名，不复制）：把 `3_2d_aligned`、`3_2d_aligned_fusion`、`4_2d_filtered`、`5_2d_global`、`6_3d_global`、`7_colocalization`、`qc` 移到 `old_results_fixed_window/`，附 README（原因：固定 501–600 窗口在 ERH 5 个、t70 1 个含细胞的 tile 落在黑图上，偏移为 0）。
+   - 两个结果目录：ERH 是 `/rsstu/users/t/tekaeser/Chlamydia/Fengyi/EGFR/ERH/detection_results`，t70 是 `/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/T70/detection_results3`。
+   - 保留 `1_2d_raw`、`2_2d_filtered`。
+   - 提交前确认 2.9 会覆盖图像目录下的 `xml_merging.xml`（11-16 那批重跑时是正常覆盖的）。
+3. 用 `scripts/egfr/inference_ERH.slurm`、`inference_t70.slurm` 提交。
+4. 核查：
+   - `_sample_windows.json` 里 ERH 的 314700_331400、314700_354000、326000_331400、337300_376600、360000_376600 和 t70 的 316800_353000，窗口都落在非黑层。
+   - 这 6 个 tile 的对齐得分 > 0，对齐 QC 不再是 bad。
+   - A 不再报 `unaligned`。
+
+### 步骤 5：已跑完的样本补跑 QC
+
+- 写 `scripts/qc_all.slurm`（只用 CPU）。用 job array 或循环，对 23 个已跑完的样本执行 `python -m src.qc.sample_qc --config ...`；DT47 跑完后也要补跑，除非它是在 QC 代码合入之后才提交的。
+- 核查：每个样本的 `qc/qc_summary.json` 都生成了；11-17 记录的问题都被报出来：b4s5 的接缝、ET10/b4s4/t70 的多通道接缝、batch4 的 SNR 饱和。
+
+### 步骤 6：分组 QC
+
+- **`config/cohorts.json`**：
+  - 每个样本：`{"id", "config", "group", "panel", "batch"}`。group 取值 `WT`/`EGFR`/`TSC_FF`/`TSC_FW`（分组见上一条）；panel 是有无 Olig2；batch 用 config 所在的子目录（EGFR/1–5、TSC、TSC2）。
+  - 两套分析：`"analyses": {"EGFR": ["WT", "EGFR"], "TSC": ["WT", "TSC_FF", "TSC_FW"]}`。
+- **`src/qc/cohort_qc.py --cohorts config/cohorts.json --out <dir>`**：
+  - 读各样本的 `qc_summary.json` 和关键指标，每套分析出一张表和 `index.html`。
+  - 技术指标（对齐、接缝、SNR 饱和、残留重复）：和本组中位数比较，偏离 > 3×MAD 标为离群，链接到该样本的审查图。
+  - 生物学指标（密度、TF+ 比例、多阳性比例）：只用技术 QC 通过的样本，按组画图，同时标出批次。
+  - 每个通道一张跨样本对比图：每个样本随机 2 个有组织的 512 px 截图，所有样本用相同的显示范围，按组排列。
+- 输出放 `X:\Fengyi\cohort_qc\NN\`，按 `zrule_tests` 的惯例编号，用 `index.csv` 登记。
+
+## 2026-11-17（续）QC 写进 pipeline；对齐窗口新模式；ERH/t70 重跑；其余样本补跑 QC；DT47 提交
+
+按上一条的实施计划（步骤 1–5）完成；步骤 6（分组 QC）还没做。
+
+### 代码
+
+- **对齐窗口 `nonblank_center`**：新模块 `src/core/align_window.py`。每个 tile 列出所有通道（含 GFPhi）都 ≥ `blank_image_max_bytes`（默认 1,000,000）的层，以中位非黑层为中心取 `sample_z_count` 张；非黑层不足 N 张就从第一个到最后一个全部用；一张都没有就标 `no_tissue`，偏移全 0。窗口写 `3_2d_aligned/_sample_windows.json`，`measured_offsets.json` 的 `sample_window` 也记 mode/no_tissue。
+  - 与计划的不同：新键不在 `resolve_align_settings` 里加，而是 `run_inference.py` 调用 `align_window.resolve_window_mode`。原因：`resolve_align_settings` 在 Stage 2.9 的 `SOLVE_CODE` 里，改它会让所有样本的 2.9 hash 失效、pipeline 停下。没写 `sample_z_mode` 的 config，settings 与以前完全一样。
+  - `point_cloud_aligner.py`：`align_tile` 加 `sample_window_override`；`tile_alignment_done` 的 compatible 加入旧 hash `95f6dba8…`。`run_align_pool` 把每个 tile 的窗口传进去。
+- **对齐 QC 的代码签名**：原来 hash `src/qc/*.py` 全部（除 alignment_flags/run_qc），新加 QC 模块会让所有 tile 重算。改为显式列表 `ALIGN_QC_FILES`（就是原来那几个文件，签名不变）。`point_cloud_aligner.py` 改了，所以对齐 QC 下次走 pipeline 时会重算一次。
+- **QC 模块**（`src/qc/`，都不进 hash 列表；失败只写 `qc/<项>_error.json`，不停 pipeline）：
+  - `review_images.py`：读原图（< `qc.review.min_image_bytes` 的黑图不画）、按 Stage 2.5 偏移放到对齐坐标、四通道叠图（RFP 红、GFP 绿、Sox9 青、Olig2 品红）、灰度图、manifest（输入没变就不重画）。没复用 `stitch_dedup._Renderer`（那个依赖 XML 几何），单独写了按 tile 的读图。
+  - A `unaligned.py`：`ok/empty/unaligned/no_tissue`；出图 = unaligned tile + 对齐 QC 里偏差大的 tile（左 pipeline 偏移、右 QC 最佳偏移；soma 用 +best_delta，TF 用 −残差）。
+  - B `seam_consistency.py`：残差与 report.txt 一致（b4s5 x/y 最大 148.54/148.28）。**判定改了**：原计划"两两相差 < 10 px"会把 b4s5 那几条 60–150 px 的接缝判成 mixed，现在是超限通道的残差向量（z 按 µm 折成 px）两两余弦 ≥ 0.5 或相差 < 10 px 即 consistent。现有结果：b4s5 7 条、ET10 7 条、b4s4 3 条、t70 2 条、FW6 0 条，与 11-17 的人工检查一致。
+  - C `snr_qc.py`：每层阈值/去除比例；饱和 = 去除比例仍 > `max_removed_frac`，只算 ≥ 20 个框的层（`qc.snr.min_boxes`；不加这条会挑到只有 1 个框的层出图）。saturated 层 > 5% 时 WARN。
+  - D `distribution.py`：每 tile 每通道每层（tile 局部、对齐后 z，读 Stage 3 输入 CSV）的计数，坏层分 blank_image / dropout；单层 track 比例；TF+ 比例按 tile 和 z。离群 tile 出图时 soma 框坐标用 detection_id 对 2D global 和 tile CSV 求偏移换回 tile 坐标。
+  - E `integrity.py`：包 `pipeline_qc.PipelineQC`，阈值取 `config/qc_config.json`；pipeline 里默认关（`qc.integrity.enabled`）。`pipeline_qc.py` 另加了 `--pipeline-config`。
+  - `stitch_dedup_top.py`：每通道残留重复最高的 3 条接缝（`qc.review.top_dedup_seams`），调用 `stitch_dedup.review_image`，`stitch_dedup.py` 没改。
+  - F `summary.py`：`qc/qc_summary.json` + `qc/index.html`，日志打印汇总表。接缝去重单条接缝 > 10% 记 WARN（`qc.summary.stitch_dedup_warn_seam_pct`）。
+  - 单独命令 `python -m src.qc.sample_qc --config <cfg> [--only A,B,C,D,E,T,F] [--force]`。
+- **pipeline 调用点**：A、C 在对齐 QC 之后（`run_qc.run_alignment_stage` 内部）；B 和 top 接缝图在接缝去重 QC 之后（`run_inference.py`）；D、E、F 在 Stage 4 之后。`run_inference.py` 改了 → 已有样本再走 pipeline 时 Stage 4 重算一次。
+- 测试：新 `test_align_window`（10）、`test_sample_qc`（6）；`test_checkpoint_code_lists`、`test_alignment_*`、`test_qc_alignment`、`test_stitch_dedup_qc`、`test_refilter_align`、`test_automatic_resume` 等通过。`test_pipeline_qc`、`test_provenance_pipeline` 各 1 个失败，HEAD 上同样失败（Windows 路径在 Linux 上），与本次无关。
+- 冒烟测试：TSC_FW6 跑 sample_qc 全部（除 E）3.3 分钟，各项正常出结果和图。
+
+### 配置
+
+- ERH、t70：删 `sample_z_start_slice: 501`，加 `"sample_z_mode": "nonblank_center", "blank_image_max_bytes": 1000000`（`sample_z_count` 仍 100）。预算窗口：ERH 314700_331400 163–262、314700_354000 229–328、326000_331400 204–303、337300_376600 288–387、360000_376600 276–375；t70 316800_353000 295–394，都在非黑层内。
+- DT47：原来写的中位数窗口（`sample_z_center_count`）改成同样的 `nonblank_center`（按"以后的样本用新规则"）。`scripts/egfr/inference_DT47.slurm` 改为 4 张 L40S、16 CPU。
+
+### HPC
+
+- ERH、t70 归档到各自结果目录的 `old_results_fixed_window/`（附 README），保留 1_2d_raw、2_2d_filtered。提交 `--gres=gpu:l40s:1`：ERH 1952936、t70 1952937。
+- 其余 23 个样本只跑 QC：`scripts/qc_all.slurm`（CPU，compute 分区）+ `scripts/qc_samples.txt`，array 作业 1952934（1–23，最多 8 个同时）。
+- ET1 完整性检查（E）计时：1952935（`ONLY=E`）。超过 30 分钟就保持默认关闭。
+- DT47：1952945，4 张 L40S，`--dependency=afterany:1952936:1952937` + `--nice=10000`，ERH、t70 结束后才开始。
+- 待核查：ERH/t70 的 `_sample_windows.json` 和 6 个 tile 的对齐得分 > 0、A 不再报 unaligned；23 个样本的 `qc/qc_summary.json`；ET1 的 E 用时。
+
+## 2026-11-17（续）atlas 配准用的拼接图像：计划（给 HPC 窗口实施用；本会话只改了 config）
+
+下一步要把检测结果配准到 atlas，需要每个样本一张拼好的降采样图像。
+
+### 结论：用 pipeline 自己拼，不用 TeraStitcher 的图
+
+- 检测坐标用的是 Stage 2.9 解出的 tile 位置，TeraStitcher 用的是它自己的位置。两者的差别是每个 tile 不同的平移，一个整体仿射变换消不掉，配准后细胞会按 tile 成块错开。而且 TeraStitcher 在部分接缝上会退回机械默认位移。
+- `src/core/stitch_raw_tiles.py` 读 2.9 写在各通道目录的 `xml_merging.xml`，直接拼原始 tile，按 XYZ 块平均降采样。不需要 TeraStitcher。
+
+### 通道：每个样本只拼 `stitching_reference_channel`
+
+- **TSC2**（FF6/8/9/11/19、FW2/6/7/8/11）拼 **Olig2（488nm）**。**老 TSC**（TSC8/10/11/12q/12t/18）拼 **Sox9（730nm）**：它们没有 Olig2，原始目录里也没有 488nm。
+- 理由：
+  - 全局坐标按 `stitching_reference_channel` 为基准（`point_cloud_aligner.rebase_shifts`），共定位结果也在这个坐标系里。拼这个通道，配准变换可以直接用在细胞坐标上，不用再加通道偏移。
+  - 从图像上看，Olig2 也最合适：488nm 信号强、自发荧光强，Olig2 在白质里很密，降采样后结构清楚。GFP 抗体渗透不均，会造成假的亮度梯度；RFP 部分样本噪声大；Sox9 弱但分布均匀。
+- **待用户确认**。
+
+### 已完成（本会话）
+
+- 16 个 TSC config 的 `direct_stitching`：`enabled: true`，并加 `markers: ["Olig2"]`（TSC2）或 `["Sox9"]`（老 TSC）。其余不变：`downsample_factor` 4，`blend_width_px` 256。
+  - 输出目录：TSC2 是 `<样本>/stitched_4x`，老 TSC 是 `<样本>/stitched_direct_4x_config_<名>`。目前都不存在。
+  - `direct_stitching` 不进任何 checkpoint hash，已有结果不会重算。以后再走 pipeline，Stage 3 会顺带拼图，已完成的会跳过。
+- 16 个样本都已跑到 `7_colocalization`，参考通道的 XML 都是 11-17 求解写的。
+- 本机 `--dry-run` 结果：
+  - TSC8：Sox9 45 tile、608 层，画布 2257×3999×148。
+  - FW6：Olig2 27 tile、563 层，画布 1384×4002×138。
+  - 本机不能直接 dry-run TSC2：`platform_path` 只认 Y:（DeepDesign）。FW6 是用 X: 路径的临时 config 跑的。HPC 上没有这个问题。
+
+### 实施步骤（HPC 上做）
+
+数据量：每个 tile 每层约 8 MB，一个样本一个通道 125–220 GB，16 个样本共 2–3 TB。计算很轻：单线程，内存只放一张降采样画布。瓶颈是 I/O，所以必须在 HPC 上跑；本机走 SMB 一个样本要 6 小时以上。
+
+1. **（可选，待用户决定）z 方向不降采样。**
+   - 现在 4x 是 XYZ 一起降，0.65×0.65×8 µm 降成 2.6×2.6×32 µm。atlas 一般是 10/25 µm 各向同性，z 方向 32 µm 偏粗。
+   - 改法：`direct_stitching` 加 `downsample_factor_z`（缺省 = `downsample_factor`，旧行为不变）。改动点：
+     - `geometry` 的 depth / discarded 改用 z 因子。
+     - `stitch_channel` 的 z 循环（`first_raw`、`range(factor)`）用 z 因子，`np.divide` 里的 `denominator * factor` 也改成 z 因子。
+     - manifest 写 `output_voxel_size_um` 和 `downsample_factor_z`。
+     - `completed_output_matches` 也要比较 z 因子。
+   - z 不降时每个样本输出是现在的 4 倍（约 600 层），读取量不变。
+   - `stitch_raw_tiles.py` 不在任何 hash 列表里，改了不会让 pipeline 重算。要补单元测试。
+2. **`scripts/stitch_tsc.slurm` + `scripts/stitch_tsc_samples.txt`**（16 行 config 路径）。
+   - 照 `scripts/qc_all.slurm` 写：`compute` 分区，`lsmsmart_cpu` 账号，`--cpus-per-task=4 --mem=32G --time=24:00:00`，array 一个样本一个任务，`%8` 限并发。
+   - 执行 `python -u -m src.core.stitch_raw_tiles --config "$CONFIG"`。
+   - 不占 GPU，不影响 ERH（1952936）、t70（1952937）、DT47（1952945）。
+   - 先 `--dry-run` 跑一遍 16 个（可以 `DRY=1`），再正式提交。
+   - 输出目录已存在且不完整时会报错，要换目录或删掉后重跑。
+3. **删除 TeraStitcher 图像**（用户已同意删；可以和步骤 2 同时做，用 HPC 上的 `rm -rf`，比 SMB 快）：
+   - `/rsstu/users/t/tekaeser/Chlamydia/Fengyi/TSC/{FF6,FF8,FF9,FF19,FW2,FW6,FW8}/561_stitched`
+   - `/rsstu/users/t/tekaeser/Chlamydia/Fengyi/TSC/{FF11,FW7,FW11}/stitched_561`
+   - `/rsstu/users/a/agrinba/DeepDesign/Fengyi/EGFR_brain/T4/stitched`（4 通道全分辨率）
+   - **保留**：`T4/488_terastitcher_backup`，只有 XML 和 mdata.bin。
+   - **不动，待用户确认来源**：`EGFR_brain/data_for_bmes/stitched`、`batch4/sample4_other/sample4_stitched`，以及老 TSC 目录里以前配准留下的 `registration.tif`、`s*_registration.tif`、`resampled*.tif`、`atlas_*.tif`、`s12t_ants`。
+4. **核查**：
+   - 每个输出目录都有 `stitch_manifest.json`，`z*.tif` 的数量等于 `output_slices`。
+   - 抽 2–3 个样本看拼接缝和亮度是否均匀。
+   - **坐标对应**：把该样本 `7_colocalization`（或 `6_3d_global`）的细胞按下面的换算叠到拼接图上，确认细胞落在核上，尤其是接缝两侧。
+     - xy：降采样像素 = (全局 px − `reference_frame.output_origin_shift_from_frame_raw_xy`) / 4。
+     - z：降采样层 = (全局 z − `leading_frame_z_slices_removed`) / z 因子。
+     - 要先核实全局坐标的零点是不是参考帧 tile 的最小 ABS 值。
+   - 另一个要核实的点：拼图只用 XML 里的单一位置（XML 表达不了随 z 变化的位置）。如果 Stage 3 用了随 z 变化的位置，两者会有差别，需要量出差多少。
+5. TSC 做完再拼 WT 对照（t70、t4、t10、ET10、ETail、ET1、ERH）和 EGFR 样本。ERH、t70 要等这次重跑完，DT47 要等全流程跑完。WT 和 EGFR 的参考帧看各自 config 的 `stitching_reference_channel`。
+
+## 2026-11-17（续）atlas 配准拼接：通道规则定稿，Z 不降采样，21 个样本准备就绪（未提交作业）
+
+### 通道选择（用户确认）
+
+- 规则：有 Olig2 的拼 Olig2，没有 Olig2 的（老 TSC：TSC8/10/11/12q/12t/18）拼 Sox9。即每个样本只拼 `stitching_reference_channel`。不做 Sox9 与 RFP 的对比。
+- config 里有两个"参考通道"，作用不同：
+  - `pre_align_params.reference_channel`（Stage 2.5 通道对齐，测各通道相对谁的偏移）：TSC 和大部分 EGFR 都是 RFP，t4/t10/t70 是 GFP。
+  - `stitching_reference_channel`（Stage 2.9 用哪个通道的检测求解 tile 位置，即全局坐标帧）：有 Olig2 的是 Olig2，老 TSC 是 Sox9。老 TSC 在 10-27 由 RFP 改成 Sox9，因为 RFP/GFP 太稀疏，解不稳 tile 位置。
+- 所有通道的细胞都在这一个坐标帧里：Stage 2.5 把每个 tile 的各通道检测平移到参考通道（`_offsets.json` 已经过 `rebase_shifts`，参考通道恒为 0）；Stage 3 只加载参考通道的 `xml_merging.xml` 放全局坐标（TSC8 日志：`Stitching frame: Sox9`，加载 `730nm/xml_merging.xml`）。所以拼参考通道的图，配准变换可以直接用到所有通道的细胞上。
+- 其他通道目录里的 `xml_merging.xml` = 该通道自己的接缝解 `P_c` + 一个全局中位数平移，不含逐 tile 偏移（`generate_merging_xml.image_positions`）。它只用来让该通道的图本身没有接缝，和细胞坐标对不上（TSC8 RFP：xy p50 7 px、p90 13 px、最大 33 px，z 最多 8 层原始切片）。以后如果要拼非参考通道给配准用，必须用"参考通道 XML + 逐 tile `_offsets.json` 偏移"放置，这个功能还没写。
+- 发现的问题（与拼接无关，未处理）：老 TSC 的 Sox9→RFP 对齐（chain 模式，用 containment 打分）分数很低（TSC8 大多 0.004–0.03）。几个大偏移 tile（326300_332600 (17,13)、337600_355200 (17,16)、348900_332600 (−16,−24)、337600_377900 (−10,8,−6)）在对齐 QC 里都是 insufficient，可靠性未知，影响老 TSC 的 Sox9–RFP/GFP 共定位。
+
+### 代码：`src/core/stitch_raw_tiles.py` 加 `downsample_factor_z`
+
+- `direct_stitching.downsample_factor_z`，缺省等于 `downsample_factor`，旧行为不变。`geometry`、`stitch_channel` 的 z 循环和分母、`completed_output_matches` 都改用 z 因子。
+- manifest 新增 `downsample_factor_xy`、`downsample_factor_z`；两者相等时仍写 `downsample_factor_xyz`。旧 manifest 只有 `downsample_factor_xyz` 的也能被识别。`output_voxel_size_um` 的 z 用 z 因子。
+- 测试 `tests/test_stitch_raw_tiles.py` 新增 1 项（XY 2x、Z 1x：层数、逐层取值、manifest、改 z 因子后不再判为已完成）。共 5 项通过；`test_pipeline_steps`、`test_checkpoint_code_lists` 也通过。这个文件不在任何 hash 列表里，不会触发重算。
+
+### config
+
+- 16 个 TSC + 5 个对照（t4、t10、ET10、ETail、ET1）的 `direct_stitching` 加 `"downsample_factor_z": 1`。XY 仍是 4x（2.6 µm），Z 保持原始层距。
+- 5 个对照另外改为 `enabled: true`，加 `markers: ["Olig2"]`。输出目录名沿用旧的（含 "4x"），Z 实际没降，以 manifest 为准。
+- ERH、t70 正在重跑（1952936、1952937），tile 位置可能会变，config 暂时没动。等它们跑完再同样修改后拼。DT47 等全流程跑完。EGFR 疾病组（batch4_sample4/5、DT47）排在后面。
+- 改前的 config 备份在会话临时目录（未保留）。
+
+### 作业准备（未提交）
+
+- `scripts/stitch_atlas.slurm` + `scripts/stitch_samples.txt`（21 行）：compute 分区，lsmsmart_cpu，4 CPU、32G、24 h，array 一个样本一个任务。`DRY=1` 只做检查。
+- 21 个样本已在登录节点用 `--dry-run` 检查通过：tile 数、XML、原始层数都一致，没有丢弃尾部层。画布 1376×2254 到 2268×4016，Z 468–842 层。
+- 21 个参考帧 XML 都是 11-16/11-17 求解写的，晚于各自的 `7_colocalization`；输出目录都不存在。
+
+### （同日续）输出改为单个 3D TIFF 并集中存放；删除 TeraStitcher 图像
+
+- 用户要求所有拼接图集中输出到 Chlamydia 盘的 `Fengyi\stitched_imgs`（`/rsstu/users/t/tekaeser/Chlamydia/Fengyi/stitched_imgs`，剩余约 23T）。DeepDesign 盘已用 100%，只剩 306G。文件命名规则是 `样本_通道_降采样.tif`。
+- `stitch_raw_tiles.py` 新增 `direct_stitching.output_name`：
+  - 设置后，每个通道写一个 ZYX BigTIFF（未压缩，逐层流式写入，不占大内存）：`<output_name>_<marker>_<tag>.tif`，旁边写一个同名 `.json` manifest（原 manifest 内容 + `file`、`axes`，`channels` 只含该通道）。
+  - `tag`：XY 和 Z 因子相同时写 `4x`；Z 为 1 时写 `xy4x`；其他情况写 `xy4x_z2x` 这种形式。
+  - 先写 `.tif.part`，完成后改名，再写 `.json`。只有 `.json` 存在才算完成；目标 `.tif`/`.json` 已存在时报 FileExistsError，不覆盖。
+  - 不设 `output_name` 时仍按旧方式输出 z*.tif 序列。
+  - 拼图计算逻辑抽成生成器 `stitched_slices`，两种输出共用。测试新增 1 项，共 6 项通过。
+- 21 个 config：`output_dir` 都改为上面的共享目录，加 `output_name`：TSC_FF6/8/9/11/19、TSC_FW2/6/7/8/11、TSC8/10/11/12q/12t/18、t4、t10、ET10、ETail、ET1。例如 `TSC8_Sox9_xy4x.tif`、`TSC_FF6_Olig2_xy4x.tif`、`t4_Olig2_xy4x.tif`。21 个都重新做过 dry-run，通过。
+- 预计输出共约 197 GB，单个文件 2.9–15.2 GB。
+- **已删除** TeraStitcher 图像（用户同意）：`TSC/{FF6,FF8,FF9,FF19,FW2,FW6,FW8}/561_stitched`、`TSC/{FF11,FW7,FW11}/stitched_561`、`EGFR_brain/T4/stitched`。保留 `T4/488_terastitcher_backup`。删完后 DeepDesign 的 df 没有马上变化（可能是快照还占着空间）。
+- 仍未处理、待用户确认来源：`EGFR_brain/data_for_bmes/stitched`、`batch4/sample4_other/sample4_stitched`，以及老 TSC 目录里以前配准留下的文件。
+- 已提交 `scripts/stitch_atlas.slurm`，作业 1954065，array 1–21，最多 8 个同时跑。日志在 `scripts/logs/slurm_stitch_1954065_<n>.out`。
+
+## 2026-11-17（续）Stage 2.5 对齐窗口位置排查；对齐 QC soma 误报修复
+
+### 起因
+
+- 用户逐张看了老 TSC 的对齐审查图（`qc/review/alignment`）：只有 tsc18 325300_342500 是 QC 的偏移更好（GFP z 差 2 层，按 QC 偏移后 RFP 细胞明显和 GFP 重合），其余都是 pipeline 的更好或差不多。TSC10 401700_394600 那张，按 QC 偏移明显更差。
+- tsc18 325300_342500 的原因：z 方向搜索范围是 ±5 层，够用。问题是窗口位置：Stage 2.5 的窗口中心 = 该 tile 所有通道细胞 z 的中位数。Sox9 的数量比 soma 多一个数量级以上，而且整个深度都有，于是窗口被拉到 312–412 层；RFP/GFP 却集中在 50–250 层，窗口里只有 85 个 soma 细胞，GFP 匹配分数 0.097。
+- `nonblank_center`（ERH/t70/DT47 在用）按非空白图像层定中心，同样解决不了，因为这个 tile 整个深度都有组织。
+
+### 第 1 步：窗口位置统计（只读，21 个 TSC/对照样本）
+
+- 对每个 tile，比较当前窗口和 soma 最密的 100 层窗口里 min(GFP 2D 框数, RFP 2D 框数) 的大小。只统计最佳窗口里至少 50 个框的 tile（733 个 tile 中 577 个）。
+- TSC 16 个样本：每个样本有 6–11 个 tile（约 30–50%）的当前窗口不到最佳窗口的一半，3–8 个不到四分之一。当前窗口和最佳窗口的起点相差中位 50–120 层。
+- 对照（t4、t10、ET10、ETail、ET1）好一些：每个样本 1–7 个 tile 不到一半，不到四分之一的有 0–1 个。
+
+### 第 2 步：soma 最密窗口试算（只读，原型脚本在会话临时目录，没有写结果目录）
+
+- 做法：只用 RFP/GFP 两个通道，按 Stage 2.5 同样的 z-link 设置和 `compute_tile_channel_shifts` 参数。窗口取"100 层内 min(GFP 细胞数, RFP 细胞数) 最大"的位置。
+- 用当前窗口重算，29 个 tile 都和 pipeline 结果一致（t4/t10 的参考通道是 GFP，原型按 RFP 算，不可比）。
+- tsc18 325300_342500：窗口 116–216，soma 细胞从 85 增加到 2978，分数从 0.097 升到 0.204，GFP 偏移从 (0,−4,1) 变成 (−4,−4,3)；QC 给的目标是 (−3,−3,3)。
+- 每个样本挑窗口最差的 1 个 tile，共 19 个：soma 细胞从几十、几百增加到几千，分数从 0.03–0.12 升到 0.17–0.34。结果多数更接近 QC 的独立估计，例如 tsc12t 326500_337900 从 (0,0,5) 变成 (0,−8,4)（QC (0,−6,4)）；FF8、FF19、tsc11、FW11 的 z 都改了 1 层，和 QC 一致；TSC10 367700_371900 的 x 从 0 变成 4（QC 3）。
+- 6 个 QC 原来标 bad 的 GFP tile（FF19 345000_321800、FW2 323100_322900、FW6 363000_335100、FW8 369000_357100、ET10 372500_388500、ETail 293300_324900）：新窗口下基本不变。其中 QC 的目标偏移有几个大得不合理（FW2 −22 px、ETail +33 px、FW6 (12,10)）。
+- **结论**：窗口应该按 soma 密度来定。还没改代码。方案是在 `align_window.py` 加 `sample_z_mode: "soma_dense"`（窗口限制在非空白层内；soma 太少时退回旧做法），只对改了 config 的样本生效。生效后需要归档并从 Stage 2.5 开始重跑。
+
+### QC soma 误报修复（`src/qc/alignment_flags.py`，不在任何 hash 里）
+
+- soma（GFP 对 RFP 的体素 IoU）判 bad 需要同时满足：峰值不在扫描边界上；z 偏移 > 1 层（`iou_max_offset_z_slices`），或 xy 偏移 > 6 µm（`iou_max_offset_xy_um`）；IoU 提升 ≥ 1.3 倍（`iou_min_gain`，原来 1.05）。
+- 峰值卡在扫描边界上的（单调上升，没有真正的峰），改判 insufficient。
+- "对齐后 IoU < 1.1 倍不对齐的 IoU" 也改判 insufficient，不再判 bad。依据：tsc18 302700_365100、314000_342500 被这条判 bad，但用 soma 最密窗口重算，结果和 pipeline 完全一致（(0,0,3)、(0,−4,3)），314000 的分数从 0.07 升到 0.21。QC 只在每个 tile 的一小块区域（10 层）里算 IoU，信息不够。
+- TF 规则没改（中位残差 > 3 µm 且 ≥ 3 SE）。
+- 新增 `refresh_flags` / `python -m src.qc.alignment_flags --qc-dir <qc/alignment> --refresh`：用代码里的新默认值重新判定（`run_details.json` 里存的旧阈值不再沿用），同时更新 `run_details.json` 和 `qc_report.md` 的 flagged 部分。不重算 IoU。
+- 测试 `test_alignment_flags` 新增 2 项（z 规则：真峰、边界峰、1 层、提升不够；refresh），共 8 项通过；`test_qc_alignment`、`test_sample_qc`、`test_checkpoint_code_lists` 也通过。
+- 已对 21 个 TSC/对照样本重新判定（改前的 4 个文件备份在各自 `qc/alignment/flags_before_20261117/`）。bad tile 数（改前 → 改后）：FF11 4→1、FF19 4→1、FF6 5→2、FF8 6→0、FF9 3→0、FW11 2→1、FW2 7→2、FW6 5→1、FW7 3→0、FW8 4→1、TSC10 6→0、tsc11 6→1、tsc12q 4→0、tsc12t 11→2、tsc18 4→1、TSC8 3→3、t4 4→3、t10 7→4、ET10 13→9、ETail 7→4、ET1 8→7。还剩的 soma bad：FF19 345000_321800、FW2 323100_322900 / 368400_334200、FW6 363000_335100、FW8 369000_357100、tsc11 351600_294700、tsc18 325300_342500（已确认是真问题）、TSC8 394200_343900、ETail 293300_324900。其余剩下的是 TF。
+- 重跑 sample QC 的 A（审查图）和 F（汇总）：作业 1955594（`LIST=stitch_samples.txt ONLY=A,F`）。注意 `sbatch --export=ALL,ONLY=A,F` 会把逗号当成变量分隔符，第一次提交（1955593）已取消；改为在命令前设环境变量，再用 `--export=ALL`。
+
+## 2026-11-17（续）Stage 2.5 新窗口 `soma_dense`；TSC + 对照 23 个样本归档，CPU 上从 Stage 2.5 重跑
+
+用户接受变慢，要求归档旧结果、改 pipeline、对所有 TSC 和对照重新对齐。CPU 用 BME 的还是学校普通分区，哪个排队快用哪个。DT47 优先级最低。另外取消了 ET1 完整性检查的计时作业 1952935。
+
+### 计时（tsc18 325300_342500，登录节点单线程，含 Sox9）
+
+- 所有通道 z-link 52 s（两种窗口相同）；找窗口 0.02 s。
+- 对齐计算：旧窗口 132 s，soma_dense 窗口 689 s（约 5 倍）。主要是 Sox9→RFP 包含度打分随窗口里的 RFP 数量增长（85 → 2978 个 soma 细胞）。
+- Sox9 偏移 (−1,6,3) → (−2,5,−1)，分数 0.003 → 0.035；GFP (0,−4,1) → (−4,−4,3)，分数 0.097 → 0.204。老 TSC 的坐标帧是 Sox9，所以 Sox9 偏移变化会影响所有通道细胞的相对位置。
+
+### 代码
+
+- `src/core/align_window.py`：
+  - 新增 `soma_dense_window(soma_centres, count, first, last)`：在 [first, last] 非空白范围内，取 min(各 soma 通道细胞数) 最大的 `count` 层；分数相同时取最靠近范围中间的；范围比 count 短时用整个范围；没有任何窗口同时含所有 soma 通道的细胞时返回 None。
+  - `resolve_window_mode` 接受 `sample_z_mode: "soma_dense"`；`tile_windows` 多记录 `first_nonblank`、`last_nonblank`。
+- `src/core/point_cloud_aligner.py` `align_tile`：soma_dense 模式和 nonblank_center 一样需要预先算好的 `_sample_windows.json`（无组织 tile 偏移仍记 0）。z-link 之后用 soma 通道（`soma_ch_ids`）细胞的 `cz` 选窗口；返回 None 时沿用 nonblank_center 窗口。`measured_offsets.json` 的 `sample_window` 记录 `soma_cells_in_window`、`fallback_nonblank_center`。
+  - `tile_alignment_done` 的兼容列表加了改前的 hash `df829b13…`（ERH/t70/DT47 11-17 的对齐用的就是这个版本），所以 EGFR 疾病组和 DT47 的已有对齐不会被判为冲突。CLAUDE.md 已补充这条规则。
+- `scripts/run_inference.py`：soma_dense 也先算 `_sample_windows.json`。Stage 4 会因为这个文件的 hash 变化重算一次（重跑的样本本来就要重算）。
+- 测试：`test_align_window` 新增 5 项（共 16 项），通过；`test_checkpoint_code_lists`、`test_pipeline_steps`、`test_automatic_resume`、`test_refilter_align`、`test_alignment_flags`、`test_sample_qc`、`test_stitch_raw_tiles` 通过。真实数据核对：tsc18 325300_342500 的 soma_dense 窗口是 116–216（2978 个细胞），和原型一致；nonblank_center 会给 294–394。
+
+### config（23 个：16 个 TSC + t4、t10、ET10、ETail、ET1、ERH、t70）
+
+- `pre_align_params` 加 `"sample_z_mode": "soma_dense"`、`"blank_image_max_bytes": 1000000`（ERH、t70 由 nonblank_center 改为 soma_dense）；`n_workers` 4 → 8（不在对齐设置里，不触发额外重算；2.9 的 workers 跟着变，2.9 本来就要重算）。
+- ERH、t70 的 `direct_stitching` 改成和其他样本一样：拼 Olig2，Z 不降采样，`output_name` 是 ERH / t70，输出到 `stitched_imgs`。
+- 改前的 config 备份在会话临时目录（未保留）。
+
+### 归档
+
+- 23 个结果目录：`3_2d_aligned`、`3_2d_aligned_fusion`、`4_2d_filtered`、`5_2d_global`、`6_3d_global`、`7_colocalization`、`qc`、`1_2d_raw/histograms` 移到 `old_results_window_center/`（ERH、t70 是 `old_results_nonblank_window/`），附 README。只剩 `1_2d_raw`、`2_2d_filtered`。旧对齐 QC 判定的备份 `flags_before_20261117` 在归档里的 `qc/alignment/` 下。
+- 拼接图：取消 1954065_19–21（ET10、ETail、ET1，删了它们未完成的 `.part`）。已完成的 18 个移到 `stitched_imgs/old_align_window_20261117/`（附 README），因为 2.9 的 tile 位置会变。新的拼接图由重跑时 Stage 3 的 direct_stitching 写回 `stitched_imgs/`。
+
+### 提交
+
+- `scripts/realign_cpu.slurm` + `scripts/realign_samples.txt`（1–16 TSC，17–23 对照）：compute 分区、lsmsmart_cpu、normal QOS（每节点 ≤ 188G、≤ 4 天），16 核 / 160G / 48 h，不占 GPU。作业 1955802（array 1–23，不限并发）。
+- 选 compute 的原因：当时 compute 空闲约 488 核、gpu_partners 约 354 核，但 gpu_partners 走 p_bme_gpu QOS，不申请 GPU 可能不让提交；之前的 CPU 作业在 compute 上几分钟内就能开始。
+- DT47（1952945，GPU）照常在跑，优先级最低，不动它。
+- 待核查：每个样本 `3_2d_aligned/_sample_windows.json` 有 first/last_nonblank；`measured_offsets.json` 的 `soma_cells_in_window` 和 fallback 数量；tsc18 325300_342500 的 GFP 是否约为 (−4,−4,3)；对齐 QC 的 bad 数；拼接图重新生成。
+- 提交后资源调整：16 核 / 160G 在 compute 上排不到（0 个空位）；BME gpu_partners 不收纯 CPU 作业，而 p_bme_gpu 的 4 张 L40S 被 DT47 占着。TSC_FF11（16 核 8 进程）Stage 2.5 峰值约 49G，所以用 scontrol 把排队中的任务改成 8 核 / 80G（`MinMemoryNode=81920`、`CPUsPerTask=8`），脚本默认值同步修改。1–3 号以 16 核启动。
+
+### 2026-11-17 停 DT47，BME GPU 改给重对齐用
+
+- 按用户要求 `scancel 1952945`（EGFR_DT47 全流程，gpu_partners 4×L40S）。它停在 Stage 2 检测。之后重新提交可以从检测 checkpoint 接着跑。
+- 重对齐 1955802：TSC 1–16 都已在 compute 上运行（8–16 核）。task 6 TSC_FW11 已经跑完全流程，用时 73 分钟，拼接图已重新生成。
+- 还在排队的对照组 19–23（ET10、ETail、ET1、ERH、t70）已从 compute 取消，改到 BME 重新提交：
+  `sbatch -p gpu_partners -A lsmsmart_gpu --qos=p_bme_gpu --gres=gpu:l40s:1 --cpus-per-task=16 --mem=120G --array=19-23 realign_cpu.slurm` → 1957198。
+  QOS p_bme_gpu 上限 4 张 L40S，所以 19–22 在跑，23（t70）等空位。
+- GPU 只在 Stage 3B 的 TF containment（stitcher cdist）里用到。Stage 2.5 对齐纯 CPU，申请 GPU 主要是为了借用 BME 节点的 CPU。
+
+### 2026-11-17 19:40 重对齐进度核查；t70 改到 compute
+
+- 核对：代码最后修改 16:30、23 个 config 16:34，所有重对齐任务都在 16:35 之后启动，用的是 soma_dense 新规则，不需要重新提交。
+- 1955802：1、2、3、5、6、7、8、9 已完成（exit 0）；4、10–18 在跑（大多已到 Stage 3，16 在拼接，17/18 在对齐 QC）。
+- 1957198（BME，ET10/ETail/ET1/ERH）仍在 Stage 2.5：已对齐 tile 数分别为 36/40/26/28（共 45）。
+- t70（第 23 行）在 BME 上因 QOSGrpGRES（4 张 L40S 用满）排队，compute 当时空闲 609 核，于是 `scancel 1957198_23`，改为 `sbatch --array=23 realign_cpu.slurm`（compute，8 核/80G）→ 1957807，已在 c202n10 上运行。

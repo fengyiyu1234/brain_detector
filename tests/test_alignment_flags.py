@@ -54,7 +54,59 @@ class FlagTests(unittest.TestCase):
         same = dict(tile='d', pairs={}, curves=iou_curves('d', 0, at_zero=.1, peak=.1, unaligned=.1),
                     offsets={'RFP': {'dx': 0, 'dy': 0, 'dz': 0}, 'GFP': {'dx': 0, 'dy': 0, 'dz': 0}})
         _, tiles, _ = flag_tiles(self.report([good, bad, unhelpful, same]))
-        self.assertEqual(dict(zip(tiles.tile, tiles.verdict)), {'a': 'ok', 'b': 'bad', 'c': 'bad', 'd': 'ok'})
+        # Aligned no better than unaligned is inconclusive, not bad (small QC region).
+        self.assertEqual(dict(zip(tiles.tile, tiles.verdict)),
+                         {'a': 'ok', 'b': 'bad', 'c': 'insufficient', 'd': 'ok'})
+
+    def test_soma_z_rules_need_interior_peak_two_slices_and_gain(self):
+        def z_curve(tile, values):
+            rows = []
+            for axis in 'xyz':
+                deltas = range(-5, 6) if axis == 'z' else range(-30, 31)
+                for delta in deltas:
+                    # zero shift is the same voxel IoU on every axis
+                    value = values[delta + 5] if axis == 'z' or delta == 0 else .01
+                    scale = SETTINGS['z_resolution_um' if axis == 'z' else 'xy_resolution_um']
+                    rows.append(dict(tile=tile, channel='GFP', metric='voxel_iou', axis=axis,
+                                     delta=delta, delta_um=delta*scale, value=value, n_pairs=0,
+                                     unaligned_iou=.05, status='diagnostic'))
+            return dict(tile=tile, pairs={}, curves=rows)
+        # tsc18 325300_342500: clear interior peak at +2 slices, x1.95 -> bad
+        real = z_curve('real', [.037, .039, .044, .052, .061, .088, .136, .172, .160, .126, .094])
+        # Like TSC10 401700_394600 (x1.25 there, now below the gain limit anyway), but with
+        # x1.67: still a monotonic rise to the +5 scan edge -> insufficient, not bad
+        edge = z_curve('edge', [.001, .005, .010, .016, .026, .036, .040, .044, .050, .055, .060])
+        # one slice off with a small gain -> ok
+        small = z_curve('small', [.05, .05, .05, .05, .09, .10, .12, .05, .05, .05, .05])
+        # two slices off but only x1.1 -> ok
+        weak = z_curve('weak', [.05, .05, .05, .05, .05, .10, .05, .11, .05, .05, .05])
+        channels, tiles, _ = flag_tiles(self.report([real, edge, small, weak]))
+        verdict = dict(zip(tiles.tile, tiles.verdict))
+        self.assertEqual(verdict, {'real': 'bad', 'edge': 'insufficient', 'small': 'ok', 'weak': 'ok'})
+        self.assertIn('inconclusive', channels.set_index('tile').loc['edge', 'reasons'])
+
+    def test_refresh_uses_current_defaults_not_stored_ones(self):
+        import json
+        from src.qc.alignment_flags import refresh_flags
+        old = dict(OPTIONS, flagging={'bootstrap_samples': 1000, 'iou_min_gain': 1.05,
+                                      'iou_min_vs_unaligned': 1.1, 'max_offset_xy_um': 3.0,
+                                      'max_offset_z_um': 4.0, 'min_z_score': 3.0})
+        # x peak at +6 px (3.9 um) with x1.1 gain: bad under the old rules only
+        record = dict(tile='a', pairs={}, curves=iou_curves('a', 6, at_zero=.2, peak=.22))
+        with tempfile.TemporaryDirectory() as tmp:
+            report = dict(options=old, settings=SETTINGS, completed=[record], failures={})
+            (Path(tmp)/'run_details.json').write_text(json.dumps(report), encoding='utf-8')
+            (Path(tmp)/'qc_report.md').write_text('# Alignment\n\nkeep me\n\n## Flagged tiles\nold\n',
+                                                  encoding='utf-8')
+            tiles, _ = refresh_flags(tmp)
+            self.assertEqual(tiles.verdict.tolist(), ['ok'])
+            details = json.loads((Path(tmp)/'run_details.json').read_text())
+            self.assertEqual(details['options']['flagging']['iou_min_gain'], 1.3)
+            self.assertEqual(details['flagged'], [])
+            md = (Path(tmp)/'qc_report.md').read_text()
+            self.assertIn('keep me', md)
+            self.assertNotIn('\nold\n', md)
+            self.assertEqual(md.count('## Flagged tiles'), 1)
 
     def test_failed_tiles_are_reported(self):
         _, tiles, _ = flag_tiles(self.report([tf_record('a', [0, 0, 0])], {'z': 'Traceback'}))

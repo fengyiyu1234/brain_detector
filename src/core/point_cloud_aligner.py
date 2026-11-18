@@ -1231,9 +1231,14 @@ def tile_alignment_done(tile_name, det_dir, align_dir, routing):
         # - 6d196d39…: before the checkpoint-validation-only release.
         # - 0f042f60…: commit 2239e80 saved with CRLF line endings (before .gitattributes
         #   eol=lf in cd135d9 renormalized the tree); 0d250537…: the same file with LF.
-        compatible = {'6d196d39d7575663d876da188ab9e1708bfb4d88bf5eade84c38c7f96668364d',
+        # - 95f6dba8…: before the nonblank_center sampling window; the older window
+        #   modes compute exactly as before.
+        # - df829b13…: before the soma_dense sampling window (2026-11-17); same as above.
+        compatible = {'df829b13c6dd2aa7b0aa1da3029ae33ce293e09163d1b94069e8092837ddd08c',
+                      '6d196d39d7575663d876da188ab9e1708bfb4d88bf5eade84c38c7f96668364d',
                       '0f042f60f7c8cd09e7a32f3c5137fc4ea82cc6c09a636b5354d17471b88d9383',
-                      '0d250537a1cbeda8cbcdf7536aa3fee83c8bc522110082d159a6bfe29e803a27'}
+                      '0d250537a1cbeda8cbcdf7536aa3fee83c8bc522110082d159a6bfe29e803a27',
+                      '95f6dba865c6552761c2f15a0698cc3e426442755432a2bed9bac0def55da44f'}
         if old_signature.get('aligner_sha256') in compatible:
             old_signature['aligner_sha256'] = signature['aligner_sha256']
         if any(not manifest_output_path(manifest_path, name).is_file()
@@ -1284,10 +1289,16 @@ def alignment_sample_window(n_slices, settings):
     return start, start + count
 
 
-def align_tile(tile_path, det_dir, align_dir, routing, settings):
+def align_tile(tile_path, det_dir, align_dir, routing, settings, sample_window_override=None):
     """
     Stage 2.5 的单 tile 流程：各通道轻量 z-link → 两步对齐 → 写对齐 CSV → 最后写 offsets JSON。
     返回缺失的检测 CSV 路径列表。只做 CPU 计算，参数全可 pickle，供进程池直接调用。
+
+    sample_z_mode "nonblank_center": sample_window_override is this tile's entry of
+    _sample_windows.json ({'start', 'stop', ...}); start None = no tissue, all shifts 0.
+    sample_z_mode "soma_dense": same entry; after z-linking, the window moves to the
+    `count` non-blank slices with the most soma cells (align_window.soma_dense_window),
+    keeping the nonblank_center window when no window holds cells of every soma channel.
     """
     from src.core.z_linker import run_z_linker   # 局部导入：z_linker 与本模块互不依赖，避免加载顺序问题
 
@@ -1297,7 +1308,18 @@ def align_tile(tile_path, det_dir, align_dir, routing, settings):
     slice_names = [os.path.splitext(f)[0] for f in sorted(
         f for f in os.listdir(tile_path)
         if f.lower().endswith(('.tif', '.tiff')) and not f.startswith('.'))]
-    sample_window = alignment_sample_window(len(slice_names), settings)
+    no_tissue = False
+    window_mode = settings.get('sample_z_mode')
+    dense_info = None
+    if window_mode in ('nonblank_center', 'soma_dense'):
+        if sample_window_override is None:
+            raise ValueError(f'{tile_name}: {window_mode} needs a precomputed sample window')
+        if sample_window_override.get('start') is None:
+            sample_window, no_tissue = None, True
+        else:
+            sample_window = (int(sample_window_override['start']), int(sample_window_override['stop']))
+    else:
+        sample_window = alignment_sample_window(len(slice_names), settings)
 
     # 1. 对每个通道轻量 z-link，得到 per-tile 3D vol_list
     measurement_source = settings.get('measured_offsets_source')
@@ -1327,6 +1349,17 @@ def align_tile(tile_path, det_dir, align_dir, routing, settings):
             if not os.path.isfile(os.path.join(
                 det_dir, f"{tile_name}_{ch['id']}_result.csv"))
         ]
+    elif no_tissue:
+        shifts = {ch['id']: (0, 0, 0) for ch in routing}
+        scores = {cid: 0.0 for cid in shifts}
+        z_center = 0.0
+        diagnostics = {'status': 'no_tissue'}
+        missing = [
+            os.path.join(det_dir, f"{tile_name}_{ch['id']}_result.csv")
+            for ch in routing
+            if not os.path.isfile(os.path.join(
+                det_dir, f"{tile_name}_{ch['id']}_result.csv"))
+        ]
     else:
         per_ch_vol_lists, z_counts, missing = {}, [], []
         for ch in routing:
@@ -1346,6 +1379,21 @@ def align_tile(tile_path, det_dir, align_dir, routing, settings):
             z_counts.extend(c.get('cz', 0) for c in vol_list)
 
         # 2. 估计 tile z 中心；3. 两步体素对齐
+        if window_mode == 'soma_dense':
+            from src.core.align_window import soma_dense_window
+            first = sample_window_override.get('first_nonblank')
+            last = sample_window_override.get('last_nonblank')
+            if first is None or last is None:
+                raise ValueError(f'{tile_name}: soma_dense needs first/last_nonblank in '
+                                 '_sample_windows.json; recompute the windows')
+            dense = soma_dense_window(
+                [[c.get('cz', 0) for c in per_ch_vol_lists.get(cid, [])]
+                 for cid in settings['soma_ch_ids']],
+                settings['sample_z_center_count'], first, last)
+            dense_info = {'soma_cells_in_window': dense[2] if dense else 0,
+                          'fallback_nonblank_center': dense is None}
+            if dense:
+                sample_window = dense[:2]
         z_center = float(np.median(z_counts)) if z_counts else 0.0
         if sample_window is not None:
             z_lo, z_hi = sample_window
@@ -1405,6 +1453,15 @@ def align_tile(tile_path, det_dir, align_dir, routing, settings):
             'first_slice_name': slice_names[lo - 1],
             'last_slice_name': slice_names[hi - 2],
         }
+    if settings.get('sample_z_mode'):
+        measurement_payload.setdefault('sample_window', {'total_slices': len(slice_names)})
+        measurement_payload['sample_window']['mode'] = settings['sample_z_mode']
+        measurement_payload['sample_window']['no_tissue'] = no_tissue
+        if sample_window_override and window_mode == 'nonblank_center':
+            measurement_payload['sample_window']['n_nonblank_in_window'] = \
+                sample_window_override.get('n_nonblank_in_window')
+        if dense_info:
+            measurement_payload['sample_window'].update(dense_info)
     os.makedirs(align_dir, exist_ok=True)
     measurement_file = os.path.join(
         align_dir, f'{tile_name}_measured_offsets.json')

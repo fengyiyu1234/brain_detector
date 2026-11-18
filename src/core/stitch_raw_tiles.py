@@ -8,6 +8,8 @@ The existing XML generation step is unchanged.
 Each channel's XML supplies
 ABS_H/ABS_V/ABS_D; this script reads raw tile TIFFs, blends overlaps, averages
 blocks in XYZ, and writes aligned 2D TIFF sequences without TeraStitcher.
+downsample_factor sets the XY block size; downsample_factor_z (default: the same
+value) sets the Z block size, so 1 keeps every raw Z slice.
 """
 from __future__ import annotations
 
@@ -186,10 +188,12 @@ def read_channel(raw_dir: Path, marker: str) -> Channel:
                    reference_size, reference_dtype, voxel_size)
 
 
-def geometry(channels: dict[str, Channel], factor: int):
+def geometry(channels: dict[str, Channel], factor: int, factor_z: int | None = None):
     """Compute one XY canvas and the complete common Z interval."""
-    if isinstance(factor, bool) or not isinstance(factor, int) or factor < 1:
-        raise ValueError("downsample_factor must be a positive integer")
+    factor_z = factor if factor_z is None else factor_z
+    for name, value in (("downsample_factor", factor), ("downsample_factor_z", factor_z)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
     first = next(iter(channels.values()))
     first_names = {tile.key for tile in first.tiles}
     for channel in channels.values():
@@ -209,13 +213,13 @@ def geometry(channels: dict[str, Channel], factor: int):
     min_z = min(tile.z for tile in all_tiles)
     max_z = max(tile.z for tile in all_tiles)
     usable_z = len(first.slice_keys) - (max_z - min_z)
-    if usable_z < factor:
+    if usable_z < factor_z:
         raise ValueError("No complete downsampled Z slice is shared by all tiles")
     canvas = ((max_x - min_x) // factor, (max_y - min_y) // factor)
-    depth = usable_z // factor
+    depth = usable_z // factor_z
     if min(canvas) < 1:
         raise ValueError("Downsample factor exceeds mosaic size")
-    return (min_x, min_y, min_z, max_z), canvas, depth, usable_z % factor
+    return (min_x, min_y, min_z, max_z), canvas, depth, usable_z % factor_z
 
 
 def feather_weights(tile_size: tuple[int, int], blend_width: int):
@@ -265,9 +269,10 @@ def read_image(path: Path, expected_size, expected_dtype):
     return array.astype(expected_dtype, copy=False)
 
 
-def stitch_channel(channel: Channel, output: Path, origin, canvas, depth,
-                   factor: int, blend_width: int):
-    output.mkdir()
+def stitched_slices(channel: Channel, origin, canvas, depth, factor: int,
+                    blend_width: int, factor_z: int | None = None):
+    """Yield the blended, block-averaged output Z slices of one channel."""
+    factor_z = factor if factor_z is None else factor_z
     patches = make_patches(channel, origin, canvas, factor)
     weight = feather_weights(channel.tile_size, blend_width)
     weight_maps = {}
@@ -287,8 +292,8 @@ def stitch_channel(channel: Channel, output: Path, origin, canvas, depth,
         numerator = np.zeros_like(denominator)
         for patch in patches:
             summed = np.zeros((patch.height, patch.width), dtype=np.float64)
-            first_raw = z_start - patch.tile.z + output_z * factor
-            for dz in range(factor):
+            first_raw = z_start - patch.tile.z + output_z * factor_z
+            for dz in range(factor_z):
                 source = read_image(patch.tile.files[first_raw + dz],
                                     channel.tile_size, channel.dtype)
                 weighted = source.astype(np.float32) * weight
@@ -296,44 +301,109 @@ def stitch_channel(channel: Channel, output: Path, origin, canvas, depth,
                 summed += small[:patch.height, :patch.width]
             numerator[patch.y0:patch.y0 + patch.height,
                       patch.x0:patch.x0 + patch.width] += summed
-        np.divide(numerator, denominator * factor, out=numerator,
+        np.divide(numerator, denominator * factor_z, out=numerator,
                   where=denominator > 0)
         image = np.clip(np.rint(numerator), 0, upper).astype(channel.dtype)
+        if (output_z + 1) % 10 == 0 or output_z + 1 == depth:
+            print(f"  {channel.marker}: {output_z + 1}/{depth} slices", flush=True)
+        yield image
+
+
+def stitch_channel(channel: Channel, output: Path, origin, canvas, depth,
+                   factor: int, blend_width: int, factor_z: int | None = None):
+    """Write one channel as a z00000.tif ... TIFF sequence in its own folder."""
+    output.mkdir()
+    for output_z, image in enumerate(stitched_slices(
+            channel, origin, canvas, depth, factor, blend_width, factor_z)):
         destination = output / f"z{output_z:05d}.tif"
         temporary = output / (destination.name + ".part")
         Image.fromarray(image).save(temporary, format="TIFF", compression="tiff_lzw")
         os.replace(temporary, destination)
-        if (output_z + 1) % 10 == 0 or output_z + 1 == depth:
-            print(f"  {channel.marker}: {output_z + 1}/{depth} slices", flush=True)
+
+
+def stitch_channel_volume(channel: Channel, destination: Path, origin, canvas, depth,
+                          factor: int, blend_width: int, factor_z: int, voxel_um):
+    """Write one channel as a single uncompressed ZYX BigTIFF, streamed slice by slice."""
+    import tifffile
+
+    temporary = destination.with_name(destination.name + ".part")
+    slices = stitched_slices(channel, origin, canvas, depth, factor, blend_width, factor_z)
+    with tifffile.TiffWriter(temporary, bigtiff=True) as writer:
+        writer.write(slices, shape=(depth, canvas[1], canvas[0]), dtype=channel.dtype,
+                     photometric="minisblack",
+                     resolution=(1.0 / voxel_um[0], 1.0 / voxel_um[1]),
+                     resolutionunit="MICROMETER",
+                     metadata={"axes": "ZYX", "voxel_size_um_xyz": list(voxel_um)})
+    os.replace(temporary, destination)
+
+
+def downsample_tag(factor: int, factor_z: int) -> str:
+    """File-name tag: 4x when XY and Z match, xy4x when Z keeps every slice."""
+    if factor == factor_z:
+        return f"{factor}x"
+    return f"xy{factor}x" if factor_z == 1 else f"xy{factor}x_z{factor_z}x"
+
+
+def manifest_matches(manifest: dict, config_path: Path, channel_dirs: dict,
+                     markers: list[str], factor: int, blend_width: int,
+                     factor_z: int) -> bool:
+    """Settings and XML stamps of a finished stitch still match the config."""
+    depth = manifest["output_slices"]
+    # Manifests written before downsample_factor_z existed hold one XYZ factor.
+    legacy = manifest.get("downsample_factor_xyz")
+    if (manifest["source_config"] != str(config_path)
+            or manifest.get("downsample_factor_xy", legacy) != factor
+            or manifest.get("downsample_factor_z", legacy) != factor_z
+            or manifest["blend_width_px"] != blend_width
+            or set(manifest["channels"]) != set(markers)
+            or not isinstance(depth, int) or depth < 1):
+        return False
+    for marker in markers:
+        raw_dir = channel_dirs[marker]
+        named = raw_dir / f"xml_merging_{marker}.xml"
+        xml = named if named.is_file() else raw_dir / "xml_merging.xml"
+        details = manifest["channels"][marker]
+        if (details["xml"] != str(xml)
+                or details["xml_mtime_ns"] != xml.stat().st_mtime_ns):
+            return False
+    return True
 
 
 def completed_output_matches(output: Path, config_path: Path, channel_dirs: dict,
-                             markers: list[str], factor: int, blend_width: int) -> bool:
+                             markers: list[str], factor: int, blend_width: int,
+                             factor_z: int | None = None) -> bool:
     """A final manifest marks a finished image stitch for pipeline resumes."""
+    factor_z = factor if factor_z is None else factor_z
     manifest_path = output / "stitch_manifest.json"
     if not manifest_path.is_file():
         return False
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        depth = manifest["output_slices"]
-        if (manifest["source_config"] != str(config_path)
-                or manifest["downsample_factor_xyz"] != factor
-                or manifest["blend_width_px"] != blend_width
-                or set(manifest["channels"]) != set(markers)
-                or not isinstance(depth, int) or depth < 1):
+        if not manifest_matches(manifest, config_path, channel_dirs, markers,
+                                factor, blend_width, factor_z):
             return False
+        depth = manifest["output_slices"]
         for marker in markers:
-            raw_dir = channel_dirs[marker]
-            named = raw_dir / f"xml_merging_{marker}.xml"
-            xml = named if named.is_file() else raw_dir / "xml_merging.xml"
-            details = manifest["channels"][marker]
-            if (details["xml"] != str(xml)
-                    or details["xml_mtime_ns"] != xml.stat().st_mtime_ns
-                    or len(list((output / marker).glob("z*.tif"))) != depth):
+            if len(list((output / marker).glob("z*.tif"))) != depth:
                 return False
     except (OSError, ValueError, KeyError, TypeError):
         return False
     return True
+
+
+def completed_volume_matches(volume: Path, manifest_path: Path, config_path: Path,
+                             channel_dirs: dict, marker: str, factor: int,
+                             blend_width: int, factor_z: int) -> bool:
+    """A single-file output is finished once its manifest sits beside the TIFF."""
+    if not volume.is_file() or not manifest_path.is_file():
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return (manifest.get("file") == volume.name and
+                manifest_matches(manifest, config_path, channel_dirs, [marker],
+                                 factor, blend_width, factor_z))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 def run(config_path: Path, dry_run: bool = False, skip_completed: bool = False):
@@ -351,6 +421,7 @@ def run(config_path: Path, dry_run: bool = False, skip_completed: bool = False):
     path_base = PROJECT_ROOT if "paths" in config or "samples" in config else config_path.parent
     output = resolve_path(output_path_value(params), path_base)
     factor = params.get("downsample_factor", 4)
+    factor_z = params.get("downsample_factor_z", factor)
     blend_width = params.get("blend_width_px", 256)
     if isinstance(blend_width, bool) or not isinstance(blend_width, int) or blend_width < 1:
         raise ValueError("blend_width_px must be a positive integer")
@@ -385,16 +456,40 @@ def run(config_path: Path, dry_run: bool = False, skip_completed: bool = False):
             for m in canonical
         }
         raw_root = None
-    if output.exists():
+    # output_name: write <output_name>_<marker>_<tag>.tif (+ .json manifest) per marker
+    # into a shared output_dir instead of one folder of z*.tif per sample.
+    output_name = params.get("output_name")
+    volumes = None
+    if output_name is not None:
+        if (not isinstance(output_name, str) or not output_name.strip()
+                or any(c in output_name for c in '/\\:')):
+            raise ValueError("direct_stitching.output_name must be a plain file-name prefix")
+        tag = downsample_tag(factor, factor_z)
+        volumes = {m: output / f"{output_name}_{m}_{tag}.tif" for m in canonical}
+        existing = [path for volume in volumes.values()
+                    for path in (volume, volume.with_suffix(".json")) if path.exists()]
+        if existing:
+            if skip_completed and all(
+                    completed_volume_matches(volume, volume.with_suffix(".json"),
+                                             config_path, channel_dirs, m, factor,
+                                             blend_width, factor_z)
+                    for m, volume in volumes.items()):
+                print(f"Direct stitching already complete in {output}; skipping.")
+                return
+            raise FileExistsError(f"Output already exists or is incomplete; delete it "
+                                  f"or change output_name: {existing[0]}")
+    elif output.exists():
         if skip_completed and completed_output_matches(
-                output, config_path, channel_dirs, canonical, factor, blend_width):
+                output, config_path, channel_dirs, canonical, factor, blend_width,
+                factor_z):
             print(f"Direct stitching already complete at {output}; skipping.")
             return
         raise FileExistsError(f"Output already exists or is incomplete; "
                               f"choose a new output_dir: {output}")
     channels = {m: read_channel(channel_dirs[m], m) for m in canonical}
-    origin, canvas, depth, discarded_z = geometry(channels, factor)
-    print(f"Canvas={canvas[0]}x{canvas[1]}, Z={depth}, downsample={factor}x XYZ, "
+    origin, canvas, depth, discarded_z = geometry(channels, factor, factor_z)
+    print(f"Canvas={canvas[0]}x{canvas[1]}, Z={depth}, "
+          f"downsample={factor}x XY, {factor_z}x Z, "
           f"global ABS_D range={origin[2]}..{origin[3]}, "
           f"discarded tail slices={discarded_z}")
     for marker, channel in channels.items():
@@ -403,17 +498,18 @@ def run(config_path: Path, dry_run: bool = False, skip_completed: bool = False):
     if dry_run:
         return
 
-    output.mkdir(parents=True)
-    for marker, channel in channels.items():
-        stitch_channel(channel, output / marker, origin, canvas, depth, factor, blend_width)
     voxel = next(iter(channels.values())).voxel_size
+    factors = {"downsample_factor_xy": factor, "downsample_factor_z": factor_z}
+    if factor_z == factor:
+        factors["downsample_factor_xyz"] = factor
     manifest = {
         "source_config": str(config_path),
         "raw_sample_dir": str(raw_root) if raw_root else None,
         "raw_channel_dirs": {m: str(channel_dirs[m]) for m in canonical},
         "output_width": canvas[0], "output_height": canvas[1],
-        "output_slices": depth, "downsample_factor_xyz": factor,
-        "output_voxel_size_um": [value * factor for value in voxel],
+        "output_slices": depth, **factors,
+        "output_voxel_size_um": [voxel[0] * factor, voxel[1] * factor,
+                                 voxel[2] * factor_z],
         "global_min_abs_h": origin[0], "global_min_abs_v": origin[1],
         "global_min_abs_d": origin[2], "global_max_abs_d": origin[3],
         "raw_z_start_for_tile": "global_max_abs_d - tile_abs_d",
@@ -438,6 +534,26 @@ def run(config_path: Path, dry_run: bool = False, skip_completed: bool = False):
                 origin[3] - max(t.z for t in frame_tiles)
             ),
         }
+    if volumes is not None:
+        output.mkdir(parents=True, exist_ok=True)
+        output_voxel = manifest["output_voxel_size_um"]
+        for marker, channel in channels.items():
+            volume = volumes[marker]
+            stitch_channel_volume(channel, volume, origin, canvas, depth, factor,
+                                  blend_width, factor_z, output_voxel)
+            single = dict(manifest, file=volume.name, axes="ZYX",
+                          channels={marker: manifest["channels"][marker]},
+                          raw_channel_dirs={marker: manifest["raw_channel_dirs"][marker]})
+            temporary = volume.with_suffix(".json.part")
+            temporary.write_text(json.dumps(single, indent=2, ensure_ascii=False) + "\n",
+                                 encoding="utf-8")
+            os.replace(temporary, volume.with_suffix(".json"))
+            print(f"Directly stitched volume written to {volume}")
+        return
+    output.mkdir(parents=True)
+    for marker, channel in channels.items():
+        stitch_channel(channel, output / marker, origin, canvas, depth, factor,
+                       blend_width, factor_z)
     (output / "stitch_manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"Directly stitched TIFF sequences written to {output}")

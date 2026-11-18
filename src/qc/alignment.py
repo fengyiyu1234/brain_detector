@@ -27,6 +27,9 @@ from .sampling import choose_region, cohort, prepare_tile, scan_footprint
 # The linking code QC runs (validate_align_shifts -> run_z_linker and its helpers), hashed by function so
 # Stage 3-only linking code later in z_linker.py does not invalidate QC records.
 # tests/test_checkpoint_code_lists.py fails if run_z_linker starts using an unlisted helper.
+ALIGN_QC_FILES = ('__init__.py', 'alignment.py', 'alignment_features.py', 'alignment_plots.py',
+                  'common.py', 'sampling.py', 'stitch_dedup.py')
+
 ALIGN_LINK_CODE = (
     'src.core.z_linker:_IOU_BLOCK', 'src.core.z_linker:_candidate_pairs',
     'src.core.z_linker:_iou_matrix', 'src.core.z_linker:_match_dense',
@@ -238,9 +241,10 @@ def input_signature(tile, params, previous=None, saved_region=None):
     paths += [Path(params['raw_dir'])/f"{tile}_{ch['id']}_inputs.json" for ch in params['routing']]
     paths += [Path(params['align_dir'])/f'{tile}_{suffix}.json' for suffix in ('offsets', 'measured_offsets')]
     paths += [Path(params['align_dir'])/'_align_settings.json']
-    # Flag thresholds and post-processing modules do not change per-tile records.
-    report_only = {'alignment_flags.py', 'run_qc.py'}
-    code = {str(p): file_sha256(p) for p in [*(q for q in Path(__file__).parent.glob('*.py') if q.name not in report_only),
+    # Flag thresholds and post-processing modules do not change per-tile records. The list
+    # is the src/qc modules that existed when the other QC modules were added, so those
+    # (unaligned.py, snr_qc.py, ...) do not rerun every tile.
+    code = {str(p): file_sha256(p) for p in [*(Path(__file__).parent/name for name in ALIGN_QC_FILES),
         Path(validation.__file__), Path(__file__).parents[1]/'core/point_cloud_aligner.py',
         Path(__file__).parents[1]/'utils/alignment_intensity_qc.py']}
     code['z_linker'] = code_sha256(None, ALIGN_LINK_CODE)

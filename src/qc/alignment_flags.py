@@ -17,7 +17,12 @@ FLAG_DEFAULTS = {
     'max_offset_z_um': 4.0,       # same for Z (half of an 8 um slice)
     'min_z_score': 3.0,           # TF residual must also exceed this many bootstrap SEs
     'bootstrap_samples': 1000,
-    'iou_min_gain': 1.05,         # IoU optimum must beat zero shift by this ratio
+    # Soma voxel IoU (GFP vs RFP) is noisy: the two label mostly different cells. A soma
+    # channel is bad only for a clear interior peak, >= 2 slices or > 6 um in XY, that beats
+    # zero shift by x1.3 (checked against review images of the old TSC samples, 2026-11-17).
+    'iou_min_gain': 1.3,          # IoU optimum must beat zero shift by this ratio
+    'iou_max_offset_xy_um': 6.0,  # soma IoU optimum beyond this in X or Y
+    'iou_max_offset_z_slices': 1,  # soma IoU optimum beyond this many slices in Z
     'iou_min_vs_unaligned': 1.1,  # aligned IoU must beat the unaligned IoU by this ratio
 }
 SEVERITY = {'ok': 0, 'insufficient': 1, 'bad': 2, 'error': 3}
@@ -69,7 +74,8 @@ def iou_rows(record, settings, flags, fixed):
     frame = pd.DataFrame([r for r in record['curves'] if r['metric'] == 'voxel_iou'])
     if frame.empty:
         return []
-    limits = {'x': flags['max_offset_xy_um'], 'y': flags['max_offset_xy_um'], 'z': flags['max_offset_z_um']}
+    limits = {'x': flags['iou_max_offset_xy_um'], 'y': flags['iou_max_offset_xy_um'],
+              'z': flags['iou_max_offset_z_slices']}
     rows = []
     for cid, group in frame.groupby('channel', sort=True):
         summary = {r['axis']: r for r in curve_summary(group)}
@@ -80,19 +86,32 @@ def iou_rows(record, settings, flags, fixed):
         if at_zero is None or not at_zero > 0:
             rows.append(dict(row, verdict='insufficient', reasons='no soma overlap signal'))
             continue
-        reasons = []
+        reasons, edges = [], []
         for axis, item in summary.items():
             row[f'd{axis}_um'] = item.get('best_delta_um')
             gain = item.get('best_value', at_zero)/at_zero
-            if abs(item.get('best_delta_um') or 0) > limits[axis] and gain >= flags['iou_min_gain']:
+            far = (abs(item.get('best_delta') or 0) > limits['z'] if axis == 'z'
+                   else abs(item.get('best_delta_um') or 0) > limits[axis])
+            if far and gain >= flags['iou_min_gain']:
                 unit = 'slice' if axis == 'z' else 'px'
-                reasons.append(f"{axis} IoU peak {item['best_delta_um']:+.1f} um "
-                               f"({item['best_delta']:+g} {unit}, x{gain:.2f})")
+                text = (f"{axis} IoU peak {item['best_delta_um']:+.1f} um "
+                        f"({item['best_delta']:+g} {unit}, x{gain:.2f})")
+                # A maximum on the scan edge is a monotonic trend, not a located optimum.
+                (edges if item.get('extremum_at_boundary') else reasons).append(text)
         # "Unaligned" applies the reference offset; identical saved offsets make it the same scan.
         moved = record.get('offsets', {}).get(cid) != record.get('offsets', {}).get(fixed)
+        # The QC region is small (10 slices), so "no better than unaligned" alone is too weak
+        # to call bad: tsc18 302700_365100/314000_342500 were confirmed by a soma-dense
+        # 100-slice re-measurement (2026-11-17). It marks the channel insufficient instead.
         if moved and row['unaligned_iou'] and at_zero < flags['iou_min_vs_unaligned']*row['unaligned_iou']:
-            reasons.append(f"aligned IoU {at_zero:.3f} vs unaligned {row['unaligned_iou']:.3f}")
-        rows.append(dict(row, verdict='bad' if reasons else 'ok', reasons='; '.join(reasons)))
+            edges.append(f"aligned IoU {at_zero:.3f} vs unaligned {row['unaligned_iou']:.3f}")
+        if reasons:
+            rows.append(dict(row, verdict='bad', reasons='; '.join(reasons)))
+        elif edges:
+            rows.append(dict(row, verdict='insufficient',
+                             reasons='inconclusive: ' + '; '.join(edges)))
+        else:
+            rows.append(dict(row, verdict='ok', reasons=''))
     return rows
 
 
@@ -132,8 +151,10 @@ def report_lines(tiles, flags):
              f'{len(bad)} of {len(tiles)} tiles need review; {len(sparse)} have too few pairs/signal to judge.',
              f"TF: median intensity-center residual > {flags['max_offset_xy_um']:g} um (XY) / "
              f"{flags['max_offset_z_um']:g} um (Z) and >= {flags['min_z_score']:g} bootstrap SE. "
-             f"Soma: IoU optimum beyond the same limits with >= x{flags['iou_min_gain']:g} gain, or aligned IoU "
-             f"< x{flags['iou_min_vs_unaligned']:g} unaligned.", '']
+             f"Soma: interior IoU peak > {flags['iou_max_offset_xy_um']:g} um (XY) / "
+             f"> {flags['iou_max_offset_z_slices']:g} slice (Z) with >= x{flags['iou_min_gain']:g} gain. "
+             f"A peak on the scan edge, or aligned IoU < x{flags['iou_min_vs_unaligned']:g} unaligned, "
+             f"counts as insufficient.", '']
     if len(bad):
         lines += ['| Tile | Channels | Reasons |', '|---|---|---|']
         lines += [f'| {r.tile} | {r.bad_channels} | {r.reasons} |' for r in bad.itertuples()]
@@ -153,11 +174,41 @@ def write_flags(output, report):
     return tiles, report_lines(tiles, flags)
 
 
+def refresh_flags(qc_dir, flagging=None):
+    """Re-flag a finished alignment QC run with current rules; no IoU/pair recomputation.
+
+    flagging: overrides on top of FLAG_DEFAULTS (run_details.json stores the resolved values
+    of its own run, so they are not reused). Updates the flag tables, run_details.json and
+    the flagged-tiles section of qc_report.md.
+    """
+    import json
+    qc_dir = Path(qc_dir)
+    report = load_config(qc_dir/'run_details.json')
+    report['options']['flagging'] = resolve_flag_options(flagging)
+    tiles, lines = write_flags(qc_dir, report)
+    report['flagged'] = tiles.loc[tiles.verdict.isin(['bad', 'error'])].to_dict('records')
+    report['insufficient'] = tiles.loc[tiles.verdict.eq('insufficient'), 'tile'].tolist()
+    tmp = qc_dir/'run_details.json.part'
+    tmp.write_text(json.dumps(report, indent=2, default=str), encoding='utf-8')
+    tmp.replace(qc_dir/'run_details.json')
+    md = qc_dir/'qc_report.md'
+    if md.is_file():
+        text = md.read_text(encoding='utf-8')
+        head = text.split('## Flagged tiles')[0]
+        md.write_text(head + '\n'.join(lines) + '\n', encoding='utf-8')
+    return tiles, lines
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--qc-dir', required=True, help='Alignment QC directory containing run_details.json')
+    parser.add_argument('--refresh', action='store_true',
+                        help='Apply current default rules and update run_details.json / qc_report.md')
     args = parser.parse_args(argv)
-    tiles, lines = write_flags(args.qc_dir, load_config(Path(args.qc_dir)/'run_details.json'))
+    if args.refresh:
+        tiles, lines = refresh_flags(args.qc_dir)
+    else:
+        tiles, lines = write_flags(args.qc_dir, load_config(Path(args.qc_dir)/'run_details.json'))
     print('\n'.join(lines))
     return 0
 
