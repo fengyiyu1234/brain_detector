@@ -10,9 +10,10 @@ report.txt. A channel exceeds when |rx| or |ry| > max_xy_px or |rz| > max_z_slic
 * ``single_outlier``: one channel exceeds and it has < min_match matches -> one bad measurement.
 * ``single``/``mixed``: recorded only.
 
-Review images (worst consistent seams): the overlap of the two tiles for the channel with
-the largest residual, tile A green and tile B magenta, left placed by the solved positions,
-right by the measured displacement, at up to layers_per_item real slices.
+Review images (worst consistent seams): the overlap of the two raw tiles (no Stage 2.5 shift,
+the frame Stage 2.9 measures and solves in), one row for the channel with the largest residual
+and one for the stitching frame channel; tile A green, tile B magenta, left placed by the solved
+positions, right by the measured displacement, at up to layers_per_item real slices.
 
 Outputs: qc/seam_consistency/{seams.csv,summary.json,report.md}, qc/review/seams/*.png.
 """
@@ -92,29 +93,41 @@ def classify(res, options, z_px=8.0 / 0.65):
     return out
 
 
-def seam_review(images, results_dir, seam, res_rows, out_dir, review, tile_size):
+def seam_review(images, results_dir, seam, res_rows, out_dir, review, tile_size, frame=None):
+    """Overlap images of one seam: one row per channel (worst channel, then the frame channel).
+
+    Stage 2.9 measures seams and solves positions on the raw tiles (2_2d_filtered, no
+    Stage 2.5 channel shift), so both tiles are read unshifted and B is placed at A + d.
+    Adding the Stage 2.5 shifts here would move B by shift_B - shift_A on top of d.
+    """
     ch = seam.worst_channel
-    r = res_rows[res_rows.channel == ch].iloc[0]
+    channels = [ch] + ([frame] if frame and frame != ch and (res_rows.channel == frame).any() else [])
+    rows = {c: res_rows[res_rows.channel == c].iloc[0] for c in channels}
+    r = rows[ch]
     a, b = seam.tile, seam.nb_tile
-    solved = (r.solved_dx, r.solved_dy, r.solved_dz)
     meas = (r.meas_dx, r.meas_dy, r.meas_dz)
     east = seam.direction == 'EAST'
     size = int(review['crop_px'])
     margin = 40
-    # overlap in tile A's frame, using the measured displacement
+    raw = (0, 0, 0)
+    # overlap in tile A's raw frame, using the measured displacement
     if east:
         x0, x1 = int(max(0, meas[0] - margin)), int(min(tile_size, tile_size + margin))
     else:
         y0, y1 = int(max(0, meas[1] - margin)), int(min(tile_size, tile_size + margin))
-    csv = os.path.join(results_dir, '3_2d_aligned', f'{a}_{ch}_result.csv')
+    csv = os.path.join(results_dir, '2_2d_filtered', f'{a}_{ch}_result.csv')
     boxes = pd.read_csv(csv, usecols=['x1', 'y1', 'x2', 'y2', 'z']) if os.path.isfile(csv) else \
         pd.DataFrame(columns=['x1', 'y1', 'x2', 'y2', 'z'])
     cx, cy = (boxes.x1 + boxes.x2) / 2, (boxes.y1 + boxes.y2) / 2
     in_ov = boxes[(cx >= meas[0]) if east else (cy >= meas[1])]
     zs = in_ov.z.value_counts()
     zs = zs[zs >= max(1, zs.max() * 0.2)].index.tolist() if len(zs) else []
-    zs = rv.pick_layers(zs, review['layers_per_item'],
-                        ok=lambda z: images.is_real(ch, a, z) and images.is_real(ch, b, int(round(z - meas[2]))))
+
+    def real(z):
+        return all(images.is_real(c, a, z) and images.is_real(c, b, int(round(z - rows[c].meas_dz)))
+                   for c in channels)
+
+    zs = rv.pick_layers(zs, review['layers_per_item'], ok=real)
     written = []
     for z in zs:
         on = in_ov[in_ov.z == z]
@@ -122,19 +135,29 @@ def seam_review(images, results_dir, seam, res_rows, out_dir, review, tile_size)
         centre = float(np.median(along)) if along.size else tile_size / 2
         lo = int(np.clip(centre - size // 2, 0, max(0, tile_size - size)))
         window = (x0, x1, lo, lo + size) if east else (lo, lo + size, y0, y1)
-        img_a = images.read(ch, a, z, window)
-        sb = images.shift(b, ch)
-        panels = []
-        for label, d in (('solved positions (Stage 2.9)', solved), ('measured displacement', meas)):
-            img_b = images.read(ch, b, z, window, (sb[0] + d[0], sb[1] + d[1], sb[2] + d[2]))
-            na, nb = rv.stretch(img_a), rv.stretch(img_b)
-            panels.append((rv.to_pil(np.dstack([nb, na, nb])),
-                           f'{label}: B-A = ({d[0]:.1f}, {d[1]:.1f}, {d[2]:.1f})'))
+        grid = []
+        for c in channels:
+            rc = rows[c]
+            img_a = images.read(c, a, z, window, raw)
+            na = rv.stretch(img_a)
+            tag = f'{c}{" (frame)" if c == frame else ""}'
+            panels = []
+            for label, d in (('solved (Stage 2.9)', (rc.solved_dx, rc.solved_dy, rc.solved_dz)),
+                             ('measured', (rc.meas_dx, rc.meas_dy, rc.meas_dz))):
+                img_b = images.read(c, b, z, window, d)
+                nb = rv.stretch(img_b)
+                m = np.isfinite(img_a) & np.isfinite(img_b)
+                corr = float(np.corrcoef(img_a[m], img_b[m])[0, 1]) if m.sum() > 100 else float('nan')
+                panels.append((rv.to_pil(np.dstack([nb, na, nb])),
+                               f'{tag} {label}: B-A = ({d[0]:.1f}, {d[1]:.1f}, {d[2]:.1f}), r={corr:.2f}'))
+            grid.append(panels)
         png = os.path.join(out_dir, f'{ch}_{a}__{b}_z{z:04d}.png')
+        res_text = '; '.join(f'{c} x {rows[c].rx:+.1f} y {rows[c].ry:+.1f} px z {rows[c].rz:+.1f}'
+                             for c in channels)
         written.append(rv.grid_png(
-            [panels], png, f'{ch} seam {a} -> {b} ({seam.direction}), tile A slice {z}',
-            f'A green, B magenta; aligned cells turn white. residual {ch}: '
-            f'x {r.rx:+.1f} y {r.ry:+.1f} px, z {r.rz:+.1f}; exceeding: {seam.exceed_channels}'))
+            grid, png, f'seam {a} -> {b} ({seam.direction}), raw tiles, tile A slice {z}',
+            f'A green, B magenta; matching cells turn white; r = overlap correlation. '
+            f'residual {res_text}; exceeding: {seam.exceed_channels}'))
     return written
 
 
@@ -176,10 +199,12 @@ def run(config, results_dir, force=False):
             if images.available():
                 rv.clear_pngs(image_dir)
                 tile_size = int((config.get('detection_params') or {}).get('tILESIZE', 2048))
+                frame = config.get('stitching_reference_channel')
                 written = []
                 for seam in picks.itertuples():
                     rows = res[(res.tile == seam.tile) & (res.nb_tile == seam.nb_tile)]
-                    written += seam_review(images, results_dir, seam, rows, image_dir, review, tile_size)
+                    written += seam_review(images, results_dir, seam, rows, image_dir, review, tile_size,
+                                           frame)
                 rv.save_images_manifest(manifest, sig, written)
                 summary['images'] = written
             else:

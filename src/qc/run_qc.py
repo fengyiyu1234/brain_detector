@@ -88,6 +88,21 @@ def run_alignment_stage(config, results_dir, tiles):
     return report
 
 
+def no_tissue_tiles(align_dir, tiles):
+    """Tiles whose <tile>_measured_offsets.json marks the Stage 2.5 window as no_tissue."""
+    import json
+    skipped = []
+    for tile in tiles:
+        path = Path(align_dir)/f'{tile}_measured_offsets.json'
+        if not path.is_file():
+            continue
+        with open(path, encoding='utf-8') as handle:
+            window = json.load(handle).get('sample_window') or {}
+        if window.get('no_tissue'):
+            skipped.append(tile)
+    return skipped
+
+
 def _run_alignment_qc(config, results_dir, tiles):
     options = config.get('qc', {}).get('alignment', {})
     if not options.get('enabled', False):
@@ -96,9 +111,23 @@ def _run_alignment_qc(config, results_dir, tiles):
         if config.get('pipeline_mode') != 'pre_align':
             raise ValueError('Alignment QC requires pre_align saved offsets and filtered detections')
         from .alignment import run
+        # Stage 2.5 records no window for tiles without tissue (offsets fixed at 0); QC has
+        # nothing to measure there.
+        skipped = no_tissue_tiles(Path(results_dir)/'3_2d_aligned', tiles)
+        tiles = [t for t in tiles if t not in skipped]
+        if skipped:
+            logging.info(f"  [QC] 对齐 QC 跳过 {len(skipped)} 个无组织 tile（偏移记 0）: {', '.join(skipped)}")
+        if not tiles:
+            return {'status': 'complete', 'completed': [], 'failures': {}, 'flagged': [],
+                    'insufficient': [], 'skipped_no_tissue': skipped}
         report = run(results_dir, options=options, tiles=tiles, config=config)
+        if skipped:
+            report['skipped_no_tissue'] = skipped
+            save_json(Path(results_dir)/options.get('output_dir', 'qc/alignment')/'run_details.json', report)
         if report['status'] == 'failed':
             raise RuntimeError(f"Alignment QC failed for {len(report['failures'])} tile(s)")
+        # The summary reports FAIL while an error file from an earlier run is present.
+        (Path(results_dir)/'qc'/'alignment_error.json').unlink(missing_ok=True)
         report_path = Path(results_dir)/options.get('output_dir', 'qc/alignment')/'qc_report.md'
         if report.get('flagged'):
             logging.warning(f"⚠️ [QC] {len(report['flagged'])}/{len(tiles)} 个 tile 对齐可疑，详见 {report_path}")

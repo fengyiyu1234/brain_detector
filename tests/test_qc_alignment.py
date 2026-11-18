@@ -91,6 +91,31 @@ class AlignmentQCTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'pre_align'):
                 run_alignment_stage(cfg,tmp,[])
 
+    def test_no_tissue_tiles_are_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); config,settings=synthetic_sample(root)
+            # soma_dense / nonblank_center record no window for a tile without tissue.
+            (root/'3_2d_aligned/blank_offsets.json').write_text(
+                json.dumps({cid:{'dx':0,'dy':0,'dz':0} for cid in config['paths']}))
+            (root/'3_2d_aligned/blank_measured_offsets.json').write_text(
+                json.dumps({'sample_window':{'total_slices':40,'mode':'soma_dense','no_tissue':True}}))
+            options={'enabled':True,'xy_range_um':1.3,'z_range_um':8,'workers':1,'formats':['png'],
+                     'sampling':{'min_pairs':1,'max_attempts':40}}
+            cfg={**config,'qc':{'alignment':options}}
+            stale=root/'qc/alignment_error.json'
+            stale.parent.mkdir(exist_ok=True)
+            stale.write_text('{"status": "failed"}')
+            report=run_alignment_stage(cfg,str(root),['tile','blank'])
+            self.assertFalse(stale.exists())
+            self.assertEqual(report['status'],'complete',report.get('failures'))
+            self.assertEqual([r['tile'] for r in report['completed']],['tile'])
+            self.assertEqual(report['skipped_no_tissue'],['blank'])
+            self.assertFalse(report['flagged'])
+            saved=json.loads((root/'qc/alignment/run_details.json').read_text())
+            self.assertEqual(saved['skipped_no_tissue'],['blank'])
+            only_blank=run_alignment_stage(cfg,str(root),['blank'])
+            self.assertEqual((only_blank['status'],only_blank['skipped_no_tissue']),('complete',['blank']))
+
     def test_fresh_images_end_to_end_resume_and_image_invalidation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); config,settings=synthetic_sample(root)

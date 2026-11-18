@@ -2435,3 +2435,40 @@ set PYTHONPATH=.
 - 1955802：1、2、3、5、6、7、8、9 已完成（exit 0）；4、10–18 在跑（大多已到 Stage 3，16 在拼接，17/18 在对齐 QC）。
 - 1957198（BME，ET10/ETail/ET1/ERH）仍在 Stage 2.5：已对齐 tile 数分别为 36/40/26/28（共 45）。
 - t70（第 23 行）在 BME 上因 QOSGrpGRES（4 张 L40S 用满）排队，compute 当时空闲 609 核，于是 `scancel 1957198_23`，改为 `sbatch --array=23 realign_cpu.slurm`（compute，8 核/80G）→ 1957807，已在 c202n10 上运行。
+
+### 2026-11-17 20:40 接缝一致性 QC（B）审查图坐标修复；FF8 接缝随 z 变化
+
+- **bug**：`seam_consistency.seam_review` 出图时给 A、B 都加了 Stage 2.5 通道偏移，但 Stage 2.9 是在 `2_2d_filtered` 原始坐标上测接缝、解位置的，图上 B 被多挪了 shift_B − shift_A（FF8 RFP 那条接缝是 (0, −9, +1)），所以"实测位移"那栏也没完全重合。数值（残差、flag）不受影响。
+- **修复**（不在任何 hash 里）：两个 tile 都读原图不加偏移，B 只加 d；选层、定裁剪中心的框改读 `2_2d_filtered`；每条接缝加一行坐标帧通道（`stitching_reference_channel`）；每栏标重叠区相关系数 r。`test_sample_qc`、`test_checkpoint_code_lists` 通过。
+- 用 `python -m src.qc.sample_qc --only B --force` 给 FF8、batch4_sample4、batch4_sample5 重出 `qc/review/seams/`。FF8 RFP 实测那栏 r 0.68 → 0.91。
+- **FF8 365500_325400 → 365500_336700**：按 z 扫图像相关，Olig2 和 RFP 在每一层的最佳 dx 一致，但从 z100 的约 1650 走到 z640 的约 1705（两个 tile 相对倾斜）。Olig2/Sox9 细胞多在深层，接缝中位数约 1703；GFP/RFP 多在浅层，约 1660。接缝只有一个平移，拟合不了，Stage 2.9 跟着稠密通道走，浅层细胞在这条接缝上偏到约 40 px。对比图和逐层表在 FF8 `qc/seam_consistency/check_365500_325400__365500_336700/`。
+- batch4_sample5 446500_313700 → 457800_313700：修正后两种摆法都对不上（GFP 与 Olig2 实测差 60–110 px），还没查。
+
+## 2026-11-18 soma_dense 重对齐结果核查；对齐 QC 两处修复；t4 OOM 重跑
+
+### 作业结果
+
+- 1955802 / 1957198 / 1957807：23 个中 22 个 exit 0。t4（1955802_17）在 Stage 3 Sox9 Z-Link（1500 万个 2D 框）时 OOM（80G）。用 `sbatch --array=17 --mem=160G realign_cpu.slurm` 重新提交 → 1961262，从 checkpoint 接着跑（2.5、对齐 QC、2.9、拼接图都复用）。
+- 拼接图：23 个 `<样本>_<通道>_xy4x.tif` + `.json` 都在 `stitched_imgs/`，都是单个 ZYX BigTIFF（uint16，tifffile 读出 series 形如 (842, 3998, 2255)）。
+
+### 核查（只读脚本，在会话临时目录）
+
+- 所有样本 `_sample_windows.json` 都有 first/last_nonblank；所有有组织的 tile 都是 `soma_dense`。
+- tsc18 325300_342500：GFP (−4,−4,3)，分数 0.204，窗口 116–216，2978 个 soma，和预期一致。
+- 退回 nonblank_center 的 tile：每个样本 0–15 个（tsc12t 最多 15/45），基本在组织边缘。
+- 703 个用了 soma_dense 窗口的 tile：窗口内 soma ≥ 200 的 595 个，< 50 的 61 个。soma 只有 1–5 个的 tile，新旧 GFP 偏移分数都是 0.00，偏移是噪声（如 (−36,−36,−5)），旧结果也一样，不是这次改动引入的。
+- 可疑：tsc11 351600_294700 窗口内只有 43 个 soma，GFP 偏移 (0,−4,3) → (−32,36,7)，分数 0.178 → 0.057，很可能变差了。TSC10 401700_383200 分数 0.129 → 0.058。这说明 soma 稀疏但又没少到触发 fallback 时，新窗口可能不如旧窗口。还没改，待用户决定是否给 soma_dense 加最少细胞数门槛。
+
+### 对齐 QC 修复（`src/qc/run_qc.py`，不在任何 hash 列表里，不让已有 QC/下游结果失效）
+
+1. soma_dense / nonblank_center 下无组织 tile 的 `sample_window` 没有 `z_start`，`src/qc/sampling.py` 读它报 KeyError，被记为 error 并算进 bad。现在 `_run_alignment_qc` 先用新函数 `no_tissue_tiles` 把这些 tile 去掉，记在 `run_details.json` 的 `skipped_no_tissue` 里；全是无组织 tile 时直接返回 complete。直接运行 `python -m src.qc.alignment` 指定这些 tile 仍会报错（那个文件在 ALIGN_QC_FILES 里，没改）。
+2. 对齐 QC 成功后删除旧的 `qc/alignment_error.json`。之前一旦失败过，汇总会一直显示 FAIL。
+- 测试 `test_qc_alignment` 新增 1 项（无组织 tile 跳过 + 旧 error 文件删除），共 6 项通过；`test_sample_qc`、`test_checkpoint_code_lists`、`test_alignment_flags` 通过。
+- 受影响的 FF11、FF19、FW7、FW8（共 11 个无组织 tile）用作业 1961285 重跑对齐 QC（其余 tile 复用 checkpoint）+ 汇总 F。注意：在登录节点跑会 BrokenProcessPool；驱动脚本必须有 `if __name__ == '__main__'`，因为 QC 用 spawn 启动子进程。
+
+### 对齐 QC bad tile 数（refresh 后的旧结果 → 新结果）
+
+FF11 1→0、FF19 1→1、FF6 2→2、FF8 0→3、FF9 0→1、FW11 1→0、FW2 2→2、FW6 1→3、FW7 0→0、FW8 1→1、TSC10 0→2、tsc11 1→4、tsc12q 0→0、tsc12t 2→0、tsc18 1→0、TSC8 3→2、t4 3→5、t10 4→3、ET10 9→10、ETail 4→7、ET1 7→4、ERH 14→12、t70 6→4。
+- 新增的 bad 大多是 TF 残差（Sox9/Olig2 3–6 µm）。soma bad 的 tile 里多数新偏移和旧的相同或分数更高，QC 给的目标偏移经常是 ±30 px / ±4 层，不可信（QC 只看 10 层的小区域）。
+- 已确认 tsc18 325300_342500 修好。仍是 soma bad：FF19 345000_321800、FW2 311800_322900 / 323100_322900、FW8 369000_379700（IoU 提升 ×61，新旧偏移相同）、TSC8 348900_332600（×9.7）、tsc11 340300_294700（×6.7）/ 351600_294700 等，需要看审查图。
+- t4 重跑 1961262 完成（exit 0，60 分钟，160G），汇总 WARN（对齐 bad 5/45，其余 PASS）。至此 23 个样本全部跑完，23 个拼接图齐全，没有残留的 `.part`。
