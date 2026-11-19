@@ -2472,3 +2472,22 @@ FF11 1→0、FF19 1→1、FF6 2→2、FF8 0→3、FF9 0→1、FW11 1→0、FW2 2
 - 新增的 bad 大多是 TF 残差（Sox9/Olig2 3–6 µm）。soma bad 的 tile 里多数新偏移和旧的相同或分数更高，QC 给的目标偏移经常是 ±30 px / ±4 层，不可信（QC 只看 10 层的小区域）。
 - 已确认 tsc18 325300_342500 修好。仍是 soma bad：FF19 345000_321800、FW2 311800_322900 / 323100_322900、FW8 369000_379700（IoU 提升 ×61，新旧偏移相同）、TSC8 348900_332600（×9.7）、tsc11 340300_294700（×6.7）/ 351600_294700 等，需要看审查图。
 - t4 重跑 1961262 完成（exit 0，60 分钟，160G），汇总 WARN（对齐 bad 5/45，其余 PASS）。至此 23 个样本全部跑完，23 个拼接图齐全，没有残留的 `.part`。
+
+## 2026-11-18 soma 通道重新拼接（stitched_imgs/soma）；t4 用了旧 XML 的 bug
+
+- 用户目测 Olig2/Sox9 拼接图效果不好，要求再拼一份 soma 通道：默认 RFP；`pre_align_params.reference_channel` 是 GFP 的样本拼高 power 的 GFP。输出到 `X:\Fengyi\stitched_imgs\soma` = `/rsstu/users/t/tekaeser/Chlamydia/Fengyi/stitched_imgs/soma`。原来的 Olig2/Sox9 图用户已移到 `stitched_imgs/nucleus/`。
+- 23 个样本里 20 个拼 RFP，t4、t10、t70 拼 GFP。这 3 个只有一个 640nm 曝光（`gfp_dir`），所以不涉及选高/低 power。双曝光的样本（TSC 和 ERH）参考通道都是 RFP。
+- `stitch_raw_tiles.py`：
+  - 新增命令行参数 `--markers`、`--output-dir`，覆盖 config 里 `direct_stitching` 的对应设置，不用改 config。
+  - **bug 修复**：`read_channel` 原来只要存在 `xml_merging_<marker>.xml` 就优先用它。T4 的 4 个通道目录里都有 09-21 的这种旧文件，所以 11-17 的 `t4_Olig2_xy4x.tif` 用的是旧 tile 位置（manifest 里 xml 是 `xml_merging_Olig2.xml`，日期 09-21），而不是 Stage 2.9 11-17 发布的 `xml_merging.xml`。现在两个文件里取较新的一个，并打印被跳过的是哪个。其他 22 个样本没有这种文件，不受影响。**t4 的 Olig2 图需要重拼**（还没做）。
+  - `test_stitch_raw_tiles` 6 项通过。
+- `scripts/stitch_atlas.slurm`：列表行可以写成 `<config> <marker>`，环境变量 `OUT` 覆盖输出目录。列表文件是 `scripts/stitch_soma_samples.txt`。
+- 作业：1962907（compute，1–16 是 TSC，最多同时 8 个）；1962908（BME gpu_partners，p_bme_gpu，每个任务 1 张 L40S，17–23 是对照 + ERH/t70，QOS 只允许同时 4 个）。文件名是 `<样本>_<RFP|GFP>_xy4x.tif`。
+- **调整：先拼 TSC**（用户要求 EGFR 优先级低于 TSC）。取消 1962908（EGFR 17–23，正在跑的约完成 10%）。compute 上还在排队的 TSC 7–14 也取消了（预计 12:14 才能开始），改到 BME：1962927（7–14）。TSC 15–16 仍在 compute 上，属于 1962907。EGFR 17–23 重新提交为 1962928，`--dependency=afterany:1962927`，等 BME 上的 TSC 跑完再开始。取消的 EGFR 任务留下 4 个 `.tif.part`，重跑时会被覆盖。
+- **t4 Olig2 重拼**：旧的 `nucleus/t4_Olig2_xy4x.tif/.json` 移到 `stitched_imgs/old_t4_olig2_stale_xml/`（附 README，可以删）。1962929（列表 `scripts/stitch_t4_olig2.txt`，`OUT=.../nucleus`，BME）同样等 1962927 跑完再开始。
+- **14:49 全部完成**：1962907、1962927、1962928、1962929 一共 24 个任务都是 exit 0，每个 22–97 分钟。`soma/` 里 23 个 `.tif` + `.json` 都在，没有残留的 `.part`。`nucleus/t4_Olig2_xy4x.tif` 已重拼，xml 用的是 11-17 的 `xml_merging.xml`。所有 manifest 的体素都是 2.6×2.6×8 µm，xml 都是 11-17 的 `xml_merging.xml`。
+
+## 2026-11-19 DT47 重新提交检测
+
+- 1952945 在 11-17 被取消时停在 Stage 2 检测。重新提交 `sbatch --gres=gpu:l40s:2 inference_DT47.slurm` → 1986479（BME gpu_partners / p_bme_gpu，2 张 L40S，16 CPU / 240G，24h），从检测 checkpoint 续跑。
+- 用户要求改成 4 张卡：运行中的作业不能改 GPU 数，于是 `scancel 1986479`（已跑 33 分钟，检测中），按脚本默认设置（4×L40S）重新提交 `sbatch inference_DT47.slurm` → 1987144，从检测 checkpoint 续跑。

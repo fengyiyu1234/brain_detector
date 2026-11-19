@@ -130,7 +130,13 @@ def list_raw_slices(tile_dir: Path, tile_name: str):
 def read_channel(raw_dir: Path, marker: str) -> Channel:
     named = raw_dir / f"xml_merging_{marker}.xml"
     generic = raw_dir / "xml_merging.xml"
-    xml = named if named.is_file() else generic
+    # Stage 2.9 publishes xml_merging.xml; an older xml_merging_<marker>.xml left in
+    # the same directory (e.g. T4's 09-21 files) must not win over it.
+    candidates = [path for path in (named, generic) if path.is_file()]
+    xml = max(candidates, key=lambda path: path.stat().st_mtime_ns) if candidates else generic
+    for path in candidates:
+        if path != xml:
+            print(f"  {marker}: using newer {xml.name}, ignoring older {path.name}", flush=True)
     if not xml.is_file():
         raise FileNotFoundError(f"Missing merging XML for {marker}: {named} or {generic}")
     root = ET.parse(xml).getroot()
@@ -406,10 +412,17 @@ def completed_volume_matches(volume: Path, manifest_path: Path, config_path: Pat
         return False
 
 
-def run(config_path: Path, dry_run: bool = False, skip_completed: bool = False):
+def run(config_path: Path, dry_run: bool = False, skip_completed: bool = False,
+        markers_override: list[str] | None = None, output_dir_override: Path | None = None):
     config_path = config_path.resolve()
     config = load_config(config_path)
-    params = config["direct_stitching"]
+    params = dict(config["direct_stitching"])
+    # CLI overrides (re-stitch other channels / elsewhere without editing the config)
+    if markers_override:
+        params["markers"] = list(markers_override)
+    if output_dir_override is not None:
+        params["output_dir"] = str(output_dir_override)
+        params.pop("output_dir_hpc", None)
     enabled = params.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError("direct_stitching.enabled must be true or false")
@@ -564,9 +577,14 @@ def main():
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate raw tiles and print output geometry")
+    parser.add_argument("--markers", nargs="+",
+                        help="Override direct_stitching.markers (e.g. RFP GFP)")
+    parser.add_argument("--output-dir", type=Path,
+                        help="Override direct_stitching.output_dir")
     args = parser.parse_args()
     try:
-        run(args.config, args.dry_run)
+        run(args.config, args.dry_run, markers_override=args.markers,
+            output_dir_override=args.output_dir)
     except (OSError, ValueError, KeyError, ET.ParseError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
